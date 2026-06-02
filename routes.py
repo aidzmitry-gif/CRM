@@ -15,7 +15,15 @@ from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
 from core.services.auth import require_permission
-from modules.sales.models import Activity, Deal, DealDocument, DealItem, KpiTarget, Message
+from modules.sales.models import (
+    Activity,
+    Deal,
+    DealDocument,
+    DealItem,
+    KpiTarget,
+    Message,
+    PriceQuote,
+)
 from modules.sales.repository import DealRepository
 from modules.sales.schemas import (
     ActivityCreate,
@@ -31,6 +39,8 @@ from modules.sales.schemas import (
     KpiOut,
     MessageCreate,
     MessageOut,
+    PriceInfo,
+    PriceQuoteCreate,
     StageBoard,
 )
 from modules.sales.stages import STAGES
@@ -65,6 +75,19 @@ async def _deal_stock_items(session: AsyncSession, deal_id: int) -> list[dict]:
         ).scalars().all()
     }
     return [{"sku_code": skus[r.sku_id].code, "qty": float(r.qty)} for r in rows if r.sku_id in skus]
+
+
+async def _price_summary(session: AsyncSession, sku_code: str, counterparty: str = "") -> PriceInfo:
+    """Сводка цен по SKU (для клиента, если задан): последняя и минимальная цена."""
+    query = select(PriceQuote.price).where(PriceQuote.sku_code == sku_code)
+    if counterparty:
+        query = query.where(PriceQuote.counterparty == counterparty)
+    prices = [
+        float(p) for p in (await session.execute(query.order_by(PriceQuote.id))).scalars().all()
+    ]
+    if not prices:
+        return PriceInfo(sku_code=sku_code)
+    return PriceInfo(sku_code=sku_code, last_price=prices[-1], min_price=min(prices), count=len(prices))
 
 
 async def _post_document_to_1c(
@@ -204,6 +227,25 @@ async def get_deal(deal_id: int, session: AsyncSession = Depends(get_session)):
                 await session.execute(select(Sku).where(Sku.id.in_(sku_ids)))
             ).scalars().all()
         }
+    # цены клиенту по позициям (Price Engine): последняя и минимальная
+    price_map: dict[str, tuple[float, float]] = {}
+    codes = [skus[r.sku_id].code for r in rows if r.sku_id in skus]
+    if codes:
+        quotes = (
+            await session.execute(
+                select(PriceQuote)
+                .where(
+                    PriceQuote.counterparty == deal.counterparty,
+                    PriceQuote.sku_code.in_(codes),
+                )
+                .order_by(PriceQuote.id)
+            )
+        ).scalars().all()
+        grouped: dict[str, list[float]] = defaultdict(list)
+        for q in quotes:
+            grouped[q.sku_code].append(float(q.price))
+        price_map = {c: (v[-1], min(v)) for c, v in grouped.items()}
+
     items = [
         DealItemOut(
             sku_id=r.sku_id,
@@ -211,6 +253,12 @@ async def get_deal(deal_id: int, session: AsyncSession = Depends(get_session)):
             title=skus[r.sku_id].title if r.sku_id in skus else "",
             unit=skus[r.sku_id].unit if r.sku_id in skus else "",
             qty=float(r.qty),
+            last_price=price_map.get(skus[r.sku_id].code, (None, None))[0]
+            if r.sku_id in skus
+            else None,
+            min_price=price_map.get(skus[r.sku_id].code, (None, None))[1]
+            if r.sku_id in skus
+            else None,
         )
         for r in rows
     ]
@@ -458,3 +506,34 @@ async def create_message(
     )
     await session.commit()
     return msg
+
+
+@router.get("/prices/{sku_code}", response_model=PriceInfo)
+async def price_info(
+    sku_code: str, counterparty: str = "", session: AsyncSession = Depends(get_session)
+):
+    """История цен по SKU → последняя и минимальная цена клиенту (Price Engine, sales-22)."""
+    return await _price_summary(session, sku_code, counterparty)
+
+
+@router.post("/prices", status_code=201)
+async def create_price_quote(
+    payload: PriceQuoteCreate,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+):
+    """Зафиксировать котировку цены SKU клиенту (пополняет историю Price Engine)."""
+    session.add(
+        PriceQuote(
+            sku_code=payload.sku_code,
+            counterparty=payload.counterparty,
+            price=Decimal(str(payload.price)),
+        )
+    )
+    core.event_bus.emit(
+        session,
+        "sales.price.quoted",
+        {"sku_code": payload.sku_code, "counterparty": payload.counterparty, "price": payload.price},
+    )
+    await session.commit()
+    return {"ok": True}

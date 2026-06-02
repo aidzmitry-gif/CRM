@@ -119,3 +119,20 @@ class Message(Base):
     author: Mapped[str] = mapped_column(String(128), default="", server_default="")
     text: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class PriceQuote(Base):
+    """Котировка цены SKU клиенту — история цен и минимальная цена (часть 10, sales-22).
+
+    Накапливает предложенные цены по (``sku_code``, ``counterparty``); из истории
+    считаются последняя и минимальная цена, отдаваемая клиенту.
+    """
+
+    __tablename__ = "price_quote"
+    __table_args__ = {"schema": "sales"}
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sku_code: Mapped[str] = mapped_column(String(64))
+    counterparty: Mapped[str] = mapped_column(String(255), default="", server_default="")
+    price: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

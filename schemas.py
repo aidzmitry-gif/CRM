@@ -90,13 +90,32 @@ class KpiOut(BaseModel):
 
 
 class DealItemOut(BaseModel):
-    """Позиция номенклатуры сделки (с данными связанного SKU)."""
+    """Позиция номенклатуры сделки (с данными связанного SKU и ценами клиенту)."""
 
     sku_id: int
     code: str
     title: str
     unit: str
     qty: float
+    last_price: float | None = None  # последняя цена клиенту (Price Engine)
+    min_price: float | None = None  # минимальная цена клиенту
+
+
+class PriceQuoteCreate(BaseModel):
+    """Зафиксировать котировку цены SKU клиенту (Price Engine)."""
+
+    sku_code: str
+    counterparty: str = ""
+    price: float
+
+
+class PriceInfo(BaseModel):
+    """Сводка цен по SKU (история → последняя/минимальная цена клиенту)."""
+
+    sku_code: str
+    last_price: float | None = None
+    min_price: float | None = None
+    count: int = 0
 
 
 class DocumentCreate(BaseModel):
