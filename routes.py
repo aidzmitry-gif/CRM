@@ -1,25 +1,16 @@
 """HTTP-API модуля Sales. Монтируется ядром под префиксом ``/sales``."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.runtime.core import Core
-from core.runtime.deps import get_core
-from modules.sales.models import Deal
+from core.runtime.deps import get_core, get_session
+from modules.sales.repository import DealRepository
+from modules.sales.schemas import DealCreate, DealRead
 
 router = APIRouter(tags=["sales"])
-
-# демо-данные каркаса (в части 7 заменяются на хранение в БД)
-_DEMO_DEALS: list[Deal] = [
-    Deal(
-        id=1,
-        number="CRM-2024-0156",
-        title="Поставка аккумуляторов",
-        counterparty="ООО Пример",
-        amount=1_750_000,
-        priority="Высокий",
-    ),
-]
 
 
 @router.get("/ping")
@@ -28,16 +19,26 @@ async def ping() -> dict:
     return {"module": "sales", "status": "ok"}
 
 
-@router.get("/deals", response_model=list[Deal])
-async def list_deals() -> list[Deal]:
-    """Список сделок (демо-данные каркаса)."""
-    return _DEMO_DEALS
+@router.get("/deals", response_model=list[DealRead])
+async def list_deals(session: AsyncSession = Depends(get_session)):
+    """Список сделок из БД."""
+    return await DealRepository(session).list()
 
 
-@router.post("/deals", response_model=Deal, status_code=201)
-async def create_deal(deal: Deal, core: Core = Depends(get_core)) -> Deal:
+@router.post("/deals", response_model=DealRead, status_code=201)
+async def create_deal(
+    payload: DealCreate,
+    session: AsyncSession = Depends(get_session),
+    core: Core = Depends(get_core),
+):
     """Создать сделку и опубликовать доменное событие через шину ядра."""
-    deal.id = len(_DEMO_DEALS) + 1
-    _DEMO_DEALS.append(deal)
-    await core.event_bus.publish("sales.deal.created", deal.model_dump())
+    try:
+        deal = await DealRepository(session).create(payload)
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="Сделка с таким номером уже существует")
+    await core.event_bus.publish(
+        "sales.deal.created", {"number": deal.number, "title": deal.title}
+    )
     return deal

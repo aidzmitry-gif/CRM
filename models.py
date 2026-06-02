@@ -1,33 +1,29 @@
-"""Собственные модели модуля Sales (схема ``sales.*``).
+"""ORM-модели модуля Sales (собственная схема ``sales.*``).
 
-На этапе каркаса — лёгкая Pydantic-модель сделки и перечень стадий воронки.
-В части 7 «Карточка сделки» становится SQLAlchemy-моделью со своей схемой и
-миграциями; здесь — демонстрация принципа «модуль владеет своими таблицами» (§2.4).
+Модуль владеет своими таблицами в отдельной схеме (§2.4). Поле `counterparty`
+пока денормализовано в строку (как на макете); связь с shared-kernel
+`Counterparty` через FK — отдельный шаг, когда понадобится.
 """
 from __future__ import annotations
 
-from enum import Enum
+from decimal import Decimal
 
-from pydantic import BaseModel
+from sqlalchemy import Numeric, String
+from sqlalchemy.orm import Mapped, mapped_column
 
-
-class DealStage(str, Enum):
-    """Стадии воронки «Новые клиенты» (как на макете)."""
-
-    NEW = "Новая заявка"
-    QUALIFICATION = "Квалификация"
-    PROPOSAL = "Коммерческое предложение"
-    APPROVAL = "Согласование"
-    CLOSED = "Закрыто"
+from core.db.base import Base
 
 
-class Deal(BaseModel):
+class Deal(Base):
     """Сделка CRM."""
 
-    id: int | None = None
-    number: str
-    title: str
-    counterparty: str
-    amount: float = 0.0
-    stage: DealStage = DealStage.NEW
-    priority: str = "Средний"
+    __tablename__ = "deal"
+    __table_args__ = {"schema": "sales"}
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    number: Mapped[str] = mapped_column(String(64), unique=True)
+    title: Mapped[str] = mapped_column(String(255))
+    counterparty: Mapped[str] = mapped_column(String(255))
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0"), server_default="0")
+    stage: Mapped[str] = mapped_column(String(64), default="Новая заявка", server_default="Новая заявка")
+    priority: Mapped[str] = mapped_column(String(32), default="Средний", server_default="Средний")
