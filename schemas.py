@@ -1,6 +1,8 @@
 """Pydantic-схемы API модуля Sales (вход/выход), отдельно от ORM-моделей."""
 from __future__ import annotations
 
+import datetime
+
 from pydantic import BaseModel, ConfigDict
 
 
@@ -101,3 +103,12 @@ class DealDetailOut(DealRead):
     """Сделка с позициями номенклатуры (для экрана карточки)."""
 
     items: list[DealItemOut] = []
+
+
+class ActivityCreate(BaseModel):
+    """Отметка факта активности (звонок, заявка, отгрузка)."""
+
+    kpi_key: str
+    value: float = 1.0
+    owner: str = ""
+    date: datetime.date | None = None

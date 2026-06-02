@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import date
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
@@ -14,6 +16,7 @@ from core.runtime.deps import get_core, get_session
 from modules.sales.models import Activity, Deal, DealItem, KpiTarget
 from modules.sales.repository import DealRepository
 from modules.sales.schemas import (
+    ActivityCreate,
     BoardOut,
     DealCreate,
     DealDetailOut,
@@ -91,6 +94,24 @@ async def kpis(session: AsyncSession = Depends(get_session)):
             )
         )
     return result
+
+
+@router.post("/activities", status_code=201)
+async def create_activity(payload: ActivityCreate, session: AsyncSession = Depends(get_session)):
+    """Отметить активность. Без даты — добавляется в текущий отчётный день."""
+    day = payload.date
+    if day is None:
+        day = (await session.execute(select(func.max(Activity.date)))).scalar() or date.today()
+    session.add(
+        Activity(
+            kpi_key=payload.kpi_key,
+            owner=payload.owner,
+            value=Decimal(str(payload.value)),
+            date=day,
+        )
+    )
+    await session.commit()
+    return {"ok": True, "date": str(day)}
 
 
 @router.get("/deals", response_model=list[DealRead])
