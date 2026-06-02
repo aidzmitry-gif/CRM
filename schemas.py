@@ -99,10 +99,30 @@ class DealItemOut(BaseModel):
     qty: float
 
 
+class DocumentCreate(BaseModel):
+    """Запрос на формирование документа сделки (счёт/договор/заказ)."""
+
+    kind: str = "invoice"  # invoice | contract | order
+
+
+class DocumentOut(BaseModel):
+    """Документ сделки: тип, состояние и номер/ссылка в 1С после записи."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    kind: str
+    number: str
+    status: str
+    onec_ref: str | None = None
+    amount: float
+
+
 class DealDetailOut(DealRead):
-    """Сделка с позициями номенклатуры (для экрана карточки)."""
+    """Сделка с позициями номенклатуры и документами (для экрана карточки)."""
 
     items: list[DealItemOut] = []
+    documents: list[DocumentOut] = []
 
 
 class ActivityCreate(BaseModel):
