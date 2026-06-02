@@ -1,14 +1,18 @@
 """HTTP-API модуля Sales. Монтируется ядром под префиксом ``/sales``."""
 from __future__ import annotations
 
+from collections import defaultdict
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
+from modules.sales.models import Deal
 from modules.sales.repository import DealRepository
-from modules.sales.schemas import DealCreate, DealRead
+from modules.sales.schemas import BoardOut, DealCreate, DealRead, StageBoard
+from modules.sales.stages import STAGES
 
 router = APIRouter(tags=["sales"])
 
@@ -19,10 +23,41 @@ async def ping() -> dict:
     return {"module": "sales", "status": "ok"}
 
 
+@router.get("/board", response_model=BoardOut)
+async def board(session: AsyncSession = Depends(get_session)) -> BoardOut:
+    """Доска сделок: сделки сгруппированы по стадиям воронки с агрегатами."""
+    deals = await DealRepository(session).list()
+    by_stage: dict[str, list[Deal]] = defaultdict(list)
+    for deal in deals:
+        by_stage[deal.stage].append(deal)
+
+    stages = [
+        StageBoard(
+            id=s["id"],
+            title=s["title"],
+            color=s["color"],
+            count=len(by_stage.get(s["id"], [])),
+            sum=float(sum(d.amount for d in by_stage.get(s["id"], []))),
+            deals=[DealRead.model_validate(d) for d in by_stage.get(s["id"], [])],
+        )
+        for s in STAGES
+    ]
+    return BoardOut(stages=stages)
+
+
 @router.get("/deals", response_model=list[DealRead])
 async def list_deals(session: AsyncSession = Depends(get_session)):
-    """Список сделок из БД."""
+    """Плоский список сделок."""
     return await DealRepository(session).list()
+
+
+@router.get("/deals/{deal_id}", response_model=DealRead)
+async def get_deal(deal_id: int, session: AsyncSession = Depends(get_session)):
+    """Одна сделка по id."""
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    return deal
 
 
 @router.post("/deals", response_model=DealRead, status_code=201)

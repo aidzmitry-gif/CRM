@@ -1,19 +1,7 @@
 """Pydantic-схемы API модуля Sales (вход/выход), отдельно от ORM-моделей."""
 from __future__ import annotations
 
-from enum import Enum
-
 from pydantic import BaseModel, ConfigDict
-
-
-class DealStage(str, Enum):
-    """Стадии воронки «Новые клиенты» (как на макете)."""
-
-    NEW = "Новая заявка"
-    QUALIFICATION = "Квалификация"
-    PROPOSAL = "Коммерческое предложение"
-    APPROVAL = "Согласование"
-    CLOSED = "Закрыто"
 
 
 class DealCreate(BaseModel):
@@ -23,8 +11,14 @@ class DealCreate(BaseModel):
     title: str
     counterparty: str
     amount: float = 0.0
-    stage: DealStage = DealStage.NEW
     priority: str = "Средний"
+    stage: str = "new"
+    owner: str = ""
+    next_step: str | None = None
+    deal_date: str | None = None
+    closed_date: str | None = None
+    focus: bool = False
+    starred: bool = False
 
 
 class DealRead(BaseModel):
@@ -37,5 +31,28 @@ class DealRead(BaseModel):
     title: str
     counterparty: str
     amount: float
-    stage: str
     priority: str
+    stage: str
+    owner: str
+    next_step: str | None = None
+    deal_date: str | None = None
+    closed_date: str | None = None
+    focus: bool
+    starred: bool
+
+
+class StageBoard(BaseModel):
+    """Колонка канбана: стадия + её сделки и агрегаты."""
+
+    id: str
+    title: str
+    color: str
+    count: int
+    sum: float
+    deals: list[DealRead]
+
+
+class BoardOut(BaseModel):
+    """Вся доска сделок."""
+
+    stages: list[StageBoard]

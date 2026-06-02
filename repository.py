@@ -10,12 +10,5 @@ class DealRepository(Repository[Deal]):
     model = Deal
 
     async def create(self, data: DealCreate) -> Deal:
-        deal = Deal(
-            number=data.number,
-            title=data.title,
-            counterparty=data.counterparty,
-            amount=data.amount,
-            stage=data.stage.value,
-            priority=data.priority,
-        )
+        deal = Deal(**data.model_dump())
         return await self.add(deal)
