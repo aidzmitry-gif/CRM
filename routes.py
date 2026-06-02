@@ -4,14 +4,15 @@ from __future__ import annotations
 from collections import defaultdict
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
-from modules.sales.models import Deal
+from modules.sales.models import Activity, Deal, KpiTarget
 from modules.sales.repository import DealRepository
-from modules.sales.schemas import BoardOut, DealCreate, DealRead, DealUpdate, StageBoard
+from modules.sales.schemas import BoardOut, DealCreate, DealRead, DealUpdate, KpiOut, StageBoard
 from modules.sales.stages import STAGES
 
 router = APIRouter(tags=["sales"])
@@ -43,6 +44,43 @@ async def board(session: AsyncSession = Depends(get_session)) -> BoardOut:
         for s in STAGES
     ]
     return BoardOut(stages=stages)
+
+
+@router.get("/kpis", response_model=list[KpiOut])
+async def kpis(session: AsyncSession = Depends(get_session)):
+    """Показатели «План на сегодня»: факт (за последнюю дату активностей) vs план."""
+    targets = (
+        await session.execute(select(KpiTarget).order_by(KpiTarget.sort_order))
+    ).scalars().all()
+
+    latest = (await session.execute(select(func.max(Activity.date)))).scalar()
+    actuals: dict[str, float] = {}
+    if latest is not None:
+        rows = await session.execute(
+            select(Activity.kpi_key, func.coalesce(func.sum(Activity.value), 0))
+            .where(Activity.date == latest)
+            .group_by(Activity.kpi_key)
+        )
+        actuals = {key: float(total) for key, total in rows.all()}
+
+    result: list[KpiOut] = []
+    for t in targets:
+        actual = actuals.get(t.key, 0.0)
+        target = float(t.target)
+        percent = round(min(100.0, actual / target * 100)) if target else 0
+        result.append(
+            KpiOut(
+                key=t.key,
+                title=t.title,
+                target=target,
+                actual=actual,
+                percent=percent,
+                unit=t.unit,
+                icon=t.icon,
+                tone=t.tone,
+            )
+        )
+    return result
 
 
 @router.get("/deals", response_model=list[DealRead])

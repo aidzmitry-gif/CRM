@@ -1,14 +1,10 @@
-"""ORM-модели модуля Sales (собственная схема ``sales.*``).
-
-Модуль владеет своими таблицами в отдельной схеме (§2.4). Поле `counterparty`
-пока денормализовано в строку (как на макете); связь с shared-kernel
-`Counterparty` через FK — отдельный шаг, когда понадобится.
-"""
+"""ORM-модели модуля Sales (собственная схема ``sales.*``)."""
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import Numeric, String
+from sqlalchemy import Date, Numeric, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db.base import Base
@@ -26,7 +22,6 @@ class Deal(Base):
     counterparty: Mapped[str] = mapped_column(String(255))
     amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0"), server_default="0")
     priority: Mapped[str] = mapped_column(String(32), default="Средний", server_default="Средний")
-    # id стадии воронки (см. modules/sales/stages.py)
     stage: Mapped[str] = mapped_column(String(32), default="new", server_default="new")
     owner: Mapped[str] = mapped_column(String(128), default="", server_default="")
     next_step: Mapped[str | None] = mapped_column(String(128))
@@ -34,3 +29,35 @@ class Deal(Base):
     closed_date: Mapped[str | None] = mapped_column(String(32))
     focus: Mapped[bool] = mapped_column(default=False)
     starred: Mapped[bool] = mapped_column(default=False)
+
+
+class KpiTarget(Base):
+    """Цель (план) показателя «План на сегодня». icon/tone — подсказки для UI."""
+
+    __tablename__ = "kpi_target"
+    __table_args__ = {"schema": "sales"}
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    key: Mapped[str] = mapped_column(String(32), unique=True)
+    title: Mapped[str] = mapped_column(String(128))
+    target: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    unit: Mapped[str] = mapped_column(String(16), default="count", server_default="count")
+    icon: Mapped[str] = mapped_column(String(16))
+    tone: Mapped[str] = mapped_column(String(16))
+    sort_order: Mapped[int] = mapped_column(default=0, server_default="0")
+
+
+class Activity(Base):
+    """Факт активности (звонок, обработка заявки, отгрузка) за дату.
+
+    ``value`` — вклад в показатель: 1 для счётных метрик, сумма для денежных.
+    """
+
+    __tablename__ = "activity"
+    __table_args__ = {"schema": "sales"}
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kpi_key: Mapped[str] = mapped_column(String(32))
+    owner: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    value: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("1"), server_default="1")
+    date: Mapped[date] = mapped_column(Date)

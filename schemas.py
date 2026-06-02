@@ -72,3 +72,16 @@ class BoardOut(BaseModel):
     """Вся доска сделок."""
 
     stages: list[StageBoard]
+
+
+class KpiOut(BaseModel):
+    """Показатель «План на сегодня»: факт vs план."""
+
+    key: str
+    title: str
+    target: float
+    actual: float
+    percent: int
+    unit: str
+    icon: str
+    tone: str
