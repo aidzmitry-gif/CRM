@@ -40,11 +40,29 @@ DOC_NUMBER_PREFIX = {"invoice": "СЧ", "contract": "ДГ", "order": "ЗК"}
 DOC_TITLES = {"invoice": "Счёт", "contract": "Договор", "order": "Заказ"}
 # Типы документов, требующие согласования до записи в 1С (договор → юрист, ч.4).
 REQUIRES_APPROVAL = {"contract"}
+# Типы документов, резервирующие складские остатки при проведении (заказ).
+RESERVES_STOCK = {"order"}
 
 
 def _utcnow() -> datetime:
     # наивный UTC — единообразно для SQLite и PostgreSQL
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+async def _deal_stock_items(session: AsyncSession, deal_id: int) -> list[dict]:
+    """Позиции сделки как ``[{sku_code, qty}]`` (для резервирования остатков в 1С)."""
+    rows = (
+        await session.execute(select(DealItem).where(DealItem.deal_id == deal_id))
+    ).scalars().all()
+    if not rows:
+        return []
+    skus = {
+        s.id: s
+        for s in (
+            await session.execute(select(Sku).where(Sku.id.in_([r.sku_id for r in rows])))
+        ).scalars().all()
+    }
+    return [{"sku_code": skus[r.sku_id].code, "qty": float(r.qty)} for r in rows if r.sku_id in skus]
 
 
 async def _post_document_to_1c(
@@ -320,7 +338,22 @@ async def create_document(
             },
         )
     else:
-        # счёт/заказ: пишем в 1С сразу
+        # счёт/заказ: пишем в 1С сразу; заказ дополнительно резервирует остатки
+        if payload.kind in RESERVES_STOCK and core.services.stock is not None:
+            reserved = await core.services.stock.reserve(
+                session, await _deal_stock_items(session, deal_id)
+            )
+            if reserved:
+                core.event_bus.emit(
+                    session,
+                    "sales.stock.reserved",
+                    {
+                        "document_id": doc.id,
+                        "deal_id": deal_id,
+                        "items": reserved,
+                        "entity_ref": f"deal:{deal_id}",
+                    },
+                )
         await _post_document_to_1c(core, session, doc, deal.counterparty)
 
     await session.commit()
