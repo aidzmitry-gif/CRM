@@ -177,11 +177,9 @@ async def create_deal(
     """Создать сделку и опубликовать доменное событие через шину ядра."""
     try:
         deal = await DealRepository(session).create(payload)
+        core.event_bus.emit(session, "sales.deal.created", {"number": deal.number, "title": deal.title})
         await session.commit()
     except IntegrityError:
         await session.rollback()
         raise HTTPException(status_code=409, detail="Сделка с таким номером уже существует")
-    await core.event_bus.publish(
-        "sales.deal.created", {"number": deal.number, "title": deal.title}
-    )
     return deal
