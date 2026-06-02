@@ -103,6 +103,14 @@ class DocumentCreate(BaseModel):
     """Запрос на формирование документа сделки (счёт/договор/заказ)."""
 
     kind: str = "invoice"  # invoice | contract | order
+    requested_by: str = ""  # инициатор (для согласования договора)
+
+
+class DocumentDecision(BaseModel):
+    """Решение по документу, требующему согласования (договор): провести/отклонить."""
+
+    approved: bool
+    by: str = ""
 
 
 class DocumentOut(BaseModel):

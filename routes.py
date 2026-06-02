@@ -10,10 +10,11 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.domain.models import Sku
+from core.domain.models import Approval, Sku
 from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
+from core.services.auth import require_permission
 from modules.sales.models import Activity, Deal, DealDocument, DealItem, KpiTarget
 from modules.sales.repository import DealRepository
 from modules.sales.schemas import (
@@ -25,6 +26,7 @@ from modules.sales.schemas import (
     DealRead,
     DealUpdate,
     DocumentCreate,
+    DocumentDecision,
     DocumentOut,
     KpiOut,
     StageBoard,
@@ -33,13 +35,45 @@ from modules.sales.stages import STAGES
 
 router = APIRouter(tags=["sales"])
 
-# Префикс номера документа по типу (счёт / договор / заказ).
+# Префикс номера и человекочитаемое название документа по типу.
 DOC_NUMBER_PREFIX = {"invoice": "СЧ", "contract": "ДГ", "order": "ЗК"}
+DOC_TITLES = {"invoice": "Счёт", "contract": "Договор", "order": "Заказ"}
+# Типы документов, требующие согласования до записи в 1С (договор → юрист, ч.4).
+REQUIRES_APPROVAL = {"contract"}
 
 
 def _utcnow() -> datetime:
     # наивный UTC — единообразно для SQLite и PostgreSQL
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+async def _post_document_to_1c(
+    core: Core, session: AsyncSession, doc: DealDocument, counterparty: str
+) -> None:
+    """Записать документ в 1С через фасад ядра и пометить проведённым (posted).
+
+    Событие ``sales.document.posted`` уходит в шину (→ audit). Используется и при
+    мгновенной записи счёта, и при проведении договора после согласования.
+    """
+    result = await core.services.onec.post_document(
+        doc.kind,
+        {"number": doc.number, "counterparty": counterparty, "amount": float(doc.amount)},
+    )
+    doc.onec_ref = result.get("ref")
+    doc.status = "posted"
+    doc.posted_at = _utcnow()
+    core.event_bus.emit(
+        session,
+        "sales.document.posted",
+        {
+            "document_id": doc.id,
+            "deal_id": doc.deal_id,
+            "kind": doc.kind,
+            "number": doc.number,
+            "onec_ref": doc.onec_ref,
+            "entity_ref": f"deal:{doc.deal_id}",
+        },
+    )
 
 
 @router.get("/ping")
@@ -245,11 +279,12 @@ async def create_document(
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
 ):
-    """Сформировать документ сделки и записать его в 1С (часть 9).
+    """Сформировать документ сделки (часть 9).
 
-    Счёт пишется в 1С сразу (``draft`` → ``posted``) через фасад
-    ``core.services.onec``; о записи сообщается событием ``sales.document.posted``
-    (→ audit log). Договор позже пойдёт через согласование (часть 4) до записи.
+    Счёт/заказ пишутся в 1С сразу (``draft`` → ``posted``). Договор сначала
+    уходит на согласование юристу (движок ч.4, маршрут ``deal.contract``) —
+    статус ``pending_approval``; в 1С он записывается только после одобрения
+    (``POST /sales/documents/{id}/decide``). Здесь ядро и CRM смыкаются в поток.
     """
     deal = await DealRepository(session).get(deal_id)
     if deal is None:
@@ -263,26 +298,83 @@ async def create_document(
     session.add(doc)
     await session.flush()
 
-    # запись в 1С через фасад ядра (в прототипе — mock-коннектор модуля integrations)
-    result = await core.services.onec.post_document(
-        payload.kind,
-        {"number": number, "counterparty": deal.counterparty, "amount": float(deal.amount)},
-    )
-    doc.onec_ref = result.get("ref")
-    doc.status = "posted"
-    doc.posted_at = _utcnow()
+    if payload.kind in REQUIRES_APPROVAL:
+        # договор: на согласование юристу (ч.4); запись в 1С — после одобрения
+        doc.status = "pending_approval"
+        await core.services.approvals.request(
+            session,
+            "deal.contract",
+            f"document:{doc.id}",
+            f"{deal.number} — {DOC_TITLES.get(payload.kind, payload.kind)} ({deal.counterparty})",
+            payload.requested_by,
+        )
+        core.event_bus.emit(
+            session,
+            "sales.document.created",
+            {
+                "document_id": doc.id,
+                "deal_id": deal_id,
+                "kind": payload.kind,
+                "number": number,
+                "entity_ref": f"deal:{deal_id}",
+            },
+        )
+    else:
+        # счёт/заказ: пишем в 1С сразу
+        await _post_document_to_1c(core, session, doc, deal.counterparty)
 
-    core.event_bus.emit(
-        session,
-        "sales.document.posted",
-        {
-            "document_id": doc.id,
-            "deal_id": deal_id,
-            "kind": payload.kind,
-            "number": number,
-            "onec_ref": doc.onec_ref,
-            "entity_ref": f"deal:{deal_id}",
-        },
-    )
+    await session.commit()
+    return doc
+
+
+@router.post("/documents/{doc_id}/decide", response_model=DocumentOut)
+async def decide_document(
+    doc_id: int,
+    payload: DocumentDecision,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: object = Depends(require_permission("sales.deal.approve")),
+):
+    """Решение по документу на согласовании (договор): провести в 1С или отклонить.
+
+    Решает связанное согласование (движок ч.4) и, при одобрении, проводит документ
+    в 1С (часть 9) — всё в одной транзакции. Согласование и проведение фиксируются
+    событиями (→ audit log).
+    """
+    doc = await session.get(DealDocument, doc_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    if doc.status != "pending_approval":
+        raise HTTPException(status_code=409, detail="Документ не на согласовании")
+    if core.services.onec is None:
+        raise HTTPException(status_code=503, detail="Интеграция 1С не подключена")
+
+    approval = (
+        await session.execute(
+            select(Approval).where(
+                Approval.entity_ref == f"document:{doc_id}", Approval.status == "pending"
+            )
+        )
+    ).scalars().first()
+    if approval is not None:
+        await core.services.approvals.decide(session, approval, payload.approved, payload.by)
+
+    if payload.approved:
+        deal = await DealRepository(session).get(doc.deal_id)
+        await _post_document_to_1c(core, session, doc, deal.counterparty if deal else "")
+    else:
+        doc.status = "rejected"
+        core.event_bus.emit(
+            session,
+            "sales.document.rejected",
+            {
+                "document_id": doc.id,
+                "deal_id": doc.deal_id,
+                "kind": doc.kind,
+                "number": doc.number,
+                "entity_ref": f"deal:{doc.deal_id}",
+            },
+        )
+
     await session.commit()
     return doc
