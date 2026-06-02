@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -54,6 +54,9 @@ DOC_TITLES = {"invoice": "Счёт", "contract": "Договор", "order": "З�
 REQUIRES_APPROVAL = {"contract"}
 # Типы документов, резервирующие складские остатки при проведении (заказ).
 RESERVES_STOCK = {"order"}
+# План/факт по периодам (sales-34): окно факта (дней) и множитель плана (рабочих дней).
+PERIOD_DAYS = {"day": 1, "week": 7, "month": 30, "quarter": 90, "year": 365}
+PERIOD_MULT = {"day": 1, "week": 5, "month": 22, "quarter": 65, "year": 250}
 
 
 def _utcnow() -> datetime:
@@ -148,8 +151,12 @@ async def board(session: AsyncSession = Depends(get_session)) -> BoardOut:
 
 
 @router.get("/kpis", response_model=list[KpiOut])
-async def kpis(session: AsyncSession = Depends(get_session)):
-    """Показатели «План на сегодня»: факт (за последнюю дату активностей) vs план."""
+async def kpis(period: str = "day", session: AsyncSession = Depends(get_session)):
+    """Показатели «План/Факт» за период (день/неделя/месяц/квартал/год, sales-34).
+
+    Факт — сумма активностей за окно периода (от последней даты назад); план —
+    дневная цель, масштабированная на число рабочих дней периода.
+    """
     targets = (
         await session.execute(select(KpiTarget).order_by(KpiTarget.sort_order))
     ).scalars().all()
@@ -157,17 +164,19 @@ async def kpis(session: AsyncSession = Depends(get_session)):
     latest = (await session.execute(select(func.max(Activity.date)))).scalar()
     actuals: dict[str, float] = {}
     if latest is not None:
+        start = latest - timedelta(days=PERIOD_DAYS.get(period, 1) - 1)
         rows = await session.execute(
             select(Activity.kpi_key, func.coalesce(func.sum(Activity.value), 0))
-            .where(Activity.date == latest)
+            .where(Activity.date >= start, Activity.date <= latest)
             .group_by(Activity.kpi_key)
         )
         actuals = {key: float(total) for key, total in rows.all()}
 
+    mult = PERIOD_MULT.get(period, 1)
     result: list[KpiOut] = []
     for t in targets:
         actual = actuals.get(t.key, 0.0)
-        target = float(t.target)
+        target = float(t.target) * mult
         percent = round(min(100.0, actual / target * 100)) if target else 0
         result.append(
             KpiOut(
