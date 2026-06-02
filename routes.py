@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.domain.models import Sku
 from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
+from core.services.approvals import ApprovalOut, ApprovalRequest
 from modules.sales.models import Activity, Deal, DealItem, KpiTarget
 from modules.sales.repository import DealRepository
 from modules.sales.schemas import (
@@ -183,3 +184,25 @@ async def create_deal(
         await session.rollback()
         raise HTTPException(status_code=409, detail="Сделка с таким номером уже существует")
     return deal
+
+
+@router.post("/deals/{deal_id}/request-approval", response_model=ApprovalOut, status_code=201)
+async def request_approval(
+    deal_id: int,
+    payload: ApprovalRequest,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+):
+    """Отправить сделку на согласование (например, договор → юристу)."""
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    approval = await core.services.approvals.request(
+        session,
+        payload.kind,
+        f"deal:{deal_id}",
+        f"{deal.number} — {deal.counterparty}",
+        payload.requested_by,
+    )
+    await session.commit()
+    return approval
