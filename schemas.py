@@ -140,3 +140,25 @@ class ActivityCreate(BaseModel):
     value: float = 1.0
     owner: str = ""
     date: datetime.date | None = None
+
+
+class MessageCreate(BaseModel):
+    """Новое сообщение по сделке (омниканальная переписка)."""
+
+    channel: str = "whatsapp"  # whatsapp|telegram|email|phone|viber
+    text: str
+    author: str = ""
+    direction: str = "out"  # out — от менеджера, in — от клиента
+
+
+class MessageOut(BaseModel):
+    """Сообщение по сделке (история переписки по каналам)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    channel: str
+    direction: str
+    author: str
+    text: str
+    created_at: datetime.datetime

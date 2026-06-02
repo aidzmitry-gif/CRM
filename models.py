@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Date, DateTime, ForeignKey, Numeric, String, func
+from sqlalchemy import Date, DateTime, ForeignKey, Numeric, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db.base import Base
@@ -100,3 +100,22 @@ class DealDocument(Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0"), server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     posted_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class Message(Base):
+    """Сообщение по сделке — омниканальная история переписки (часть 10, sales-16).
+
+    ``channel`` — канал (whatsapp/telegram/email/phone/viber), ``direction`` —
+    входящее от клиента (``in``) или исходящее от менеджера (``out``).
+    """
+
+    __tablename__ = "message"
+    __table_args__ = {"schema": "sales"}
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    deal_id: Mapped[int] = mapped_column(ForeignKey("sales.deal.id"))
+    channel: Mapped[str] = mapped_column(String(16))  # whatsapp|telegram|email|phone|viber
+    direction: Mapped[str] = mapped_column(String(8), default="out", server_default="out")  # in|out
+    author: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    text: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

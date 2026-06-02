@@ -15,7 +15,7 @@ from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
 from core.services.auth import require_permission
-from modules.sales.models import Activity, Deal, DealDocument, DealItem, KpiTarget
+from modules.sales.models import Activity, Deal, DealDocument, DealItem, KpiTarget, Message
 from modules.sales.repository import DealRepository
 from modules.sales.schemas import (
     ActivityCreate,
@@ -29,6 +29,8 @@ from modules.sales.schemas import (
     DocumentDecision,
     DocumentOut,
     KpiOut,
+    MessageCreate,
+    MessageOut,
     StageBoard,
 )
 from modules.sales.stages import STAGES
@@ -411,3 +413,48 @@ async def decide_document(
 
     await session.commit()
     return doc
+
+
+@router.get("/deals/{deal_id}/messages", response_model=list[MessageOut])
+async def list_messages(deal_id: int, session: AsyncSession = Depends(get_session)):
+    """Омниканальная история переписки по сделке (часть 10)."""
+    return (
+        await session.execute(
+            select(Message).where(Message.deal_id == deal_id).order_by(Message.id)
+        )
+    ).scalars().all()
+
+
+@router.post("/deals/{deal_id}/messages", response_model=MessageOut, status_code=201)
+async def create_message(
+    deal_id: int,
+    payload: MessageCreate,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+):
+    """Отправить/зафиксировать сообщение по сделке (канал + текст) — событие в шину."""
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    msg = Message(
+        deal_id=deal_id,
+        channel=payload.channel,
+        direction=payload.direction,
+        author=payload.author,
+        text=payload.text,
+    )
+    session.add(msg)
+    await session.flush()
+    core.event_bus.emit(
+        session,
+        "sales.message.sent",
+        {
+            "message_id": msg.id,
+            "deal_id": deal_id,
+            "channel": payload.channel,
+            "direction": payload.direction,
+            "entity_ref": f"deal:{deal_id}",
+        },
+    )
+    await session.commit()
+    return msg
