@@ -85,3 +85,19 @@ class KpiOut(BaseModel):
     unit: str
     icon: str
     tone: str
+
+
+class DealItemOut(BaseModel):
+    """Позиция номенклатуры сделки (с данными связанного SKU)."""
+
+    sku_id: int
+    code: str
+    title: str
+    unit: str
+    qty: float
+
+
+class DealDetailOut(DealRead):
+    """Сделка с позициями номенклатуры (для экрана карточки)."""
+
+    items: list[DealItemOut] = []

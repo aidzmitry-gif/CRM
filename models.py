@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import Date, Numeric, String
+from sqlalchemy import Date, ForeignKey, Numeric, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db.base import Base
@@ -61,3 +61,19 @@ class Activity(Base):
     owner: Mapped[str] = mapped_column(String(128), default="", server_default="")
     value: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("1"), server_default="1")
     date: Mapped[date] = mapped_column(Date)
+
+
+class DealItem(Base):
+    """Позиция номенклатуры в сделке — ссылка на shared-kernel SKU (§2.4).
+
+    Жёсткий cross-schema FK на ``sku`` не ставим (sku в общем ядре); связь
+    разрешается на чтении join-ом в эндпоинте.
+    """
+
+    __tablename__ = "deal_item"
+    __table_args__ = {"schema": "sales"}
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    deal_id: Mapped[int] = mapped_column(ForeignKey("sales.deal.id"))
+    sku_id: Mapped[int] = mapped_column()
+    qty: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("1"), server_default="1")

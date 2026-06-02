@@ -8,11 +8,21 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.domain.models import Sku
 from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
-from modules.sales.models import Activity, Deal, KpiTarget
+from modules.sales.models import Activity, Deal, DealItem, KpiTarget
 from modules.sales.repository import DealRepository
-from modules.sales.schemas import BoardOut, DealCreate, DealRead, DealUpdate, KpiOut, StageBoard
+from modules.sales.schemas import (
+    BoardOut,
+    DealCreate,
+    DealDetailOut,
+    DealItemOut,
+    DealRead,
+    DealUpdate,
+    KpiOut,
+    StageBoard,
+)
 from modules.sales.stages import STAGES
 
 router = APIRouter(tags=["sales"])
@@ -89,13 +99,36 @@ async def list_deals(session: AsyncSession = Depends(get_session)):
     return await DealRepository(session).list()
 
 
-@router.get("/deals/{deal_id}", response_model=DealRead)
+@router.get("/deals/{deal_id}", response_model=DealDetailOut)
 async def get_deal(deal_id: int, session: AsyncSession = Depends(get_session)):
-    """Одна сделка по id."""
+    """Одна сделка по id с позициями номенклатуры (со связью к SKU)."""
     deal = await DealRepository(session).get(deal_id)
     if deal is None:
         raise HTTPException(status_code=404, detail="Сделка не найдена")
-    return deal
+
+    rows = (
+        await session.execute(select(DealItem).where(DealItem.deal_id == deal_id))
+    ).scalars().all()
+    skus: dict[int, Sku] = {}
+    if rows:
+        sku_ids = [r.sku_id for r in rows]
+        skus = {
+            s.id: s
+            for s in (
+                await session.execute(select(Sku).where(Sku.id.in_(sku_ids)))
+            ).scalars().all()
+        }
+    items = [
+        DealItemOut(
+            sku_id=r.sku_id,
+            code=skus[r.sku_id].code if r.sku_id in skus else "",
+            title=skus[r.sku_id].title if r.sku_id in skus else "",
+            unit=skus[r.sku_id].unit if r.sku_id in skus else "",
+            qty=float(r.qty),
+        )
+        for r in rows
+    ]
+    return DealDetailOut(**DealRead.model_validate(deal).model_dump(), items=items)
 
 
 @router.patch("/deals/{deal_id}", response_model=DealRead)
