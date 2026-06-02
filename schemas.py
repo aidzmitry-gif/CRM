@@ -21,6 +21,22 @@ class DealCreate(BaseModel):
     starred: bool = False
 
 
+class DealUpdate(BaseModel):
+    """Частичное обновление сделки (все поля опциональны)."""
+
+    title: str | None = None
+    counterparty: str | None = None
+    amount: float | None = None
+    priority: str | None = None
+    stage: str | None = None
+    owner: str | None = None
+    next_step: str | None = None
+    deal_date: str | None = None
+    closed_date: str | None = None
+    focus: bool | None = None
+    starred: bool | None = None
+
+
 class DealRead(BaseModel):
     """Представление сделки в ответах API."""
 

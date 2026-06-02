@@ -11,7 +11,7 @@ from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
 from modules.sales.models import Deal
 from modules.sales.repository import DealRepository
-from modules.sales.schemas import BoardOut, DealCreate, DealRead, StageBoard
+from modules.sales.schemas import BoardOut, DealCreate, DealRead, DealUpdate, StageBoard
 from modules.sales.stages import STAGES
 
 router = APIRouter(tags=["sales"])
@@ -57,6 +57,22 @@ async def get_deal(deal_id: int, session: AsyncSession = Depends(get_session)):
     deal = await DealRepository(session).get(deal_id)
     if deal is None:
         raise HTTPException(status_code=404, detail="Сделка не найдена")
+    return deal
+
+
+@router.patch("/deals/{deal_id}", response_model=DealRead)
+async def update_deal(
+    deal_id: int,
+    payload: DealUpdate,
+    session: AsyncSession = Depends(get_session),
+):
+    """Частично обновить сделку (например, сменить стадию при drag&drop)."""
+    repo = DealRepository(session)
+    deal = await repo.get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    await repo.update(deal, payload.model_dump(exclude_unset=True))
+    await session.commit()
     return deal
 
 
