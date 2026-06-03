@@ -147,6 +147,17 @@ class ContactCreate(BaseModel):
     is_primary: bool = False
 
 
+class ChatOut(BaseModel):
+    """Диалог по сделке для панели «Чаты и дела» (последнее сообщение)."""
+
+    deal_id: int
+    number: str
+    company: str
+    last_text: str
+    channel: str
+    direction: str
+
+
 class PriceQuoteCreate(BaseModel):
     """Зафиксировать котировку цены SKU клиенту (Price Engine)."""
 

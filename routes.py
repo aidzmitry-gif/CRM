@@ -32,6 +32,7 @@ from modules.sales.schemas import (
     AiDraftOut,
     AiTextOut,
     BoardOut,
+    ChatOut,
     ContactCreate,
     ContactOut,
     DealCreate,
@@ -501,6 +502,35 @@ async def add_contact(
     await session.flush()
     await session.commit()
     return contact
+
+
+@router.get("/chats", response_model=list[ChatOut])
+async def list_chats(session: AsyncSession = Depends(get_session)):
+    """Диалоги для панели «Чаты и дела»: сделки с последним сообщением переписки."""
+    msgs = (
+        await session.execute(select(Message).order_by(Message.id.desc()).limit(100))
+    ).scalars().all()
+    deals = {d.id: d for d in (await session.execute(select(Deal))).scalars().all()}
+    chats: list[ChatOut] = []
+    seen: set[int] = set()
+    for m in msgs:
+        if m.deal_id in seen or m.deal_id not in deals:
+            continue
+        seen.add(m.deal_id)
+        deal = deals[m.deal_id]
+        chats.append(
+            ChatOut(
+                deal_id=m.deal_id,
+                number=deal.number,
+                company=deal.counterparty,
+                last_text=m.text,
+                channel=m.channel,
+                direction=m.direction,
+            )
+        )
+        if len(chats) >= 20:
+            break
+    return chats
 
 
 @router.patch("/contacts/{contact_id}/primary", response_model=ContactOut)
