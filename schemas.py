@@ -188,3 +188,17 @@ class AiDraftOut(BaseModel):
 
     text: str
     model: str
+
+
+class AiAssistRequest(BaseModel):
+    """Запрос к AI-ассистенту сделки."""
+
+    kind: str = "summary"  # summary | next_step
+
+
+class AiTextOut(BaseModel):
+    """Текст AI-ассистента (резюме сделки / следующий шаг)."""
+
+    kind: str
+    text: str
+    model: str

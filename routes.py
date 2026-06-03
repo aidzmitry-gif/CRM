@@ -15,7 +15,7 @@ from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
 from core.services.auth import require_permission
-from modules.sales.ai import draft_reply
+from modules.sales.ai import draft_reply, next_step, summarize
 from modules.sales.models import (
     Activity,
     Deal,
@@ -28,7 +28,9 @@ from modules.sales.models import (
 from modules.sales.repository import DealRepository
 from modules.sales.schemas import (
     ActivityCreate,
+    AiAssistRequest,
     AiDraftOut,
+    AiTextOut,
     BoardOut,
     DealCreate,
     DealDetailOut,
@@ -583,3 +585,47 @@ async def ai_draft_reply(
     )
     await session.commit()
     return AiDraftOut(text=text, model=model)
+
+
+@router.post("/deals/{deal_id}/ai/assist", response_model=AiTextOut)
+async def ai_assist(
+    deal_id: int,
+    payload: AiAssistRequest,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+):
+    """AI-ассистент сделки: резюме или следующий шаг (AI-слой, Итерация 1).
+
+    Под-фича модуля за feature-flag (503 если AI выкл). Контекст сделки (позиции,
+    документы, переписка) идёт в общий шлюз ``core.services.llm``; AI-действие
+    фиксируется событием ``ai.<kind>.generated`` (→ audit, §3.3).
+    """
+    if not core.services.llm.enabled:
+        raise HTTPException(status_code=503, detail="AI-слой выключен (feature-flag)")
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+
+    async def _count(model, deal_col) -> int:
+        return (
+            await session.execute(select(func.count()).select_from(model).where(deal_col == deal_id))
+        ).scalar() or 0
+
+    context = (
+        f"Позиций: {await _count(DealItem, DealItem.deal_id)}, "
+        f"документов: {await _count(DealDocument, DealDocument.deal_id)}, "
+        f"сообщений: {await _count(Message, Message.deal_id)}."
+    )
+
+    gateway = core.services.llm
+    kind = "next_step" if payload.kind == "next_step" else "summary"
+    text = await (next_step if kind == "next_step" else summarize)(gateway, deal, context)
+    model = gateway.model or "mock"
+
+    core.event_bus.emit(
+        session,
+        f"ai.{kind}.generated",
+        {"deal_id": deal_id, "model": model, "actor": "AI", "entity_ref": f"deal:{deal_id}"},
+    )
+    await session.commit()
+    return AiTextOut(kind=kind, text=text, model=model)
