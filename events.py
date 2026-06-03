@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 
+from sqlalchemy import func, select
+
 logger = logging.getLogger("aios.sales")
 
 
@@ -11,6 +13,60 @@ async def on_deal_created(payload: dict) -> None:
     logger.info(
         "Sales: создана сделка %s — %s", payload.get("number"), payload.get("title")
     )
+
+
+async def on_campaign_launched(payload: dict, ctx) -> None:
+    """Кампания запущена → лиды попадают в воронку как новые сделки (marketing → sales)."""
+    if ctx is None:
+        return
+    from modules.sales.models import Deal
+
+    leads = min(int(payload.get("leads", 0) or 0), 10)
+    name = payload.get("name", "Кампания")
+    base = (await ctx.session.execute(select(func.count()).select_from(Deal))).scalar() or 0
+    for i in range(leads):
+        ctx.session.add(
+            Deal(
+                number=f"LEAD-{base + i + 1}",
+                title=f"Лид: {name}",
+                counterparty="Новый лид",
+                stage="new",
+                priority="Средний",
+            )
+        )
+    logger.info("Sales: из кампании «%s» создано лидов: %d", name, leads)
+
+
+async def on_payment_paid(payload: dict, ctx) -> None:
+    """Платёж проведён → документ-счёт помечается оплаченным (finance → sales)."""
+    if ctx is None:
+        return
+    from modules.sales.models import DealDocument
+
+    ref = payload.get("ref")
+    if not ref:
+        return
+    doc = (
+        await ctx.session.execute(select(DealDocument).where(DealDocument.number == ref))
+    ).scalars().first()
+    if doc is not None:
+        doc.status = "paid"
+        logger.info("Sales: документ %s помечен оплаченным", ref)
+
+
+async def on_shipment_delivered(payload: dict, ctx) -> None:
+    """Отгрузка доставлена → сделка закрывается успешно (logistics → sales)."""
+    if ctx is None:
+        return
+    deal_id = payload.get("deal_id")
+    if not deal_id:
+        return
+    from modules.sales.models import Deal
+
+    deal = await ctx.session.get(Deal, deal_id)
+    if deal is not None:
+        deal.stage = "won"
+        logger.info("Sales: сделка %s закрыта успешно (доставлено)", deal_id)
 
 
 async def on_incoming_message_ai(payload: dict, ctx) -> None:
