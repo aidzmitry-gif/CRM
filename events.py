@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 logger = logging.getLogger("aios.sales")
 
@@ -16,25 +16,30 @@ async def on_deal_created(payload: dict) -> None:
 
 
 async def on_campaign_launched(payload: dict, ctx) -> None:
-    """Кампания запущена → лиды попадают в воронку как новые сделки (marketing → sales)."""
+    """Кампания запущена → привлечённые лиды попадают в приём лидов CRM (marketing → sales).
+
+    Маркетинг питает воронку через её вход: создаёт записи лидов (front-of-funnel),
+    которые менеджер/AI затем квалифицирует, распределяет и превращает в сделки —
+    а не создаёт сделки напрямую. Так замыкается цикл «кампания → лиды → воронка».
+    """
     if ctx is None:
         return
-    from modules.sales.models import Deal
+    from modules.sales.leads import LEAD_SOURCES
+    from modules.sales.models import Lead
 
-    leads = min(int(payload.get("leads", 0) or 0), 10)
+    count = min(int(payload.get("leads", 0) or 0), 10)
     name = payload.get("name", "Кампания")
-    base = (await ctx.session.execute(select(func.count()).select_from(Deal))).scalar() or 0
-    for i in range(leads):
+    channel = payload.get("channel", "site")
+    source = channel if channel in LEAD_SOURCES else "site"
+    for _ in range(count):
         ctx.session.add(
-            Deal(
-                number=f"LEAD-{base + i + 1}",
-                title=f"Лид: {name}",
-                counterparty="Новый лид",
-                stage="new",
-                priority="Средний",
+            Lead(
+                source=source,
+                message=f"Заявка из кампании «{name}» (канал {channel})",
+                status="new",
             )
         )
-    logger.info("Sales: из кампании «%s» создано лидов: %d", name, leads)
+    logger.info("Sales: из кампании «%s» принято лидов: %d", name, count)
 
 
 async def on_payment_paid(payload: dict, ctx) -> None:

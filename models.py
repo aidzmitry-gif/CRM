@@ -136,3 +136,37 @@ class PriceQuote(Base):
     counterparty: Mapped[str] = mapped_column(String(255), default="", server_default="")
     price: Mapped[Decimal] = mapped_column(Numeric(14, 2))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class Lead(Base):
+    """Лид — вход воронки CRM (приём → квалификация → распределение → сделка).
+
+    Front-of-funnel из ФАЗЫ 1: входящие заявки из каналов (сайт, мессенджеры,
+    e-mail, телефония, тендеры) собираются здесь до превращения в ``Deal``.
+    ``score``/``qualification`` заполняет квалификатор (эвристики + AI-обоснование,
+    §2.5), ``assigned_to``/``funnel`` — движок распределения (правила: география,
+    продукт, нагрузка, тип воронки). После конвертации ``deal_id`` ссылается на
+    созданную сделку, а ``status`` = ``converted``.
+    """
+
+    __tablename__ = "lead"
+    __table_args__ = {"schema": "sales"}
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(16), default="site", server_default="site")
+    name: Mapped[str] = mapped_column(String(255), default="", server_default="")
+    company: Mapped[str] = mapped_column(String(255), default="", server_default="")
+    phone: Mapped[str | None] = mapped_column(String(64))
+    email: Mapped[str | None] = mapped_column(String(128))
+    region: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    product: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    message: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # new → qualified → routed → converted (или rejected при отказе)
+    status: Mapped[str] = mapped_column(String(16), default="new", server_default="new")
+    score: Mapped[int] = mapped_column(default=0, server_default="0")
+    qualification: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    reason: Mapped[str] = mapped_column(String(255), default="", server_default="")
+    assigned_to: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    funnel: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    deal_id: Mapped[int | None] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

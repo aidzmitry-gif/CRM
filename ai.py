@@ -8,7 +8,7 @@
 """
 from __future__ import annotations
 
-from modules.sales.models import Deal, Message
+from modules.sales.models import Deal, Lead, Message
 
 
 async def draft_reply(gateway, deal: Deal, messages: list[Message]) -> str:
@@ -41,3 +41,20 @@ async def next_step(gateway, deal: Deal, context: str) -> str:
         f"{context} Предложи конкретный следующий шаг."
     )
     return await gateway.complete(prompt, system=system, kind="next_step")
+
+
+async def qualify_lead(gateway, lead: Lead, score: int, verdict: str) -> str:
+    """AI-обоснование квалификации лида (Lead Qualifier & Router, Итерация 1).
+
+    Поверх детерминированного скоринга (``leads.score_lead``): даёт краткое
+    пояснение вывода и рекомендацию по работе с лидом. Вызывается за feature-flag.
+    """
+    system = "Ты — AI-квалификатор лидов отдела продаж. Кратко поясни оценку на русском."
+    verdict_ru = "целевой" if verdict == "target" else "нецелевой"
+    prompt = (
+        f"Лид из канала «{lead.source}», компания «{lead.company or '—'}», "
+        f"регион «{lead.region or '—'}», интерес «{lead.product or '—'}». "
+        f"Сообщение: «{lead.message or '—'}». Оценка {score}/100, вердикт: {verdict_ru}. "
+        f"Поясни вывод и предложи следующее действие."
+    )
+    return await gateway.complete(prompt, system=system, kind="qualify")
