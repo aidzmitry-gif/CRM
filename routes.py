@@ -15,6 +15,7 @@ from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
 from core.services.auth import require_permission
+from modules.sales.ai import draft_reply
 from modules.sales.models import (
     Activity,
     Deal,
@@ -27,6 +28,7 @@ from modules.sales.models import (
 from modules.sales.repository import DealRepository
 from modules.sales.schemas import (
     ActivityCreate,
+    AiDraftOut,
     BoardOut,
     DealCreate,
     DealDetailOut,
@@ -546,3 +548,38 @@ async def create_price_quote(
     )
     await session.commit()
     return {"ok": True}
+
+
+@router.post("/deals/{deal_id}/ai/draft-reply", response_model=AiDraftOut)
+async def ai_draft_reply(
+    deal_id: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+):
+    """AI-черновик ответа клиенту по истории переписки (AI-слой, Итерация 1).
+
+    Под-фича модуля за feature-flag: при выключенном AI — 503. Генерация идёт
+    через общий шлюз ``core.services.llm``; AI-действие фиксируется событием
+    ``ai.draft.generated`` (→ audit, трассировка §3.3).
+    """
+    if not core.services.llm.enabled:
+        raise HTTPException(status_code=503, detail="AI-слой выключен (feature-flag)")
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+
+    messages = (
+        await session.execute(
+            select(Message).where(Message.deal_id == deal_id).order_by(Message.id)
+        )
+    ).scalars().all()
+    text = await draft_reply(core.services.llm, deal, messages)
+    model = core.services.llm.model or "mock"
+
+    core.event_bus.emit(
+        session,
+        "ai.draft.generated",
+        {"deal_id": deal_id, "model": model, "actor": "AI", "entity_ref": f"deal:{deal_id}"},
+    )
+    await session.commit()
+    return AiDraftOut(text=text, model=model)

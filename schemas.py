@@ -181,3 +181,10 @@ class MessageOut(BaseModel):
     author: str
     text: str
     created_at: datetime.datetime
+
+
+class AiDraftOut(BaseModel):
+    """Черновик ответа, сгенерированный AI-подмодулем (Итерация 1)."""
+
+    text: str
+    model: str
