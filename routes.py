@@ -168,6 +168,8 @@ async def _post_document_to_1c(
             "kind": doc.kind,
             "number": doc.number,
             "onec_ref": doc.onec_ref,
+            "counterparty": counterparty,
+            "amount": float(doc.amount),
             "entity_ref": f"deal:{doc.deal_id}",
         },
     )
