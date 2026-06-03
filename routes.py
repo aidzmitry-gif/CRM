@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.domain.models import Approval, Sku
+from core.domain.models import Approval, Contact, Counterparty, Sku
 from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
@@ -32,6 +32,8 @@ from modules.sales.schemas import (
     AiDraftOut,
     AiTextOut,
     BoardOut,
+    ContactCreate,
+    ContactOut,
     DealCreate,
     DealDetailOut,
     DealItemCreate,
@@ -114,6 +116,31 @@ async def _build_item_out(session: AsyncSession, item: DealItem, counterparty: s
         last_price=price.last_price,
         min_price=price.min_price,
     )
+
+
+async def _counterparty_for_deal(
+    session: AsyncSession, deal: Deal, create: bool = False
+) -> Counterparty | None:
+    """Найти контрагента сделки по имени (связь по названию); опц. создать."""
+    cp = (
+        await session.execute(select(Counterparty).where(Counterparty.name == deal.counterparty))
+    ).scalars().first()
+    if cp is None and create:
+        cp = Counterparty(name=deal.counterparty)
+        session.add(cp)
+        await session.flush()
+    return cp
+
+
+async def _clear_primary(session: AsyncSession, counterparty_id: int) -> None:
+    """Снять признак основного со всех контактов контрагента."""
+    rows = (
+        await session.execute(
+            select(Contact).where(Contact.counterparty_id == counterparty_id, Contact.is_primary)
+        )
+    ).scalars().all()
+    for contact in rows:
+        contact.is_primary = False
 
 
 async def _post_document_to_1c(
@@ -431,6 +458,62 @@ async def delete_deal_item(item_id: int, session: AsyncSession = Depends(get_ses
         raise HTTPException(status_code=404, detail="Позиция не найдена")
     await session.delete(item)
     await session.commit()
+
+
+@router.get("/deals/{deal_id}/contacts", response_model=list[ContactOut])
+async def list_contacts(deal_id: int, session: AsyncSession = Depends(get_session)):
+    """Контакты контрагента сделки (основной — первым), sales-13."""
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        return []
+    cp = await _counterparty_for_deal(session, deal)
+    if cp is None:
+        return []
+    return (
+        await session.execute(
+            select(Contact)
+            .where(Contact.counterparty_id == cp.id)
+            .order_by(Contact.is_primary.desc(), Contact.id)
+        )
+    ).scalars().all()
+
+
+@router.post("/deals/{deal_id}/contacts", response_model=ContactOut, status_code=201)
+async def add_contact(
+    deal_id: int, payload: ContactCreate, session: AsyncSession = Depends(get_session)
+):
+    """Добавить контакт контрагенту сделки (контрагент создаётся по имени при нужде)."""
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    cp = await _counterparty_for_deal(session, deal, create=True)
+    assert cp is not None
+    if payload.is_primary:
+        await _clear_primary(session, cp.id)
+    contact = Contact(
+        counterparty_id=cp.id,
+        full_name=payload.full_name,
+        phone=payload.phone,
+        email=payload.email,
+        is_primary=payload.is_primary,
+    )
+    session.add(contact)
+    await session.flush()
+    await session.commit()
+    return contact
+
+
+@router.patch("/contacts/{contact_id}/primary", response_model=ContactOut)
+async def set_primary_contact(contact_id: int, session: AsyncSession = Depends(get_session)):
+    """Назначить контакт основным (снимая признак с остальных контактов контрагента)."""
+    contact = await session.get(Contact, contact_id)
+    if contact is None:
+        raise HTTPException(status_code=404, detail="Контакт не найден")
+    if contact.counterparty_id is not None:
+        await _clear_primary(session, contact.counterparty_id)
+    contact.is_primary = True
+    await session.commit()
+    return contact
 
 
 @router.get("/deals/{deal_id}/documents", response_model=list[DocumentOut])

@@ -126,6 +126,27 @@ class SkuOut(BaseModel):
     unit: str
 
 
+class ContactOut(BaseModel):
+    """Контактное лицо контрагента (sales-13)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    full_name: str
+    phone: str | None = None
+    email: str | None = None
+    is_primary: bool
+
+
+class ContactCreate(BaseModel):
+    """Добавить контакт контрагенту сделки."""
+
+    full_name: str
+    phone: str | None = None
+    email: str | None = None
+    is_primary: bool = False
+
+
 class PriceQuoteCreate(BaseModel):
     """Зафиксировать котировку цены SKU клиенту (Price Engine)."""
 
