@@ -92,6 +92,7 @@ class KpiOut(BaseModel):
 class DealItemOut(BaseModel):
     """Позиция номенклатуры сделки (с данными связанного SKU и ценами клиенту)."""
 
+    id: int = 0
     sku_id: int
     code: str
     title: str
@@ -99,6 +100,30 @@ class DealItemOut(BaseModel):
     qty: float
     last_price: float | None = None  # последняя цена клиенту (Price Engine)
     min_price: float | None = None  # минимальная цена клиенту
+
+
+class DealItemCreate(BaseModel):
+    """Добавить позицию номенклатуры в сделку."""
+
+    sku_id: int
+    qty: float = 1.0
+
+
+class DealItemUpdate(BaseModel):
+    """Изменить позицию (количество)."""
+
+    qty: float
+
+
+class SkuOut(BaseModel):
+    """Позиция справочника номенклатуры (для подбора в сделку)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    code: str
+    title: str
+    unit: str
 
 
 class PriceQuoteCreate(BaseModel):

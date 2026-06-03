@@ -34,7 +34,9 @@ from modules.sales.schemas import (
     BoardOut,
     DealCreate,
     DealDetailOut,
+    DealItemCreate,
     DealItemOut,
+    DealItemUpdate,
     DealRead,
     DealUpdate,
     DocumentCreate,
@@ -45,6 +47,7 @@ from modules.sales.schemas import (
     MessageOut,
     PriceInfo,
     PriceQuoteCreate,
+    SkuOut,
     StageBoard,
 )
 from modules.sales.stages import STAGES
@@ -95,6 +98,22 @@ async def _price_summary(session: AsyncSession, sku_code: str, counterparty: str
     if not prices:
         return PriceInfo(sku_code=sku_code)
     return PriceInfo(sku_code=sku_code, last_price=prices[-1], min_price=min(prices), count=len(prices))
+
+
+async def _build_item_out(session: AsyncSession, item: DealItem, counterparty: str) -> DealItemOut:
+    """Представление позиции с данными SKU и ценами клиенту (Price Engine)."""
+    sku = await session.get(Sku, item.sku_id)
+    price = await _price_summary(session, sku.code if sku else "", counterparty)
+    return DealItemOut(
+        id=item.id,
+        sku_id=item.sku_id,
+        code=sku.code if sku else "",
+        title=sku.title if sku else "",
+        unit=sku.unit if sku else "",
+        qty=float(item.qty),
+        last_price=price.last_price,
+        min_price=price.min_price,
+    )
 
 
 async def _post_document_to_1c(
@@ -261,6 +280,7 @@ async def get_deal(deal_id: int, session: AsyncSession = Depends(get_session)):
 
     items = [
         DealItemOut(
+            id=r.id,
             sku_id=r.sku_id,
             code=skus[r.sku_id].code if r.sku_id in skus else "",
             title=skus[r.sku_id].title if r.sku_id in skus else "",
@@ -341,6 +361,76 @@ async def request_approval(
     )
     await session.commit()
     return approval
+
+
+@router.get("/skus", response_model=list[SkuOut])
+async def list_skus(session: AsyncSession = Depends(get_session)):
+    """Справочник номенклатуры (для подбора позиций в сделку, sales-12)."""
+    return (await session.execute(select(Sku).order_by(Sku.code))).scalars().all()
+
+
+@router.get("/deals/{deal_id}/items", response_model=list[DealItemOut])
+async def list_deal_items(deal_id: int, session: AsyncSession = Depends(get_session)):
+    """Позиции номенклатуры сделки (с данными SKU и ценами клиенту)."""
+    deal = await DealRepository(session).get(deal_id)
+    counterparty = deal.counterparty if deal else ""
+    rows = (
+        await session.execute(
+            select(DealItem).where(DealItem.deal_id == deal_id).order_by(DealItem.id)
+        )
+    ).scalars().all()
+    return [await _build_item_out(session, r, counterparty) for r in rows]
+
+
+@router.post("/deals/{deal_id}/items", response_model=DealItemOut, status_code=201)
+async def add_deal_item(
+    deal_id: int,
+    payload: DealItemCreate,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+):
+    """Добавить позицию номенклатуры в сделку (подбор из SKU, sales-12)."""
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    if await session.get(Sku, payload.sku_id) is None:
+        raise HTTPException(status_code=404, detail="Номенклатура не найдена")
+    item = DealItem(deal_id=deal_id, sku_id=payload.sku_id, qty=Decimal(str(payload.qty)))
+    session.add(item)
+    await session.flush()
+    core.event_bus.emit(
+        session,
+        "sales.item.changed",
+        {"deal_id": deal_id, "action": "added", "entity_ref": f"deal:{deal_id}"},
+    )
+    await session.commit()
+    return await _build_item_out(session, item, deal.counterparty)
+
+
+@router.patch("/deal-items/{item_id}", response_model=DealItemOut)
+async def update_deal_item(
+    item_id: int,
+    payload: DealItemUpdate,
+    session: AsyncSession = Depends(get_session),
+):
+    """Изменить количество в позиции сделки."""
+    item = await session.get(DealItem, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
+    item.qty = Decimal(str(payload.qty))
+    deal = await DealRepository(session).get(item.deal_id)
+    await session.commit()
+    return await _build_item_out(session, item, deal.counterparty if deal else "")
+
+
+@router.delete("/deal-items/{item_id}", status_code=204)
+async def delete_deal_item(item_id: int, session: AsyncSession = Depends(get_session)):
+    """Удалить позицию номенклатуры из сделки."""
+    item = await session.get(DealItem, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
+    await session.delete(item)
+    await session.commit()
 
 
 @router.get("/deals/{deal_id}/documents", response_model=list[DocumentOut])
