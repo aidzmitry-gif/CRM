@@ -11,7 +11,7 @@ import logging
 from core.runtime.contract import ModuleContract, Widget
 from core.runtime.core import Core
 from modules.sales import routes, telegram
-from modules.sales.events import on_deal_created
+from modules.sales.events import on_deal_created, on_incoming_message_ai
 from modules.sales.permissions import PERMISSIONS, ROLES
 from modules.sales.workflows import DealApprovalWorkflow
 
@@ -26,6 +26,8 @@ class SalesModule(ModuleContract):
     def register(self, core: Core) -> None:
         core.include_router(routes.router, prefix=self.api_prefix)
         core.subscribe("sales.deal.created", on_deal_created)
+        # AI-агент модуля как обработчик событий (Итерация 1, §2.5)
+        core.subscribe("sales.message.sent", on_incoming_message_ai)
         core.register_workflow(DealApprovalWorkflow.name, DealApprovalWorkflow)
         core.declare_permissions(PERMISSIONS)
         for role in ROLES:
