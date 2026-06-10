@@ -12,7 +12,6 @@ from core.runtime.contract import ModuleContract, Widget
 from core.runtime.core import Core
 from modules.sales import routes, telegram
 from modules.sales.events import (
-    on_campaign_launched,
     on_deal_created,
     on_incoming_message_ai,
     on_payment_paid,
@@ -35,7 +34,6 @@ class SalesModule(ModuleContract):
         # AI-агент модуля как обработчик событий (Итерация 1, §2.5)
         core.subscribe("sales.message.sent", on_incoming_message_ai)
         # обратные межмодульные связи, замыкающие циклы (§2.5)
-        core.subscribe("marketing.campaign.launched", on_campaign_launched)  # лиды → воронка
         core.subscribe("finance.payment.paid", on_payment_paid)  # оплата → документ оплачен
         core.subscribe("logistics.shipment.delivered", on_shipment_delivered)  # доставка → won
         core.register_workflow(DealApprovalWorkflow.name, DealApprovalWorkflow)
