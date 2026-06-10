@@ -15,33 +15,6 @@ async def on_deal_created(payload: dict) -> None:
     )
 
 
-async def on_campaign_launched(payload: dict, ctx) -> None:
-    """Кампания запущена → привлечённые лиды попадают в приём лидов CRM (marketing → sales).
-
-    Маркетинг питает воронку через её вход: создаёт записи лидов (front-of-funnel),
-    которые менеджер/AI затем квалифицирует, распределяет и превращает в сделки —
-    а не создаёт сделки напрямую. Так замыкается цикл «кампания → лиды → воронка».
-    """
-    if ctx is None:
-        return
-    from modules.sales.leads import LEAD_SOURCES
-    from modules.sales.models import Lead
-
-    count = min(int(payload.get("leads", 0) or 0), 10)
-    name = payload.get("name", "Кампания")
-    channel = payload.get("channel", "site")
-    source = channel if channel in LEAD_SOURCES else "site"
-    for _ in range(count):
-        ctx.session.add(
-            Lead(
-                source=source,
-                message=f"Заявка из кампании «{name}» (канал {channel})",
-                status="new",
-            )
-        )
-    logger.info("Sales: из кампании «%s» принято лидов: %d", name, count)
-
-
 async def on_payment_paid(payload: dict, ctx) -> None:
     """Платёж проведён → документ-счёт помечается оплаченным (finance → sales)."""
     if ctx is None:
