@@ -15,6 +15,46 @@ async def on_deal_created(payload: dict) -> None:
     )
 
 
+async def on_lead_converted(payload: dict, ctx) -> None:
+    """Лид сконвертирован (модуль лидов) → создать сделку (leads → sales).
+
+    Точка интеграции с репозиторием лидов через шину (§2.4/§2.5): модуль лидов не
+    импортирует sales — он публикует ``leads.lead.converted``, а sales создаёт
+    ``Deal`` (стадия ``new``, ответственный и приоритет из payload) и отвечает
+    ``sales.deal.created`` с ``lead_id``/``deal_id``, по которому лид получает
+    обратную ссылку на сделку.
+    """
+    if ctx is None:
+        return
+    lead_id = payload.get("lead_id")
+    if not lead_id:
+        return
+    from modules.sales.models import Deal
+
+    deal = Deal(
+        number=f"CRM-LEAD-{lead_id}",
+        title=payload.get("title") or "Лид",
+        counterparty=payload.get("counterparty") or "Новый лид",
+        owner=payload.get("owner", ""),
+        stage="new",
+        priority=payload.get("priority", "Средний"),
+    )
+    ctx.session.add(deal)
+    await ctx.session.flush()
+    ctx.services.event_bus.emit(
+        ctx.session,
+        "sales.deal.created",
+        {
+            "number": deal.number,
+            "title": deal.title,
+            "lead_id": lead_id,
+            "deal_id": deal.id,
+            "entity_ref": f"deal:{deal.id}",
+        },
+    )
+    logger.info("Sales: из лида %s создана сделка %s", lead_id, deal.number)
+
+
 async def on_payment_paid(payload: dict, ctx) -> None:
     """Платёж проведён → документ-счёт помечается оплаченным (finance → sales)."""
     if ctx is None:
