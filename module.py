@@ -14,6 +14,7 @@ from modules.sales import routes, telegram
 from modules.sales.events import (
     on_deal_created,
     on_incoming_message_ai,
+    on_lead_converted,
     on_payment_paid,
     on_shipment_delivered,
 )
@@ -34,6 +35,7 @@ class SalesModule(ModuleContract):
         # AI-агент модуля как обработчик событий (Итерация 1, §2.5)
         core.subscribe("sales.message.sent", on_incoming_message_ai)
         # обратные межмодульные связи, замыкающие циклы (§2.5)
+        core.subscribe("leads.lead.converted", on_lead_converted)  # лид → сделка (репо лидов)
         core.subscribe("finance.payment.paid", on_payment_paid)  # оплата → документ оплачен
         core.subscribe("logistics.shipment.delivered", on_shipment_delivered)  # доставка → won
         core.register_workflow(DealApprovalWorkflow.name, DealApprovalWorkflow)
