@@ -21,6 +21,8 @@ class DealCreate(BaseModel):
     closed_date: str | None = None
     focus: bool = False
     starred: bool = False
+    probability: int | None = None
+    expected_close_date: str | None = None
 
 
 class DealUpdate(BaseModel):
@@ -37,6 +39,8 @@ class DealUpdate(BaseModel):
     closed_date: str | None = None
     focus: bool | None = None
     starred: bool | None = None
+    probability: int | None = None
+    expected_close_date: str | None = None
 
 
 class DealRead(BaseModel):
@@ -57,6 +61,12 @@ class DealRead(BaseModel):
     closed_date: str | None = None
     focus: bool
     starred: bool
+    probability: int | None = None
+    expected_close_date: str | None = None
+    created_at: datetime.datetime | None = None
+    stage_changed_at: datetime.datetime | None = None
+    lost_reason_code: str | None = None
+    lost_comment: str | None = None
 
 
 class StageBoard(BaseModel):
@@ -67,6 +77,7 @@ class StageBoard(BaseModel):
     color: str
     count: int
     sum: float
+    weighted: float = 0.0  # SALES-44: Σ(amount × вероятность) по колонке
     deals: list[DealRead]
 
 
@@ -156,6 +167,7 @@ class ChatOut(BaseModel):
     last_text: str
     channel: str
     direction: str
+    unread: int = 0  # SALES-49: непрочитанных входящих по диалогу
 
 
 class PriceQuoteCreate(BaseModel):
@@ -325,3 +337,30 @@ class LeadConvertOut(BaseModel):
     deal_id: int
     number: str
     status: str
+
+
+class LossReasonOut(BaseModel):
+    """Причина отказа из справочника (SALES-40)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    code: str
+    title: str
+
+
+class LoseRequest(BaseModel):
+    """Закрыть сделку в отказ: причина (обязательна) + комментарий."""
+
+    reason_code: str
+    comment: str | None = None
+
+
+class StageEventOut(BaseModel):
+    """Запись истории смены стадий сделки (SALES-43)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    from_stage: str | None = None
+    to_stage: str
+    changed_by: str
+    changed_at: datetime.datetime

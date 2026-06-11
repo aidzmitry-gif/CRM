@@ -29,6 +29,15 @@ class Deal(Base):
     closed_date: Mapped[str | None] = mapped_column(String(32))
     focus: Mapped[bool] = mapped_column(default=False)
     starred: Mapped[bool] = mapped_column(default=False)
+    # SALES-44: прогноз — вероятность (0..100) и ожидаемая дата закрытия
+    probability: Mapped[int | None] = mapped_column()
+    expected_close_date: Mapped[str | None] = mapped_column(String(32))
+    # SALES-43: возраст в стадии и цикл сделки
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    stage_changed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    # SALES-40: причина отказа (код из справочника loss_reason) и комментарий
+    lost_reason_code: Mapped[str | None] = mapped_column(String(32))
+    lost_comment: Mapped[str | None] = mapped_column(String(255))
 
 
 class KpiTarget(Base):
@@ -119,6 +128,7 @@ class Message(Base):
     author: Mapped[str] = mapped_column(String(128), default="", server_default="")
     text: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    read_at: Mapped[datetime | None] = mapped_column(DateTime)  # SALES-49: когда прочитано (входящее)
 
 
 class PriceQuote(Base):
@@ -170,3 +180,30 @@ class Lead(Base):
     funnel: Mapped[str] = mapped_column(String(16), default="", server_default="")
     deal_id: Mapped[int | None] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class LossReason(Base):
+    """Справочник причин отказа по сделке (SALES-40)."""
+
+    __tablename__ = "loss_reason"
+    __table_args__ = {"schema": "sales"}
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True)
+    title: Mapped[str] = mapped_column(String(128))
+    sort_order: Mapped[int] = mapped_column(default=0, server_default="0")
+    active: Mapped[bool] = mapped_column(default=True)
+
+
+class DealStageEvent(Base):
+    """История смены стадий сделки (SALES-43): из стадии → в стадию, кто и когда."""
+
+    __tablename__ = "deal_stage_event"
+    __table_args__ = {"schema": "sales"}
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    deal_id: Mapped[int] = mapped_column(ForeignKey("sales.deal.id"))
+    from_stage: Mapped[str | None] = mapped_column(String(32))
+    to_stage: Mapped[str] = mapped_column(String(32))
+    changed_by: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    changed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

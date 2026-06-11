@@ -14,7 +14,7 @@ from core.domain.models import Approval, Contact, Counterparty, Sku
 from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
-from core.services.auth import require_permission
+from core.services.auth import CurrentUser, get_current_user, require_permission
 from modules.sales.ai import draft_reply, next_step, qualify_lead, summarize
 from modules.sales.leads import lead_priority, route_lead, score_lead
 from modules.sales.models import (
@@ -22,12 +22,14 @@ from modules.sales.models import (
     Deal,
     DealDocument,
     DealItem,
+    DealStageEvent,
     KpiTarget,
     Lead,
+    LossReason,
     Message,
     PriceQuote,
 )
-from modules.sales.repository import DealRepository
+from modules.sales.repository import DealRepository, record_stage
 from modules.sales.schemas import (
     ActivityCreate,
     AiAssistRequest,
@@ -53,12 +55,15 @@ from modules.sales.schemas import (
     LeadOut,
     LeadQualifyOut,
     LeadRouteOut,
+    LoseRequest,
+    LossReasonOut,
     MessageCreate,
     MessageOut,
     PriceInfo,
     PriceQuoteCreate,
     SkuOut,
     StageBoard,
+    StageEventOut,
 )
 from modules.sales.stages import STAGES
 
@@ -74,6 +79,14 @@ RESERVES_STOCK = {"order"}
 # План/факт по периодам (sales-34): окно факта (дней) и множитель плана (рабочих дней).
 PERIOD_DAYS = {"day": 1, "week": 7, "month": 30, "quarter": 90, "year": 365}
 PERIOD_MULT = {"day": 1, "week": 5, "month": 22, "quarter": 65, "year": 250}
+# SALES-44: дефолтная вероятность по стадии (если у сделки не задана probability).
+PROB_DEFAULTS = {"new": 10, "qual": 30, "prop": 50, "appr": 75, "won": 100, "lost": 0}
+
+
+def _deal_weight(deal: Deal) -> float:
+    """Взвешенная сумма сделки: amount × вероятность (своя или дефолт стадии)."""
+    p = deal.probability if deal.probability is not None else PROB_DEFAULTS.get(deal.stage, 0)
+    return float(deal.amount) * p / 100
 
 
 def _utcnow() -> datetime:
@@ -203,6 +216,7 @@ async def board(session: AsyncSession = Depends(get_session)) -> BoardOut:
             color=s["color"],
             count=len(by_stage.get(s["id"], [])),
             sum=float(sum(d.amount for d in by_stage.get(s["id"], []))),
+            weighted=float(sum(_deal_weight(d) for d in by_stage.get(s["id"], []))),
             deals=[DealRead.model_validate(d) for d in by_stage.get(s["id"], [])],
         )
         for s in STAGES
@@ -272,8 +286,18 @@ async def create_activity(payload: ActivityCreate, session: AsyncSession = Depen
 
 
 @router.get("/deals", response_model=list[DealRead])
-async def list_deals(session: AsyncSession = Depends(get_session)):
-    """Плоский список сделок."""
+async def list_deals(stuck_days: int = 0, session: AsyncSession = Depends(get_session)):
+    """Плоский список сделок. ``stuck_days>0`` — только «висяки» (SALES-43): открытые
+    сделки без смены стадии дольше N дней (по ``stage_changed_at``)."""
+    if stuck_days > 0:
+        cutoff = _utcnow() - timedelta(days=stuck_days)
+        return (
+            await session.execute(
+                select(Deal)
+                .where(Deal.stage.notin_(["won", "lost"]), Deal.stage_changed_at < cutoff)
+                .order_by(Deal.id)
+            )
+        ).scalars().all()
     return await DealRepository(session).list()
 
 
@@ -350,15 +374,114 @@ async def update_deal(
     deal_id: int,
     payload: DealUpdate,
     session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(get_current_user),
 ):
-    """Частично обновить сделку (например, сменить стадию при drag&drop)."""
+    """Частично обновить сделку. Смена стадии (drag&drop) пишется в историю и
+    обновляет ``stage_changed_at`` через единый хелпер ``record_stage`` (SALES-43)."""
     repo = DealRepository(session)
     deal = await repo.get(deal_id)
     if deal is None:
         raise HTTPException(status_code=404, detail="Сделка не найдена")
-    await repo.update(deal, payload.model_dump(exclude_unset=True))
+    data = payload.model_dump(exclude_unset=True)
+    new_stage = data.pop("stage", None)
+    if new_stage is not None and new_stage != deal.stage:
+        record_stage(session, deal, new_stage, by=user.username)
+    await repo.update(deal, data)
     await session.commit()
     return deal
+
+
+@router.get("/loss-reasons", response_model=list[LossReasonOut])
+async def loss_reasons(session: AsyncSession = Depends(get_session)):
+    """Справочник активных причин отказа (для выпадашки модалки «Отказ», SALES-40)."""
+    return (
+        await session.execute(
+            select(LossReason).where(LossReason.active).order_by(LossReason.sort_order)
+        )
+    ).scalars().all()
+
+
+@router.post("/deals/{deal_id}/lose", response_model=DealRead)
+async def lose_deal(
+    deal_id: int,
+    payload: LoseRequest,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Закрыть сделку в отказ с обязательной причиной (SALES-40).
+
+    Причина обязательна; если справочник заполнен — должна быть активным кодом.
+    Ставит стадию ``lost`` (через ``record_stage`` → история + ``stage_changed_at``),
+    дату закрытия и публикует ``sales.deal.lost`` (→ audit)."""
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    if deal.stage == "lost":
+        raise HTTPException(status_code=409, detail="Сделка уже закрыта в отказ")
+    code = (payload.reason_code or "").strip()
+    if not code:
+        raise HTTPException(status_code=422, detail="Нужна причина отказа")
+    active_codes = set(
+        (await session.execute(select(LossReason.code).where(LossReason.active))).scalars().all()
+    )
+    if active_codes and code not in active_codes:
+        raise HTTPException(status_code=422, detail="Неизвестная причина отказа")
+
+    deal.lost_reason_code = code
+    deal.lost_comment = payload.comment
+    deal.closed_date = date.today().strftime("%d.%m.%Y")
+    record_stage(session, deal, "lost", by=user.username)
+    core.event_bus.emit(
+        session,
+        "sales.deal.lost",
+        {
+            "deal_id": deal.id, "number": deal.number, "reason_code": code,
+            "amount": float(deal.amount), "owner": deal.owner, "entity_ref": f"deal:{deal.id}",
+        },
+    )
+    await session.commit()
+    return deal
+
+
+@router.post("/deals/{deal_id}/win", response_model=DealRead)
+async def win_deal(
+    deal_id: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Закрыть сделку успешно (SALES-40). Единый путь с логистикой (`record_stage`):
+    стадия ``won``, дата закрытия, событие ``sales.deal.won`` (→ audit)."""
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    if deal.stage == "won":
+        raise HTTPException(status_code=409, detail="Сделка уже выиграна")
+    deal.closed_date = date.today().strftime("%d.%m.%Y")
+    record_stage(session, deal, "won", by=user.username)
+    core.event_bus.emit(
+        session,
+        "sales.deal.won",
+        {
+            "deal_id": deal.id, "number": deal.number, "amount": float(deal.amount),
+            "owner": deal.owner, "entity_ref": f"deal:{deal.id}",
+        },
+    )
+    await session.commit()
+    return deal
+
+
+@router.get("/deals/{deal_id}/history", response_model=list[StageEventOut])
+async def deal_history(deal_id: int, session: AsyncSession = Depends(get_session)):
+    """Хронология смен стадий сделки (SALES-43)."""
+    return (
+        await session.execute(
+            select(DealStageEvent)
+            .where(DealStageEvent.deal_id == deal_id)
+            .order_by(DealStageEvent.id)
+        )
+    ).scalars().all()
 
 
 @router.post("/deals", response_model=DealRead, status_code=201)
@@ -520,6 +643,17 @@ async def list_chats(session: AsyncSession = Depends(get_session)):
         await session.execute(select(Message).order_by(Message.id.desc()).limit(100))
     ).scalars().all()
     deals = {d.id: d for d in (await session.execute(select(Deal))).scalars().all()}
+    # SALES-49: непрочитанные входящие по сделкам (для бейджа в панели чатов)
+    unread_map = {
+        deal_id: int(n)
+        for deal_id, n in (
+            await session.execute(
+                select(Message.deal_id, func.count())
+                .where(Message.direction == "in", Message.read_at.is_(None))
+                .group_by(Message.deal_id)
+            )
+        ).all()
+    }
     chats: list[ChatOut] = []
     seen: set[int] = set()
     for m in msgs:
@@ -535,6 +669,7 @@ async def list_chats(session: AsyncSession = Depends(get_session)):
                 last_text=m.text,
                 channel=m.channel,
                 direction=m.direction,
+                unread=unread_map.get(m.deal_id, 0),
             )
         )
         if len(chats) >= 20:
@@ -731,6 +866,28 @@ async def create_message(
     )
     await session.commit()
     return msg
+
+
+@router.post("/deals/{deal_id}/messages/read")
+async def mark_messages_read(deal_id: int, session: AsyncSession = Depends(get_session)):
+    """Пометить входящие сообщения сделки прочитанными (обнуляет счётчик, SALES-49)."""
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    rows = (
+        await session.execute(
+            select(Message).where(
+                Message.deal_id == deal_id,
+                Message.direction == "in",
+                Message.read_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    now = _utcnow()
+    for m in rows:
+        m.read_at = now
+    await session.commit()
+    return {"ok": True, "read": len(rows)}
 
 
 @router.get("/prices/{sku_code}", response_model=PriceInfo)

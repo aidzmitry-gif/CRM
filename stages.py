@@ -9,4 +9,5 @@ STAGES: list[dict] = [
     {"id": "prop", "title": "Коммерческое предл.", "color": "#F59E0B"},
     {"id": "appr", "title": "Согласование", "color": "#14B8A6"},
     {"id": "won", "title": "Закрыто: Успешно", "color": "#22C55E"},
+    {"id": "lost", "title": "Закрыто: Отказ", "color": "#EF4444"},
 ]

@@ -60,17 +60,25 @@ async def on_payment_paid(payload: dict, ctx) -> None:
 
 
 async def on_shipment_delivered(payload: dict, ctx) -> None:
-    """Отгрузка доставлена → сделка закрывается успешно (logistics → sales)."""
+    """Отгрузка доставлена → сделка закрывается успешно (logistics → sales).
+
+    Закрытие в ``won`` идёт через тот же ``record_stage``, что и ручное закрытие
+    в карточке — чтобы стадия, ``stage_changed_at``, история и дата не разъехались
+    (ТЗ §9, SALES-40/43)."""
     if ctx is None:
         return
     deal_id = payload.get("deal_id")
     if not deal_id:
         return
+    from datetime import date
+
     from modules.sales.models import Deal
+    from modules.sales.repository import record_stage
 
     deal = await ctx.session.get(Deal, deal_id)
-    if deal is not None:
-        deal.stage = "won"
+    if deal is not None and deal.stage != "won":
+        record_stage(ctx.session, deal, "won", by="logistics")
+        deal.closed_date = deal.closed_date or date.today().strftime("%d.%m.%Y")
         logger.info("Sales: сделка %s закрыта успешно (доставлено)", deal_id)
 
 
