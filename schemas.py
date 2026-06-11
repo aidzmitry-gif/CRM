@@ -364,3 +364,37 @@ class StageEventOut(BaseModel):
     to_stage: str
     changed_by: str
     changed_at: datetime.datetime
+
+
+class TaskCreate(BaseModel):
+    """Новая задача по сделке (SALES-41)."""
+
+    title: str
+    kind: str = "other"  # call|meeting|email|chat|doc|other
+    assignee_id: int | None = None
+    due_at: datetime.datetime | None = None
+
+
+class TaskUpdate(BaseModel):
+    """Изменение задачи: перенос срока, исполнение, отмена."""
+
+    title: str | None = None
+    kind: str | None = None
+    assignee_id: int | None = None
+    due_at: datetime.datetime | None = None
+    status: str | None = None  # open|done|canceled
+    result: str | None = None
+
+
+class TaskOut(BaseModel):
+    """Задача по сделке (``overdue`` — вычисляемый флаг просрочки)."""
+
+    id: int
+    deal_id: int
+    title: str
+    kind: str
+    assignee_id: int | None = None
+    due_at: datetime.datetime | None = None
+    status: str
+    result: str | None = None
+    overdue: bool = False

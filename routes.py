@@ -23,6 +23,7 @@ from modules.sales.models import (
     DealDocument,
     DealItem,
     DealStageEvent,
+    DealTask,
     KpiTarget,
     Lead,
     LossReason,
@@ -64,6 +65,9 @@ from modules.sales.schemas import (
     SkuOut,
     StageBoard,
     StageEventOut,
+    TaskCreate,
+    TaskOut,
+    TaskUpdate,
 )
 from modules.sales.stages import STAGES
 
@@ -92,6 +96,22 @@ def _deal_weight(deal: Deal) -> float:
 def _utcnow() -> datetime:
     # наивный UTC — единообразно для SQLite и PostgreSQL
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _task_out(task: DealTask) -> TaskOut:
+    """Представление задачи с вычисляемым флагом просрочки (SALES-41)."""
+    overdue = task.status == "open" and task.due_at is not None and task.due_at < _utcnow()
+    return TaskOut(
+        id=task.id,
+        deal_id=task.deal_id,
+        title=task.title,
+        kind=task.kind,
+        assignee_id=task.assignee_id,
+        due_at=task.due_at,
+        status=task.status,
+        result=task.result,
+        overdue=overdue,
+    )
 
 
 async def _deal_stock_items(session: AsyncSession, deal_id: int) -> list[dict]:
@@ -286,15 +306,31 @@ async def create_activity(payload: ActivityCreate, session: AsyncSession = Depen
 
 
 @router.get("/deals", response_model=list[DealRead])
-async def list_deals(stuck_days: int = 0, session: AsyncSession = Depends(get_session)):
+async def list_deals(
+    stuck_days: int = 0,
+    has_open_task: bool | None = None,
+    session: AsyncSession = Depends(get_session),
+):
     """Плоский список сделок. ``stuck_days>0`` — только «висяки» (SALES-43): открытые
-    сделки без смены стадии дольше N дней (по ``stage_changed_at``)."""
+    сделки без смены стадии дольше N дней. ``has_open_task=false`` — открытые сделки
+    без единой открытой задачи (отчёт «брошенные», SALES-41)."""
     if stuck_days > 0:
         cutoff = _utcnow() - timedelta(days=stuck_days)
         return (
             await session.execute(
                 select(Deal)
                 .where(Deal.stage.notin_(["won", "lost"]), Deal.stage_changed_at < cutoff)
+                .order_by(Deal.id)
+            )
+        ).scalars().all()
+    if has_open_task is False:
+        open_deal_ids = (
+            select(DealTask.deal_id).where(DealTask.status == "open").distinct()
+        )
+        return (
+            await session.execute(
+                select(Deal)
+                .where(Deal.stage.notin_(["won", "lost"]), Deal.id.notin_(open_deal_ids))
                 .order_by(Deal.id)
             )
         ).scalars().all()
@@ -482,6 +518,75 @@ async def deal_history(deal_id: int, session: AsyncSession = Depends(get_session
             .order_by(DealStageEvent.id)
         )
     ).scalars().all()
+
+
+@router.get("/deals/{deal_id}/tasks", response_model=list[TaskOut])
+async def list_tasks(deal_id: int, session: AsyncSession = Depends(get_session)):
+    """Задачи по сделке (SALES-41): открытые — первыми, по сроку."""
+    rows = (
+        await session.execute(
+            select(DealTask)
+            .where(DealTask.deal_id == deal_id)
+            .order_by((DealTask.status == "open").desc(), DealTask.due_at, DealTask.id)
+        )
+    ).scalars().all()
+    return [_task_out(t) for t in rows]
+
+
+@router.post("/deals/{deal_id}/tasks", response_model=TaskOut, status_code=201)
+async def create_task(
+    deal_id: int,
+    payload: TaskCreate,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+):
+    """Поставить задачу по сделке (SALES-41) — событие ``sales.task.created`` (→ audit)."""
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    task = DealTask(
+        deal_id=deal_id,
+        title=payload.title,
+        kind=payload.kind,
+        assignee_id=payload.assignee_id,
+        due_at=payload.due_at,
+    )
+    session.add(task)
+    await session.flush()
+    core.event_bus.emit(
+        session,
+        "sales.task.created",
+        {"task_id": task.id, "deal_id": deal_id, "entity_ref": f"deal:{deal_id}"},
+    )
+    await session.commit()
+    return _task_out(task)
+
+
+@router.patch("/tasks/{task_id}", response_model=TaskOut)
+async def update_task(
+    task_id: int,
+    payload: TaskUpdate,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+):
+    """Изменить задачу: перенос срока / исполнение / отмена. При закрытии (``done``)
+    ставит ``done_at`` и публикует ``sales.task.completed`` (→ audit, SALES-41)."""
+    task = await session.get(DealTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    data = payload.model_dump(exclude_unset=True)
+    becoming_done = data.get("status") == "done" and task.status != "done"
+    for key, value in data.items():
+        setattr(task, key, value)
+    if becoming_done:
+        task.done_at = _utcnow()
+        core.event_bus.emit(
+            session,
+            "sales.task.completed",
+            {"task_id": task.id, "deal_id": task.deal_id, "entity_ref": f"deal:{task.deal_id}"},
+        )
+    await session.commit()
+    return _task_out(task)
 
 
 @router.post("/deals", response_model=DealRead, status_code=201)

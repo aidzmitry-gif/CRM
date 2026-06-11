@@ -207,3 +207,24 @@ class DealStageEvent(Base):
     to_stage: Mapped[str] = mapped_column(String(32))
     changed_by: Mapped[str] = mapped_column(String(128), default="", server_default="")
     changed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class DealTask(Base):
+    """Задача по сделке (SALES-41): что сделать, ответственный, дедлайн, статус.
+
+    ``assignee_id`` — мягкая ссылка на ``hr.employee`` (без cross-schema FK). Просрочка
+    вычисляется на лету: ``status == open`` и ``due_at < now``."""
+
+    __tablename__ = "deal_task"
+    __table_args__ = {"schema": "sales"}
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    deal_id: Mapped[int] = mapped_column(ForeignKey("sales.deal.id"))
+    title: Mapped[str] = mapped_column(String(255))
+    kind: Mapped[str] = mapped_column(String(16), default="other", server_default="other")
+    assignee_id: Mapped[int | None] = mapped_column()
+    due_at: Mapped[datetime | None] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(String(16), default="open", server_default="open")
+    result: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    done_at: Mapped[datetime | None] = mapped_column(DateTime)
