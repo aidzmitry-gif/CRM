@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Date, DateTime, ForeignKey, Numeric, String, Text, func
+from sqlalchemy import Date, DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db.base import Base
@@ -68,6 +68,7 @@ class Activity(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     kpi_key: Mapped[str] = mapped_column(String(32))
     owner: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    owner_id: Mapped[int | None] = mapped_column()  # SALES-47: мягкая ссылка на hr.employee
     value: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("1"), server_default="1")
     date: Mapped[date] = mapped_column(Date)
 
@@ -228,3 +229,35 @@ class DealTask(Base):
     result: Mapped[str | None] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     done_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class PlanTarget(Base):
+    """Личный план продаж по периоду (SALES-47).
+
+    Продавец ставит себе план, согласует с РОПом через approvals-движок.
+    Метрики (``metric``) — 16 показателей: calls, cold_calls, leads, deal_activities,
+    new_deals_count, new_deals_amount, invoice_payment_conv, tenders_count,
+    tenders_amount, won_count, won_amount, future_won, payments_vat, shipments,
+    gross_profit, avg_deal. Валюта: BYN.
+
+    ``period_type`` / ``period_key``: day/2026-06-12, week/2026-W24,
+    month/2026-06, quarter/2026-Q2, year/2026.
+
+    Статусы: ``draft`` → ``pending_approval`` → ``approved`` / ``rejected``.
+    """
+
+    __tablename__ = "plan_target"
+    __table_args__ = (
+        UniqueConstraint("owner_id", "metric", "period_type", "period_key", name="uq_plan_target"),
+        {"schema": "sales"},
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column()  # мягкая ссылка на hr.employee (чей план)
+    metric: Mapped[str] = mapped_column(String(32))
+    period_type: Mapped[str] = mapped_column(String(8))  # day/week/month/quarter/year
+    period_key: Mapped[str] = mapped_column(String(10))  # 2026-06-12 / 2026-W24 / 2026-06 / 2026-Q2 / 2026
+    target: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    status: Mapped[str] = mapped_column(String(16), default="draft", server_default="draft")
+    approved_by: Mapped[str | None] = mapped_column(String(128))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime)
