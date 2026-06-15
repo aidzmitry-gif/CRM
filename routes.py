@@ -69,7 +69,7 @@ from modules.sales.schemas import (
     TaskOut,
     TaskUpdate,
 )
-from modules.sales.stages import STAGES
+from modules.sales.stages import PROBABILITY_BY_STAGE, STAGES, TERMINAL_STAGES
 
 router = APIRouter(tags=["sales"])
 
@@ -83,13 +83,11 @@ RESERVES_STOCK = {"order"}
 # План/факт по периодам (sales-34): окно факта (дней) и множитель плана (рабочих дней).
 PERIOD_DAYS = {"day": 1, "week": 7, "month": 30, "quarter": 90, "year": 365}
 PERIOD_MULT = {"day": 1, "week": 5, "month": 22, "quarter": 65, "year": 250}
-# SALES-44: дефолтная вероятность по стадии (если у сделки не задана probability).
-PROB_DEFAULTS = {"new": 10, "qual": 30, "prop": 50, "appr": 75, "won": 100, "lost": 0}
 
 
 def _deal_weight(deal: Deal) -> float:
     """Взвешенная сумма сделки: amount × вероятность (своя или дефолт стадии)."""
-    p = deal.probability if deal.probability is not None else PROB_DEFAULTS.get(deal.stage, 0)
+    p = deal.probability if deal.probability is not None else PROBABILITY_BY_STAGE.get(deal.stage, 0)
     return float(deal.amount) * p / 100
 
 
@@ -222,9 +220,12 @@ async def ping() -> dict:
 
 
 @router.get("/board", response_model=BoardOut)
-async def board(session: AsyncSession = Depends(get_session)) -> BoardOut:
-    """Доска сделок: сделки сгруппированы по стадиям воронки с агрегатами."""
+async def board(owner: str = "", session: AsyncSession = Depends(get_session)) -> BoardOut:
+    """Доска сделок: сделки по стадиям с агрегатами. ``owner`` — фильтр по
+    ответственному (видимость «по менеджеру», SALES-42)."""
     deals = await DealRepository(session).list()
+    if owner:
+        deals = [d for d in deals if d.owner == owner]
     by_stage: dict[str, list[Deal]] = defaultdict(list)
     for deal in deals:
         by_stage[deal.stage].append(deal)
@@ -319,7 +320,7 @@ async def list_deals(
         return (
             await session.execute(
                 select(Deal)
-                .where(Deal.stage.notin_(["won", "lost"]), Deal.stage_changed_at < cutoff)
+                .where(Deal.stage.notin_(TERMINAL_STAGES), Deal.stage_changed_at < cutoff)
                 .order_by(Deal.id)
             )
         ).scalars().all()
@@ -330,7 +331,7 @@ async def list_deals(
         return (
             await session.execute(
                 select(Deal)
-                .where(Deal.stage.notin_(["won", "lost"]), Deal.id.notin_(open_deal_ids))
+                .where(Deal.stage.notin_(TERMINAL_STAGES), Deal.id.notin_(open_deal_ids))
                 .order_by(Deal.id)
             )
         ).scalars().all()
