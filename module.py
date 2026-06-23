@@ -11,6 +11,12 @@ import logging
 from core.runtime.contract import ModuleContract, Widget
 from core.runtime.core import Core
 from modules.sales import routes, telegram
+from modules.sales.calls import (
+    on_call_answered,
+    on_call_ended,
+    on_call_transfer,
+    on_incoming_call,
+)
 from modules.sales.events import (
     on_deal_created,
     on_incoming_message_ai,
@@ -38,6 +44,11 @@ class SalesModule(ModuleContract):
         core.subscribe("leads.lead.converted", on_lead_converted)  # лид → сделка (репо лидов)
         core.subscribe("finance.payment.paid", on_payment_paid)  # оплата → документ оплачен
         core.subscribe("logistics.shipment.delivered", on_shipment_delivered)  # доставка → won
+        # телефония (SALES-50): события коннектора → журнал звонков + push карточки продавцу
+        core.subscribe("telephony.call.incoming", on_incoming_call)
+        core.subscribe("telephony.call.answered", on_call_answered)
+        core.subscribe("telephony.call.ended", on_call_ended)
+        core.subscribe("telephony.call.transfer", on_call_transfer)
         core.register_workflow(DealApprovalWorkflow.name, DealApprovalWorkflow)
         core.declare_permissions(PERMISSIONS)
         for role in ROLES:
