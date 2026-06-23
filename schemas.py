@@ -212,6 +212,8 @@ class DocumentOut(BaseModel):
     status: str
     onec_ref: str | None = None
     amount: float
+    valid_until: datetime.date | None = None  # SALES-51: срок действия счёта (резерв)
+    reserve_status: str = "none"  # none | reserved | consumed | released
 
 
 class DealDetailOut(DealRead):

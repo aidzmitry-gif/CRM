@@ -110,6 +110,13 @@ class DealDocument(Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0"), server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     posted_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # SALES-51: резерв под счёт/заказ + срок действия счёта (valid_until = +AIOS_INVOICE_VALID_DAYS дн.).
+    # reserve_status: none → reserved → consumed (оплата) | released (истёк/снят).
+    valid_until: Mapped[date | None] = mapped_column(Date)
+    reserve_status: Mapped[str] = mapped_column(String(16), default="none", server_default="none")
+    reserved_at: Mapped[datetime | None] = mapped_column(DateTime)
+    reminded_at: Mapped[datetime | None] = mapped_column(DateTime)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class Message(Base):

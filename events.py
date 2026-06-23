@@ -56,6 +56,8 @@ async def on_payment_paid(payload: dict, ctx) -> None:
     ).scalars().first()
     if doc is not None:
         doc.status = "paid"
+        if doc.reserve_status == "reserved":
+            doc.reserve_status = "consumed"  # SALES-51: оплачен → резерв израсходован
         logger.info("Sales: документ %s помечен оплаченным", ref)
 
 

@@ -1,6 +1,7 @@
 """HTTP-API модуля Sales. Монтируется ядром под префиксом ``/sales``."""
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -82,8 +83,8 @@ DOC_NUMBER_PREFIX = {"invoice": "СЧ", "contract": "ДГ", "order": "ЗК"}
 DOC_TITLES = {"invoice": "Счёт", "contract": "Договор", "order": "Заказ"}
 # Типы документов, требующие согласования до записи в 1С (договор → юрист, ч.4).
 REQUIRES_APPROVAL = {"contract"}
-# Типы документов, резервирующие складские остатки при проведении (заказ).
-RESERVES_STOCK = {"order"}
+# Типы документов, резервирующие складские остатки при проведении (счёт и заказ, SALES-51).
+RESERVES_STOCK = {"invoice", "order"}
 # План/факт по периодам (sales-34): окно факта (дней) и множитель плана (рабочих дней).
 PERIOD_DAYS = {"day": 1, "week": 7, "month": 30, "quarter": 90, "year": 365}
 PERIOD_MULT = {"day": 1, "week": 5, "month": 22, "quarter": 65, "year": 250}
@@ -858,12 +859,17 @@ async def create_document(
             },
         )
     else:
-        # счёт/заказ: пишем в 1С сразу; заказ дополнительно резервирует остатки
+        # счёт/заказ: пишем в 1С сразу; счёт и заказ дополнительно резервируют остатки (SALES-51)
         if payload.kind in RESERVES_STOCK and core.services.stock is not None:
             reserved = await core.services.stock.reserve(
                 session, await _deal_stock_items(session, deal_id)
             )
             if reserved:
+                # фиксируем резерв на документе + срок действия счёта (5 дней по счёт-протоколу)
+                valid_days = int(os.getenv("AIOS_INVOICE_VALID_DAYS", "5"))
+                doc.reserve_status = "reserved"
+                doc.reserved_at = _utcnow()
+                doc.valid_until = _utcnow().date() + timedelta(days=valid_days)
                 core.event_bus.emit(
                     session,
                     "sales.stock.reserved",
@@ -871,6 +877,7 @@ async def create_document(
                         "document_id": doc.id,
                         "deal_id": deal_id,
                         "items": reserved,
+                        "valid_until": doc.valid_until.isoformat(),
                         "entity_ref": f"deal:{deal_id}",
                     },
                 )

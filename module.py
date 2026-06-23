@@ -25,6 +25,7 @@ from modules.sales.events import (
     on_shipment_delivered,
 )
 from modules.sales.permissions import PERMISSIONS, ROLES
+from modules.sales.reserve import tick_invoice_reserve
 from modules.sales.workflows import DealApprovalWorkflow
 
 logger = logging.getLogger("aios.sales")
@@ -57,6 +58,8 @@ class SalesModule(ModuleContract):
             core.register_telegram(command)
         core.register_widget(Widget("sales_pipeline", "Воронка продаж", source="sales.deals"))
         core.on_startup(self._on_startup)
+        # SALES-51: периодический шаг — срок/напоминание/аннулирование резерва под счёт
+        core.on_tick(tick_invoice_reserve)
 
     async def _on_startup(self) -> None:
         logger.info("Sales: модуль готов (каркас)")
