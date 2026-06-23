@@ -109,3 +109,36 @@ async def on_incoming_message_ai(payload: dict, ctx) -> None:
         {"deal_id": deal_id, "text": text, "actor": "AI", "entity_ref": f"deal:{deal_id}"},
     )
     logger.info("Sales AI: предложен черновик ответа по сделке %s", deal_id)
+
+
+async def on_intake_lead(payload: dict, ctx) -> None:
+    """Заявка с сайта/почты (коннектор integrations) → лид в приём CRM.
+
+    Front-of-funnel: создаёт `Lead` со статусом `new`; дальше менеджер/AI квалифицирует,
+    распределяет и конвертирует в сделку. Канал сайта/почты питает приём лидов, а не сделки
+    напрямую (тот же паттерн, что marketing.campaign.launched)."""
+    if ctx is None:
+        return
+    from modules.sales.leads import LEAD_SOURCES
+    from modules.sales.models import Lead
+
+    src = payload.get("source") or "site"
+    lead = Lead(
+        source=src if src in LEAD_SOURCES else "site",
+        name=payload.get("name", "") or "",
+        company=payload.get("company", "") or "",
+        phone=(payload.get("phone") or None),
+        email=(payload.get("email") or None),
+        region=payload.get("region", "") or "",
+        product=payload.get("product", "") or "",
+        message=payload.get("message", "") or "",
+        status="new",
+    )
+    ctx.session.add(lead)
+    await ctx.session.flush()
+    ctx.services.event_bus.emit(
+        ctx.session,
+        "sales.lead.received",
+        {"lead_id": lead.id, "source": lead.source, "entity_ref": f"lead:{lead.id}"},
+    )
+    logger.info("Sales: лид из «%s» принят в воронку (#%s)", src, lead.id)
