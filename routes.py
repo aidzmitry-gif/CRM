@@ -37,6 +37,10 @@ from modules.sales.schemas import (
     AiDraftOut,
     AiTextOut,
     BoardOut,
+    CallCommentIn,
+    CallLinkDealIn,
+    CallOut,
+    CallResultIn,
     ChatOut,
     ContactCreate,
     ContactOut,
@@ -1306,3 +1310,186 @@ async def ai_assist(
     )
     await session.commit()
     return AiTextOut(kind=kind, text=text, model=model)
+
+
+# --- Окно входящего звонка (SALES-50): SSE-поток, журнал, действия --------------------
+@router.get("/calls/stream")
+async def calls_stream(
+    owner: str | None = None,
+    user: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """SSE-поток карточек звонков продавца (всплывающее окно входящего звонка).
+
+    Подписка по ``owner`` (= ``Deal.owner``, ФИО продавца); по умолчанию — текущий
+    пользователь. ponytail: маппинг username↔Deal.owner закроется реальной
+    аутентификацией (Keycloak, P1); сейчас фронт передаёт ``?owner=<ФИО>``.
+    """
+    import asyncio
+    import json
+
+    from fastapi.responses import StreamingResponse
+
+    from modules.sales import calls as calls_mod
+
+    target = owner or user.username
+    queue = calls_mod.subscribe(target)
+
+    async def _gen():
+        try:
+            yield ": connected\n\n"
+            while True:
+                try:
+                    card = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"data: {json.dumps(card, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"  # heartbeat против обрыва простаивающего соединения
+        finally:
+            calls_mod.unsubscribe(target, queue)
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+@router.get("/calls", response_model=list[CallOut])
+async def list_calls(
+    status: str | None = None,
+    owner: str | None = None,
+    date: str | None = None,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Журнал звонков с фильтрами: статус / продавец / дата (``YYYY-MM-DD``)."""
+    from modules.sales.models import CallLog
+
+    stmt = select(CallLog).order_by(CallLog.started_at.desc())
+    if status:
+        stmt = stmt.where(CallLog.status == status)
+    if owner:
+        stmt = stmt.where(CallLog.owner == owner)
+    if date:
+        try:
+            day = datetime.fromisoformat(date)  # param `date` затеняет datetime.date — берём datetime
+        except ValueError:
+            raise HTTPException(status_code=400, detail="date: ожидается YYYY-MM-DD")
+        start = datetime(day.year, day.month, day.day)
+        stmt = stmt.where(CallLog.started_at >= start, CallLog.started_at < start + timedelta(days=1))
+    return (await session.execute(stmt)).scalars().all()
+
+
+@router.get("/calls/{cid}", response_model=CallOut)
+async def get_call(
+    cid: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Карточка одного звонка."""
+    from modules.sales.models import CallLog
+
+    call = await session.get(CallLog, cid)
+    if call is None:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    return call
+
+
+@router.post("/calls/{cid}/comment", response_model=CallOut)
+async def call_comment(
+    cid: int,
+    payload: CallCommentIn,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Заметка по звонку."""
+    from modules.sales.models import CallLog
+
+    call = await session.get(CallLog, cid)
+    if call is None:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    call.comment = payload.comment
+    await session.commit()
+    return call
+
+
+@router.post("/calls/{cid}/result", response_model=CallOut)
+async def call_result(
+    cid: int,
+    payload: CallResultIn,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Отметить итог/классификацию звонка."""
+    from modules.sales.models import CallLog
+
+    call = await session.get(CallLog, cid)
+    if call is None:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    call.result = payload.result
+    await session.commit()
+    return call
+
+
+@router.post("/calls/{cid}/link-deal", response_model=CallOut)
+async def call_link_deal(
+    cid: int,
+    payload: CallLinkDealIn,
+    session: AsyncSession = Depends(get_session),
+    core: Core = Depends(get_core),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Привязать звонок к существующей сделке (``deal_id``) или создать новую (``create``)."""
+    from modules.sales.models import CallLog
+
+    call = await session.get(CallLog, cid)
+    if call is None:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    if payload.deal_id is not None:
+        deal = await session.get(Deal, payload.deal_id)
+        if deal is None:
+            raise HTTPException(status_code=404, detail="Сделка не найдена")
+        call.deal_id = deal.id
+    elif payload.create:
+        cp_name = ""
+        if call.counterparty_id is not None:
+            cp = await session.get(Counterparty, call.counterparty_id)
+            cp_name = cp.name if cp is not None else ""
+        deal = Deal(
+            number=f"CRM-CALL-{call.id}",
+            title=f"Звонок {call.phone_e164 or call.call_id}",
+            counterparty=cp_name or (call.phone_e164 or "Неизвестный номер"),
+            owner=call.owner,
+            stage="new",
+        )
+        session.add(deal)
+        try:
+            await session.flush()
+        except IntegrityError:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail="Сделка по этому звонку уже создана")
+        call.deal_id = deal.id
+        core.event_bus.emit(session, "sales.deal.created", {"number": deal.number, "title": deal.title})
+    else:
+        raise HTTPException(status_code=400, detail="Укажите deal_id или create=true")
+    await session.commit()
+    return call
+
+
+@router.post("/telephony/incoming")
+async def telephony_incoming(
+    payload: dict,
+    session: AsyncSession = Depends(get_session),
+    core: Core = Depends(get_core),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Прямой приём нормализованного события звонка (fallback/тест, если не через шину).
+
+    Обрабатывает синхронно (апсерт записи + push карточки), минуя задержку relay.
+    ``payload`` — как от коннектора + ``event_type`` (по умолчанию incoming).
+    """
+    from core.services.eventbus import EventContext
+    from modules.sales import calls as calls_mod
+
+    event_type = payload.get("event_type", "telephony.call.incoming")
+    handler = calls_mod.EVENT_HANDLERS.get(event_type)
+    if handler is None:
+        raise HTTPException(status_code=400, detail=f"Неизвестный тип события: {event_type}")
+    await handler(payload, EventContext(session=session, services=core.services))
+    await session.commit()
+    return {"ok": True, "event_type": event_type, "call_id": payload.get("call_id")}

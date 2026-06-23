@@ -398,3 +398,49 @@ class TaskOut(BaseModel):
     status: str
     result: str | None = None
     overdue: bool = False
+
+
+class CallOut(BaseModel):
+    """Запись журнала звонков (SALES-50)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    call_id: str
+    direction: str
+    phone_e164: str | None = None
+    did: str | None = None
+    agent_ext: str | None = None
+    owner: str
+    owner_id: int | None = None
+    counterparty_id: int | None = None
+    contact_id: int | None = None
+    deal_id: int | None = None
+    status: str
+    result: str | None = None
+    comment: str | None = None
+    recording_url: str | None = None
+    started_at: datetime.datetime
+    answered_at: datetime.datetime | None = None
+    ended_at: datetime.datetime | None = None
+    duration_sec: int | None = None
+    hold_sec: int | None = None
+
+
+class CallCommentIn(BaseModel):
+    """Комментарий к звонку."""
+
+    comment: str
+
+
+class CallResultIn(BaseModel):
+    """Итог/классификация звонка."""
+
+    result: str
+
+
+class CallLinkDealIn(BaseModel):
+    """Привязка звонка к сделке или создание новой сделки из звонка."""
+
+    deal_id: int | None = None
+    create: bool = False
