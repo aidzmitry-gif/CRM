@@ -198,7 +198,9 @@ async def record_event(session, payload: dict, event_type: str) -> tuple[CallLog
         call.did = payload["did"]
 
     if event_type == "telephony.call.answered":
-        call.status = "answered"
+        # не понижаем терминальный статус, если answer пришёл/переставлен после hangup
+        if call.ended_at is None:
+            call.status = "answered"
         call.answered_at = call.answered_at or _utcnow()
     elif event_type == "telephony.call.ended":
         provider_status = payload.get("status")
@@ -225,6 +227,29 @@ async def record_event(session, payload: dict, event_type: str) -> tuple[CallLog
 
 
 # --- Обработчики событий шины (ctx = сессия relay + сервисы) -----------------------
+def _emit_logged(ctx, call: CallLog) -> None:
+    """Эмитнуть ``sales.call.logged`` (→ audit, KPI-активность) для новой записи звонка.
+
+    Любой первый по ``call_id`` звонок логируется ровно один раз — на каком бы этапе он
+    ни «появился»: incoming, либо сразу misscall/answered/transfer, если предыдущие
+    события потеряны/переставлены (webhook публичен). Иначе пропущенные и внепорядковые
+    звонки не попали бы в аудит/KPI, хотя запись в журнале есть."""
+    ctx.services.event_bus.emit(
+        ctx.session,
+        "sales.call.logged",
+        {
+            "call_id": call.call_id,
+            "direction": call.direction,
+            "owner": call.owner,
+            "phone": call.phone_e164,
+            "deal_id": call.deal_id,
+            "actor": "telephony",
+            "entity_ref": f"call:{call.call_id}",
+        },
+    )
+    logger.info("calls: звонок %s → %s (owner=%s)", call.call_id, call.status, call.owner or "—")
+
+
 async def on_incoming_call(payload: dict, ctx) -> None:
     """Входящий/исходящий старт звонка → запись в журнал + push карточки продавцу."""
     if ctx is None:
@@ -233,38 +258,30 @@ async def on_incoming_call(payload: dict, ctx) -> None:
     if call is None:
         return
     if created:
-        ctx.services.event_bus.emit(
-            ctx.session,
-            "sales.call.logged",
-            {
-                "call_id": call.call_id,
-                "direction": call.direction,
-                "owner": call.owner,
-                "phone": call.phone_e164,
-                "deal_id": call.deal_id,
-                "actor": "telephony",
-                "entity_ref": f"call:{call.call_id}",
-            },
-        )
-        logger.info("calls: звонок %s → %s (owner=%s)", call.call_id, call.status, call.owner or "—")
+        _emit_logged(ctx, call)
     _push_card(call)
 
 
 async def on_call_answered(payload: dict, ctx) -> None:
     if ctx is None:
         return
-    call, _ = await record_event(ctx.session, payload, "telephony.call.answered")
-    if call is not None:
-        _push_card(call)
+    call, created = await record_event(ctx.session, payload, "telephony.call.answered")
+    if call is None:
+        return
+    if created:
+        _emit_logged(ctx, call)
+    _push_card(call)
 
 
 async def on_call_ended(payload: dict, ctx) -> None:
     """Завершение разговора → обновить статус/длительность/запись + событие ``sales.call.ended``."""
     if ctx is None:
         return
-    call, _ = await record_event(ctx.session, payload, "telephony.call.ended")
+    call, created = await record_event(ctx.session, payload, "telephony.call.ended")
     if call is None:
         return
+    if created:  # пропущенный/внепорядковый: запись появилась сразу с hangup/misscall
+        _emit_logged(ctx, call)
     ctx.services.event_bus.emit(
         ctx.session,
         "sales.call.ended",
@@ -284,9 +301,12 @@ async def on_call_ended(payload: dict, ctx) -> None:
 async def on_call_transfer(payload: dict, ctx) -> None:
     if ctx is None:
         return
-    call, _ = await record_event(ctx.session, payload, "telephony.call.transfer")
-    if call is not None:
-        _push_card(call)
+    call, created = await record_event(ctx.session, payload, "telephony.call.transfer")
+    if call is None:
+        return
+    if created:
+        _emit_logged(ctx, call)
+    _push_card(call)
 
 
 # Карта обработчиков по типу события — для синхронного приёма через эндпоинт-fallback
