@@ -14,7 +14,7 @@ from core.domain.models import Approval, Contact, Counterparty, Sku
 from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
-from core.services.auth import require_permission
+from core.services.auth import CurrentUser, require_permission
 from modules.sales.ai import draft_reply, next_step, summarize
 from modules.sales.models import (
     Activity,
