@@ -15,31 +15,44 @@ async def on_deal_created(payload: dict) -> None:
     )
 
 
-async def on_campaign_launched(payload: dict, ctx) -> None:
-    """Кампания запущена → привлечённые лиды попадают в приём лидов CRM (marketing → sales).
+async def on_lead_converted(payload: dict, ctx) -> None:
+    """Лид сконвертирован (модуль лидов) → создать сделку (leads → sales).
 
-    Маркетинг питает воронку через её вход: создаёт записи лидов (front-of-funnel),
-    которые менеджер/AI затем квалифицирует, распределяет и превращает в сделки —
-    а не создаёт сделки напрямую. Так замыкается цикл «кампания → лиды → воронка».
+    Точка интеграции с репозиторием лидов через шину (§2.4/§2.5): модуль лидов не
+    импортирует sales — он публикует ``leads.lead.converted``, а sales создаёт
+    ``Deal`` (стадия ``new``, ответственный и приоритет из payload) и отвечает
+    ``sales.deal.created`` с ``lead_id``/``deal_id``, по которому лид получает
+    обратную ссылку на сделку.
     """
     if ctx is None:
         return
-    from modules.sales.leads import LEAD_SOURCES
-    from modules.sales.models import Lead
+    lead_id = payload.get("lead_id")
+    if not lead_id:
+        return
+    from modules.sales.models import Deal
 
-    count = min(int(payload.get("leads", 0) or 0), 10)
-    name = payload.get("name", "Кампания")
-    channel = payload.get("channel", "site")
-    source = channel if channel in LEAD_SOURCES else "site"
-    for _ in range(count):
-        ctx.session.add(
-            Lead(
-                source=source,
-                message=f"Заявка из кампании «{name}» (канал {channel})",
-                status="new",
-            )
-        )
-    logger.info("Sales: из кампании «%s» принято лидов: %d", name, count)
+    deal = Deal(
+        number=f"CRM-LEAD-{lead_id}",
+        title=payload.get("title") or "Лид",
+        counterparty=payload.get("counterparty") or "Новый лид",
+        owner=payload.get("owner", ""),
+        stage="new",
+        priority=payload.get("priority", "Средний"),
+    )
+    ctx.session.add(deal)
+    await ctx.session.flush()
+    ctx.services.event_bus.emit(
+        ctx.session,
+        "sales.deal.created",
+        {
+            "number": deal.number,
+            "title": deal.title,
+            "lead_id": lead_id,
+            "deal_id": deal.id,
+            "entity_ref": f"deal:{deal.id}",
+        },
+    )
+    logger.info("Sales: из лида %s создана сделка %s", lead_id, deal.number)
 
 
 async def on_payment_paid(payload: dict, ctx) -> None:
@@ -109,36 +122,3 @@ async def on_incoming_message_ai(payload: dict, ctx) -> None:
         {"deal_id": deal_id, "text": text, "actor": "AI", "entity_ref": f"deal:{deal_id}"},
     )
     logger.info("Sales AI: предложен черновик ответа по сделке %s", deal_id)
-
-
-async def on_intake_lead(payload: dict, ctx) -> None:
-    """Заявка с сайта/почты (коннектор integrations) → лид в приём CRM.
-
-    Front-of-funnel: создаёт `Lead` со статусом `new`; дальше менеджер/AI квалифицирует,
-    распределяет и конвертирует в сделку. Канал сайта/почты питает приём лидов, а не сделки
-    напрямую (тот же паттерн, что marketing.campaign.launched)."""
-    if ctx is None:
-        return
-    from modules.sales.leads import LEAD_SOURCES
-    from modules.sales.models import Lead
-
-    src = payload.get("source") or "site"
-    lead = Lead(
-        source=src if src in LEAD_SOURCES else "site",
-        name=payload.get("name", "") or "",
-        company=payload.get("company", "") or "",
-        phone=(payload.get("phone") or None),
-        email=(payload.get("email") or None),
-        region=payload.get("region", "") or "",
-        product=payload.get("product", "") or "",
-        message=payload.get("message", "") or "",
-        status="new",
-    )
-    ctx.session.add(lead)
-    await ctx.session.flush()
-    ctx.services.event_bus.emit(
-        ctx.session,
-        "sales.lead.received",
-        {"lead_id": lead.id, "source": lead.source, "entity_ref": f"lead:{lead.id}"},
-    )
-    logger.info("Sales: лид из «%s» принят в воронку (#%s)", src, lead.id)
