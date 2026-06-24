@@ -4,7 +4,17 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Date, DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    JSON,
+    Date,
+    DateTime,
+    ForeignKey,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db.base import Base
@@ -117,6 +127,28 @@ class DealDocument(Base):
     reserved_at: Mapped[datetime | None] = mapped_column(DateTime)
     reminded_at: Mapped[datetime | None] = mapped_column(DateTime)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # SALES-53: договор по шаблону — ссылка на шаблон + согласованные условия. terms_json
+    # хранит и реквизиты покупателя по УНП (registry.lookup), чтобы не править shared-схему
+    # Counterparty (адрес/директор там не хранятся).
+    template_id: Mapped[int | None] = mapped_column()
+    payment_terms: Mapped[str | None] = mapped_column(String(255))
+    delivery_terms: Mapped[str | None] = mapped_column(String(255))
+    terms_json: Mapped[dict | None] = mapped_column(JSON)
+
+
+class ContractTemplate(Base):
+    """Шаблон договора (SALES-53). ``body`` — текст с плейсхолдерами ``{{...}}``
+    (``{{seller.name}}``, ``{{buyer.unp}}``, ``{{items}}``, ``{{payment_terms}}`` …)."""
+
+    __tablename__ = "contract_template"
+    __table_args__ = {"schema": "sales"}
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(64), unique=True)
+    name: Mapped[str] = mapped_column(String(255))
+    body: Mapped[str] = mapped_column(Text)
+    is_active: Mapped[bool] = mapped_column(default=True, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class Message(Base):

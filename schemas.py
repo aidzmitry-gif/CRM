@@ -216,6 +216,45 @@ class DocumentOut(BaseModel):
     reserve_status: str = "none"  # none | reserved | consumed | released
 
 
+class ContractTemplateOut(BaseModel):
+    """Шаблон договора для выбора в окне «Подготовить договор» (SALES-53)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    code: str
+    name: str
+
+
+class ContractTemplateCreate(BaseModel):
+    """Создание/сидирование шаблона договора (SALES-53)."""
+
+    code: str
+    name: str
+    body: str  # текст с плейсхолдерами {{...}}
+
+
+class ContractPrepareIn(BaseModel):
+    """SALES-53: подготовить договор по шаблону + реквизиты покупателя по УНП."""
+
+    template_code: str
+    unp: str = ""  # УНП покупателя → core.services.registry.lookup (graceful при выкл)
+    payment_terms: str = ""
+    delivery_terms: str = ""
+    terms: dict | None = None  # прочие согласованные условия (структурно)
+    requested_by: str = ""  # инициатор согласования
+
+
+class PackageSentOut(BaseModel):
+    """SALES-53: результат отправки пакета «счёт + договор»."""
+
+    deal_id: int
+    invoice_number: str
+    contract_number: str
+    channel: str
+    sent: bool = True
+
+
 class DealDetailOut(DealRead):
     """Сделка с позициями номенклатуры и документами (для экрана карточки)."""
 

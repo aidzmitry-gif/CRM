@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import os
+import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import HTMLResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +22,7 @@ from modules.sales.ai import draft_reply, next_step, qualify_lead, summarize
 from modules.sales.leads import lead_priority, route_lead, score_lead
 from modules.sales.models import (
     Activity,
+    ContractTemplate,
     Deal,
     DealDocument,
     DealItem,
@@ -45,6 +48,9 @@ from modules.sales.schemas import (
     ChatOut,
     ContactCreate,
     ContactOut,
+    ContractPrepareIn,
+    ContractTemplateCreate,
+    ContractTemplateOut,
     DealCreate,
     DealDetailOut,
     DealItemCreate,
@@ -65,6 +71,7 @@ from modules.sales.schemas import (
     LossReasonOut,
     MessageCreate,
     MessageOut,
+    PackageSentOut,
     PriceInfo,
     PriceQuoteCreate,
     SkuOut,
@@ -839,25 +846,7 @@ async def create_document(
 
     if payload.kind in REQUIRES_APPROVAL:
         # договор: на согласование юристу (ч.4); запись в 1С — после одобрения
-        doc.status = "pending_approval"
-        await core.services.approvals.request(
-            session,
-            "deal.contract",
-            f"document:{doc.id}",
-            f"{deal.number} — {DOC_TITLES.get(payload.kind, payload.kind)} ({deal.counterparty})",
-            payload.requested_by,
-        )
-        core.event_bus.emit(
-            session,
-            "sales.document.created",
-            {
-                "document_id": doc.id,
-                "deal_id": deal_id,
-                "kind": payload.kind,
-                "number": number,
-                "entity_ref": f"deal:{deal_id}",
-            },
-        )
+        await _submit_contract_for_approval(core, session, doc, deal, payload.requested_by)
     else:
         # счёт/заказ: пишем в 1С сразу; счёт и заказ дополнительно резервируют остатки (SALES-51)
         if payload.kind in RESERVES_STOCK and core.services.stock is not None:
@@ -938,6 +927,293 @@ async def decide_document(
 
     await session.commit()
     return doc
+
+
+# ──────────────────────── Договор по шаблону (SALES-53) ────────────────────────
+
+# Плейсхолдеры тела шаблона: {{seller.name}}, {{buyer.unp}}, {{items}}, {{total}}, …
+_PLACEHOLDER = re.compile(r"\{\{\s*([\w.]+)\s*\}\}")
+
+
+def _seller_requisites(core: Core) -> dict[str, str]:
+    """Реквизиты своей организации (продавца) из конфига (ТЗ C.5, не shared-схема)."""
+    c = core.config
+    return {
+        "name": c.seller_name, "unp": c.seller_unp, "address": c.seller_address,
+        "director": c.seller_director, "phone": c.seller_phone, "email": c.seller_email,
+    }
+
+
+async def _buyer_requisites(
+    session: AsyncSession, core: Core, deal: Deal, unp: str
+) -> dict[str, str]:
+    """Реквизиты покупателя: из ЕГР по УНП (graceful) + обогащение Counterparty.unp.
+
+    Реестр выключен или УНП не найден → минимум из сделки (вводится вручную). Имя
+    контрагента в Counterparty не перезатираем (связь сделки — по имени). Внешний
+    вызов реестра делаем ДО создания контрагента, чтобы не держать открытую запись/блок
+    в БД на время сетевого запроса в ЕГР.
+    """
+    info = None
+    if unp and core.services.registry is not None:
+        info = await core.services.registry.lookup(unp)
+    cp = await _counterparty_for_deal(session, deal, create=True)
+    buyer = {"name": deal.counterparty, "unp": unp or (cp.unp if cp else "") or ""}
+    if info:
+        buyer.update({k: str(v) for k, v in info.items() if v})
+    if cp is not None and unp:
+        cp.unp = cp.unp or unp
+    return buyer
+
+
+async def _contract_items(session: AsyncSession, deal_id: int) -> list[str]:
+    """Строки спецификации договора из позиций сделки (title — qty unit)."""
+    rows = (
+        await session.execute(
+            select(DealItem, Sku)
+            .join(Sku, Sku.id == DealItem.sku_id, isouter=True)
+            .where(DealItem.deal_id == deal_id)
+            .order_by(DealItem.id)
+        )
+    ).all()
+    lines = []
+    for item, sku in rows:
+        title = sku.title if sku else f"позиция #{item.sku_id}"
+        unit = sku.unit if sku else "шт"
+        lines.append(f"{title} — {item.qty} {unit}")
+    return lines
+
+
+def _render_contract(body: str, ctx: dict[str, str]) -> str:
+    """Подставить плейсхолдеры {{key}} (плоские ключи seller.name/buyer.unp/…)."""
+    return _PLACEHOLDER.sub(lambda m: ctx.get(m.group(1), ""), body)
+
+
+async def _submit_contract_for_approval(
+    core: Core,
+    session: AsyncSession,
+    doc: DealDocument,
+    deal: Deal,
+    requested_by: str,
+    extra_event: dict | None = None,
+) -> None:
+    """Договор → на согласование юристу (ч.4) + событие ``sales.document.created``.
+
+    Общий путь для обоих способов создания договора: универсального
+    ``POST /documents`` и ``POST /deals/{id}/contract`` (SALES-53) — чтобы маршрут
+    согласования и форма события не разъезжались.
+    """
+    doc.status = "pending_approval"
+    await core.services.approvals.request(
+        session,
+        "deal.contract",
+        f"document:{doc.id}",
+        f"{deal.number} — {DOC_TITLES['contract']} ({deal.counterparty})",
+        requested_by,
+    )
+    payload = {
+        "document_id": doc.id,
+        "deal_id": deal.id,
+        "kind": "contract",
+        "number": doc.number,
+        "entity_ref": f"deal:{deal.id}",
+    }
+    if extra_event:
+        payload.update(extra_event)
+    core.event_bus.emit(session, "sales.document.created", payload)
+
+
+@router.get("/contract-templates", response_model=list[ContractTemplateOut])
+async def list_contract_templates(session: AsyncSession = Depends(get_session)):
+    """Активные шаблоны договора для окна «Подготовить договор» (SALES-53)."""
+    return (
+        await session.execute(
+            select(ContractTemplate)
+            .where(ContractTemplate.is_active.is_(True))
+            .order_by(ContractTemplate.name)
+        )
+    ).scalars().all()
+
+
+@router.post("/contract-templates", response_model=ContractTemplateOut, status_code=201)
+async def create_contract_template(
+    payload: ContractTemplateCreate,
+    session: AsyncSession = Depends(get_session),
+    _: object = Depends(require_permission("sales.deal.write")),
+):
+    """Завести/сидировать шаблон договора (SALES-53)."""
+    tpl = ContractTemplate(code=payload.code, name=payload.name, body=payload.body)
+    session.add(tpl)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="Шаблон с таким кодом уже есть")
+    return tpl
+
+
+@router.post("/deals/{deal_id}/contract", response_model=DocumentOut, status_code=201)
+async def prepare_contract(
+    deal_id: int,
+    payload: ContractPrepareIn,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: object = Depends(require_permission("sales.deal.write")),
+):
+    """SALES-53: подготовить договор по шаблону + реквизиты покупателя по УНП.
+
+    Реквизиты покупателя подтягиваются из ЕГР по УНП (graceful при выкл реестра),
+    Counterparty обогащается УНП, условия частично предзаполнены из сделки. Договор
+    создаётся как DealDocument(kind=contract) и уходит на согласование; запись в 1С —
+    после одобрения (/documents/{id}/decide), поэтому шлюз 1С здесь не требуется.
+    """
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    tpl = (
+        await session.execute(
+            select(ContractTemplate).where(
+                ContractTemplate.code == payload.template_code,
+                ContractTemplate.is_active.is_(True),
+            )
+        )
+    ).scalars().first()
+    if tpl is None:
+        raise HTTPException(status_code=404, detail="Шаблон договора не найден")
+    # один активный договор на сделку: номер ДГ-{deal} не уникален в БД, дубль создал бы
+    # два договора с одинаковым номером (отклонённый можно перевыставить).
+    existing = (
+        await session.execute(
+            select(DealDocument).where(
+                DealDocument.deal_id == deal_id,
+                DealDocument.kind == "contract",
+                DealDocument.status != "rejected",
+            )
+        )
+    ).scalars().first()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="Договор по сделке уже подготовлен")
+
+    buyer = await _buyer_requisites(session, core, deal, payload.unp.strip())
+    doc = DealDocument(
+        deal_id=deal_id,
+        kind="contract",
+        number=f"{DOC_NUMBER_PREFIX['contract']}-{deal.number}",
+        amount=deal.amount,
+        template_id=tpl.id,
+        payment_terms=payload.payment_terms or None,
+        delivery_terms=payload.delivery_terms or None,
+        terms_json={"buyer": buyer, "custom": payload.terms or {}},
+    )
+    session.add(doc)
+    await session.flush()
+    await _submit_contract_for_approval(
+        core, session, doc, deal, payload.requested_by,
+        extra_event={"template": tpl.code, "buyer_unp": buyer.get("unp", "")},
+    )
+    await session.commit()
+    return doc
+
+
+@router.get("/documents/{doc_id}/render", response_class=HTMLResponse)
+async def render_contract(
+    doc_id: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: object = Depends(require_permission("sales.deal.read")),
+):
+    """Рендер договора по шаблону в HTML (печатная форма, ТЗ C.2). Только kind=contract.
+
+    Гард ``sales.deal.read``: форма содержит реквизиты продавца и покупателя (ЕГР) —
+    не отдаём анонимно (прод публичен).
+    """
+    doc = await session.get(DealDocument, doc_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    if doc.kind != "contract":
+        raise HTTPException(status_code=400, detail="Рендер по шаблону — только для договора")
+    tpl = await session.get(ContractTemplate, doc.template_id) if doc.template_id else None
+    if tpl is None:
+        raise HTTPException(status_code=409, detail="У договора не задан шаблон")
+    deal = await DealRepository(session).get(doc.deal_id)
+    buyer = (doc.terms_json or {}).get("buyer", {})
+    ctx = {
+        "number": doc.number,
+        "items": "; ".join(await _contract_items(session, doc.deal_id)),
+        "total": f"{float(doc.amount):.2f} BYN",
+        "payment_terms": doc.payment_terms or "",
+        "delivery_terms": doc.delivery_terms or "",
+        "valid_until": doc.valid_until.isoformat() if doc.valid_until else "",
+        "deal": deal.number if deal else "",
+    }
+    ctx.update({f"seller.{k}": v for k, v in _seller_requisites(core).items()})
+    ctx.update({f"buyer.{k}": str(v) for k, v in buyer.items()})
+    return HTMLResponse(_render_contract(tpl.body, ctx))
+
+
+@router.post("/deals/{deal_id}/send-package", response_model=PackageSentOut)
+async def send_package(
+    deal_id: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: object = Depends(require_permission("sales.deal.write")),
+):
+    """SALES-53 C.4: отправить клиенту пакет «счёт + договор» одной записью.
+
+    Берём последний проведённый счёт и последний согласованный (проведённый) договор
+    сделки — по ТЗ пакет уходит ПОСЛЕ согласования договора. Эмитим ``sales.package.sent``
+    и пишем ОДНУ запись в историю переписки. Реальная доставка (email/Telegram, B.3) —
+    отдельный слой; здесь фиксируем факт отправки пакета.
+    """
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    docs = (
+        await session.execute(
+            select(DealDocument)
+            .where(
+                DealDocument.deal_id == deal_id,
+                DealDocument.status.in_(("posted", "paid")),
+            )
+            .order_by(DealDocument.id.desc())
+        )
+    ).scalars().all()
+    # счёт — проведённый/оплаченный; договор — проведённый (после согласования)
+    invoice = next((d for d in docs if d.kind == "invoice"), None)
+    contract = next((d for d in docs if d.kind == "contract"), None)
+    if invoice is None or contract is None:
+        raise HTTPException(
+            status_code=409, detail="Нужны проведённый счёт и согласованный договор"
+        )
+
+    channel = "email"
+    session.add(
+        Message(
+            deal_id=deal_id,
+            channel=channel,
+            direction="out",
+            author="Система",
+            text=f"Отправлен пакет: счёт {invoice.number} + договор {contract.number}",
+        )
+    )
+    core.event_bus.emit(
+        session,
+        "sales.package.sent",
+        {
+            "deal_id": deal_id,
+            "invoice_number": invoice.number,
+            "contract_number": contract.number,
+            "channel": channel,
+            "entity_ref": f"deal:{deal_id}",
+        },
+    )
+    await session.commit()
+    return PackageSentOut(
+        deal_id=deal_id,
+        invoice_number=invoice.number,
+        contract_number=contract.number,
+        channel=channel,
+    )
 
 
 @router.get("/deals/{deal_id}/messages", response_model=list[MessageOut])
