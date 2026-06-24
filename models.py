@@ -136,3 +136,40 @@ class PriceQuote(Base):
     counterparty: Mapped[str] = mapped_column(String(255), default="", server_default="")
     price: Mapped[Decimal] = mapped_column(Numeric(14, 2))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class CallLog(Base):
+    """Журнал звонков (SALES-50) — события телефонии, склеенные по ``call_id``.
+
+    Источник — коннектор ``integrations`` (облачная АТС): доменные события
+    ``telephony.call.*`` апсертятся в одну запись по уникальному id вызова провайдера
+    (``call_id``, идемпотентность). Резолв продавца (``owner``) — серверная логика
+    sales (знает сделки/контрагентов), коннектор про owner не знает. Мягкие ссылки на
+    shared kernel / hr / контакт — без cross-schema FK; ``deal_id`` — FK на свою схему.
+    """
+
+    __tablename__ = "call_log"
+    __table_args__ = {"schema": "sales"}
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    call_id: Mapped[str] = mapped_column(String(64), unique=True)  # uniqueid провайдера
+    direction: Mapped[str] = mapped_column(String(8), default="in", server_default="in")  # in|out
+    phone_e164: Mapped[str | None] = mapped_column(String(32))  # клиент (нормализованный)
+    did: Mapped[str | None] = mapped_column(String(32))  # внешняя линия (на какую звонил клиент)
+    agent_ext: Mapped[str | None] = mapped_column(String(8))  # внутренний номер сотрудника
+    owner: Mapped[str] = mapped_column(String(128), default="", server_default="")  # резолвленный продавец
+    owner_id: Mapped[int | None] = mapped_column()  # мягкая ссылка hr.employee
+    counterparty_id: Mapped[int | None] = mapped_column()  # мягкая ссылка shared kernel
+    contact_id: Mapped[int | None] = mapped_column()  # мягкая ссылка shared kernel
+    deal_id: Mapped[int | None] = mapped_column(ForeignKey("sales.deal.id"))
+    # ringing → answered → ended | missed | busy | failed
+    status: Mapped[str] = mapped_column(String(16), default="ringing", server_default="ringing")
+    result: Mapped[str | None] = mapped_column(String(255))  # итог/классификация
+    comment: Mapped[str | None] = mapped_column(String(1000))
+    recording_url: Mapped[str | None] = mapped_column(String(255))
+    started_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime)
+    duration_sec: Mapped[int | None] = mapped_column()  # разговор, сек
+    hold_sec: Mapped[int | None] = mapped_column()  # общее время вызова, сек
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
