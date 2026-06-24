@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 
 from core.domain.models import Contact, Counterparty
-from modules.sales.models import CallLog, Deal, Lead
+from modules.sales.models import CallLog, Deal
 from modules.sales.stages import TERMINAL_STAGES
 
 logger = logging.getLogger("aios.sales.calls")
@@ -115,11 +115,15 @@ async def _owner_from_deals(session, cp_name: str) -> str:
 
 
 async def resolve_owner(session, phone_e164: str | None) -> dict:
-    """Резолв продавца по номеру (A.2): сделки контрагента → лид → пусто (дежурный пул).
+    """Резолв продавца по номеру (A.2): сделки контрагента → пусто (дежурный пул).
 
     Возвращает ``{owner, owner_id, counterparty_id, contact_id}``. Матч номера — по
     значащему хвосту (последние 9 цифр), т.к. контакты могут быть записаны без кода
     страны. ponytail: при росте базы — нормализованная колонка + индекс вместо LIKE-скана.
+
+    Лиды живут в отдельном репозитории: создание/резолв лида по звонку делает он сам,
+    подписавшись на ``sales.call.logged`` (там есть ``agent_ext`` — кто поднял трубку).
+    Поэтому здесь лид-fallback нет: неизвестный номер → owner пуст (дежурный пул).
     """
     result: dict = {"owner": "", "owner_id": None, "counterparty_id": None, "contact_id": None}
     tail = _digits_tail(phone_e164)
@@ -144,16 +148,6 @@ async def resolve_owner(session, phone_e164: str | None) -> dict:
                     result["owner"] = owner
                     return result
 
-    # новый/неизвестный контакт — пробуем лид по номеру (его ответственного)
-    lead = (
-        await session.execute(
-            select(Lead)
-            .where(Lead.phone.isnot(None), Lead.phone.like(f"%{tail}"))
-            .order_by(Lead.created_at.desc(), Lead.id.desc())
-        )
-    ).scalars().first()
-    if lead is not None and lead.assigned_to:
-        result["owner"] = lead.assigned_to
     return result
 
 
@@ -241,6 +235,7 @@ def _emit_logged(ctx, call: CallLog) -> None:
             "call_id": call.call_id,
             "direction": call.direction,
             "owner": call.owner,
+            "agent_ext": call.agent_ext,  # кто поднял трубку — репо лидов заводит лид на него
             "phone": call.phone_e164,
             "deal_id": call.deal_id,
             "actor": "telephony",
