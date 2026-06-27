@@ -48,6 +48,10 @@ class Deal(Base):
     # SALES-40: причина отказа (код из справочника loss_reason) и комментарий
     lost_reason_code: Mapped[str | None] = mapped_column(String(32))
     lost_comment: Mapped[str | None] = mapped_column(String(255))
+    # Мульти-воронки: код воронки (sales.stage.funnel), дефолт — «новые клиенты».
+    funnel: Mapped[str] = mapped_column(
+        String(32), default="new_clients", server_default="new_clients"
+    )
 
 
 class KpiTarget(Base):
@@ -255,6 +259,10 @@ class Stage(Base):
     kind: Mapped[str] = mapped_column(String(16), default="normal", server_default="normal")
     color: Mapped[str] = mapped_column(String(16), default="#64748B", server_default="#64748B")
     is_active: Mapped[bool] = mapped_column(default=True, server_default="true")
+    # Воронка-владелец стадии (мульти-воронки: new_clients / repeat_clients и т.п.).
+    funnel: Mapped[str] = mapped_column(
+        String(32), default="new_clients", server_default="new_clients"
+    )
 
 
 class DealStageEvent(Base):

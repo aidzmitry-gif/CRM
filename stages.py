@@ -43,10 +43,34 @@ STAGE_BY_ID: dict[str, dict] = {s["id"]: s for s in STAGES}
 # Тип стадии для редактора (Сделки 2.0): успех/отказы — особые, прочие — normal.
 KIND_BY_STAGE: dict[str, str] = {"won": "won", "cond_lost": "cond_lost", "lost": "lost"}
 
+# Дефолтная воронка — для legacy-сделок без явного значения и для сидов канона.
+DEFAULT_FUNNEL = "new_clients"
+
+# Справочник воронок (полоса CRM, мульти-воронки). Расширяется через редактор/миграции.
+FUNNELS: list[dict] = [
+    {"code": "new_clients", "title": "Новые клиенты"},
+    {"code": "repeat_clients", "title": "Постоянные клиенты"},
+]
+
+# Канон «Постоянные клиенты»: укороченная воронка (перезаказ, цена уже известна) +
+# терминалы успех/отказ. ``cond_lost`` опускаем — для перезаказов это шумная стадия.
+REPEAT_STAGES: list[tuple[str, str, int, str, str]] = [
+    # (code, title, probability, kind, color)
+    ("rp_request", "Запрос повтор", 30, "normal", "#3B82F6"),
+    ("rp_invoice", "Счёт повтор", 70, "normal", "#0EA5E9"),
+    ("rp_contract", "Договор/предоплата", 90, "normal", "#10B981"),
+    ("rp_won", "Успех", 100, "won", "#22C55E"),
+    ("rp_lost", "Отказ", 0, "lost", "#EF4444"),
+]
+
 
 def canonical_stages() -> list[dict]:
-    """Канон 11 стадий как полные строки — сид таблицы ``sales.stage``, фолбэк редактора."""
-    return [
+    """Канон всех воронок как полные строки — сид таблицы ``sales.stage``, фолбэк редактора.
+
+    Возвращает воронку «Новые клиенты» (11 стадий) + «Постоянные клиенты» (5 стадий).
+    ``sort_order`` уникален в пределах воронки (порядок колонок доски).
+    """
+    rows: list[dict] = [
         {
             "code": s["id"],
             "title": s["title"],
@@ -55,6 +79,21 @@ def canonical_stages() -> list[dict]:
             "kind": KIND_BY_STAGE.get(s["id"], "normal"),
             "color": s["color"],
             "is_active": True,
+            "funnel": "new_clients",
         }
         for i, s in enumerate(STAGES)
     ]
+    rows += [
+        {
+            "code": code,
+            "title": title,
+            "sort_order": i,
+            "probability": prob,
+            "kind": kind,
+            "color": color,
+            "is_active": True,
+            "funnel": "repeat_clients",
+        }
+        for i, (code, title, prob, kind, color) in enumerate(REPEAT_STAGES)
+    ]
+    return rows

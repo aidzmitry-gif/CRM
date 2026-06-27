@@ -74,6 +74,7 @@ from modules.sales.schemas import (
     DocumentCreate,
     DocumentDecision,
     DocumentOut,
+    FunnelOut,
     KpiOut,
     LeadConvertOut,
     LeadCreate,
@@ -102,6 +103,8 @@ from modules.sales.schemas import (
     TelephonyEventIn,
 )
 from modules.sales.stages import (
+    DEFAULT_FUNNEL,
+    FUNNELS,
     PROBABILITY_BY_STAGE,
     STAGES,
     TERMINAL_STAGES,
@@ -133,20 +136,31 @@ def _deal_weight(deal: Deal, prob_by_stage: dict[str, int] | None = None) -> flo
     return float(deal.amount) * p / 100
 
 
-async def _board_stages(session: AsyncSession) -> list[dict]:
-    """Активные стадии доски (порядок=колонки) из таблицы ``sales.stage``; пусто → канон.
+async def _board_stages(session: AsyncSession, funnel: str = DEFAULT_FUNNEL) -> list[dict]:
+    """Активные стадии воронки ``funnel`` (порядок=колонки) из таблицы ``sales.stage``.
 
-    Таблица — редактируемый источник истины (редактор стадий); пока не материализована,
-    падаем на канон ``stages.py`` (значения идентичны сиду миграции).
+    Таблица — редактируемый источник истины (редактор стадий); пусто → канон ``stages.py``
+    (значения идентичны сиду миграции). Пустая воронка (таблица заполнена, но в этой
+    воронке стадий нет) → пустой список — UI решает, как показать пустую доску.
     """
     rows = (
-        await session.execute(select(Stage).where(Stage.is_active).order_by(Stage.sort_order))
+        await session.execute(
+            select(Stage)
+            .where(Stage.is_active, Stage.funnel == funnel)
+            .order_by(Stage.sort_order)
+        )
     ).scalars().all()
     if rows:
         return [
             {"id": r.code, "title": r.title, "color": r.color, "probability": r.probability}
             for r in rows
         ]
+    # Таблица пуста ВООБЩЕ (до материализации канона) → fallback для дефолтной воронки.
+    any_row = (await session.execute(select(Stage).limit(1))).scalars().first()
+    if any_row is not None:
+        return []  # таблица заполнена, но конкретная воронка без стадий — honest-empty
+    if funnel != DEFAULT_FUNNEL:
+        return []
     return [
         {"id": s["id"], "title": s["title"], "color": s["color"],
          "probability": PROBABILITY_BY_STAGE.get(s["id"], 0)}
@@ -303,17 +317,24 @@ async def ping() -> dict:
 
 
 @router.get("/board", response_model=BoardOut)
-async def board(owner: str = "", session: AsyncSession = Depends(get_session)) -> BoardOut:
-    """Доска сделок: сделки по стадиям с агрегатами. ``owner`` — фильтр по
-    ответственному (видимость «по менеджеру», SALES-42)."""
+async def board(
+    owner: str = "",
+    funnel: str = DEFAULT_FUNNEL,
+    session: AsyncSession = Depends(get_session),
+) -> BoardOut:
+    """Доска сделок воронки ``funnel``: сделки по стадиям с агрегатами. ``owner`` —
+    фильтр по ответственному (видимость «по менеджеру», SALES-42). Сделки фильтруются
+    по ``Deal.funnel == funnel`` (дефолт ``new_clients``); колонки — стадии этой воронки.
+    """
     deals = await DealRepository(session).list()
+    deals = [d for d in deals if d.funnel == funnel]
     if owner:
         deals = [d for d in deals if d.owner == owner]
     by_stage: dict[str, list[Deal]] = defaultdict(list)
     for deal in deals:
         by_stage[deal.stage].append(deal)
 
-    board_stages = await _board_stages(session)
+    board_stages = await _board_stages(session, funnel)
     prob_by_stage = {s["id"]: s["probability"] for s in board_stages}
     stages = [
         StageBoard(
@@ -331,25 +352,58 @@ async def board(owner: str = "", session: AsyncSession = Depends(get_session)) -
 
 
 # ── Редактор стадий воронки (Сделки 2.0): CRUD справочника sales.stage ─────────────
-@router.get("/stages", response_model=list[StageOut])
-async def list_stages(
+@router.get("/funnels", response_model=list[FunnelOut])
+async def list_funnels(
     session: AsyncSession = Depends(get_session),
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
 ):
-    """Стадии воронки для доски/редактора. Первый вызов лениво материализует канон
-    (``stages.py``) в таблицу — дальше источник истины редактируемый."""
-    rows = (
-        await session.execute(select(Stage).order_by(Stage.sort_order))
+    """Воронки sales: код + титул + сколько активных сделок. Имена — из ``FUNNELS``
+    (справочник в коде), порядок — как там; неизвестные коды (созданы через редактор
+    стадий, но не описаны в справочнике) добавляются в конец с code как title."""
+    # код → активных сделок (исключаем терминальные стадии)
+    stage_counts = (
+        await session.execute(
+            select(Deal.funnel, func.count())
+            .where(Deal.stage.notin_(TERMINAL_STAGES))
+            .group_by(Deal.funnel)
+        )
+    ).all()
+    counts = {code: n for code, n in stage_counts}
+    seen: set[str] = set()
+    rows: list[FunnelOut] = []
+    for f in FUNNELS:
+        rows.append(FunnelOut(code=f["code"], title=f["title"], active_deals=counts.get(f["code"], 0)))
+        seen.add(f["code"])
+    # Воронки из таблицы stage, не описанные в FUNNELS — показываем как есть.
+    extras = (
+        await session.execute(select(Stage.funnel).distinct())
     ).scalars().all()
+    for code in extras:
+        if code not in seen:
+            rows.append(FunnelOut(code=code, title=code, active_deals=counts.get(code, 0)))
+    return rows
+
+
+@router.get("/stages", response_model=list[StageOut])
+async def list_stages(
+    funnel: str | None = None,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Стадии воронки для доски/редактора. Без ``funnel`` — все стадии всех воронок.
+    Первый вызов лениво материализует канон (``stages.py``) в таблицу — дальше источник
+    истины редактируемый."""
+    stmt = select(Stage).order_by(Stage.funnel, Stage.sort_order)
+    rows = (await session.execute(stmt)).scalars().all()
     if not rows:
         session.add_all([Stage(**row) for row in canonical_stages()])
         try:
             await session.commit()
         except IntegrityError:  # гонка параллельного первого GET — сид уже сделан рядом
             await session.rollback()
-        rows = (
-            await session.execute(select(Stage).order_by(Stage.sort_order))
-        ).scalars().all()
+        rows = (await session.execute(stmt)).scalars().all()
+    if funnel is not None:
+        rows = [r for r in rows if r.funnel == funnel]
     return rows
 
 
@@ -593,6 +647,17 @@ async def update_deal(
         raise HTTPException(status_code=404, detail="Сделка не найдена")
     data = payload.model_dump(exclude_unset=True)
     new_stage = data.pop("stage", None)
+    new_funnel = data.pop("funnel", None)
+    # Смена воронки фиксируется в истории как смена стадии (источник → стадия первой стадии
+    # новой воронки), чтобы фронт-таймлайн не терял этот шаг; реальный новый стадия-код может
+    # прилететь следующим PATCH (drag&drop на доске уже другой воронки).
+    if new_funnel is not None and new_funnel != deal.funnel:
+        from_stage = deal.stage
+        deal.funnel = new_funnel
+        record_stage(session, deal, deal.stage, by=user.username)
+        # ponytail: stage остаётся прежним кодом; если код несуществует в новой воронке,
+        # доска покажет сделку «вне колонок» — UI должен сменить стадию следующим действием.
+        deal.next_step = f"Воронка: {from_stage} → {new_funnel}"
     if new_stage is not None and new_stage != deal.stage:
         record_stage(session, deal, new_stage, by=user.username)
     await repo.update(deal, data)

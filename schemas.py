@@ -42,6 +42,8 @@ class DealUpdate(BaseModel):
     starred: bool | None = None
     probability: int | None = None
     expected_close_date: str | None = None
+    # Смена воронки (мульти-воронки): фиксируется в истории как смена стадии.
+    funnel: str | None = None
 
 
 class DealRead(BaseModel):
@@ -68,6 +70,7 @@ class DealRead(BaseModel):
     stage_changed_at: datetime.datetime | None = None
     lost_reason_code: str | None = None
     lost_comment: str | None = None
+    funnel: str = "new_clients"
 
 
 class StageBoard(BaseModel):
@@ -297,6 +300,7 @@ class StageOut(BaseModel):
     kind: StageKind
     color: str
     is_active: bool
+    funnel: str = "new_clients"
 
 
 class StageCreate(BaseModel):
@@ -309,10 +313,11 @@ class StageCreate(BaseModel):
     kind: StageKind = "normal"
     color: str = "#64748B"
     is_active: bool = True
+    funnel: str = "new_clients"
 
 
 class StageUpdate(BaseModel):
-    """Частичное обновление стадии (порядок/вероятность/тип/имя/цвет/активность)."""
+    """Частичное обновление стадии (порядок/вероятность/тип/имя/цвет/активность/воронки)."""
 
     title: str | None = Field(default=None, min_length=1, max_length=128)
     sort_order: int | None = None
@@ -320,6 +325,15 @@ class StageUpdate(BaseModel):
     kind: StageKind | None = None
     color: str | None = None
     is_active: bool | None = None
+    funnel: str | None = None
+
+
+class FunnelOut(BaseModel):
+    """Воронка sales (мульти-воронки): код + титул + счётчик активных сделок."""
+
+    code: str
+    title: str
+    active_deals: int = 0
 
 
 MarginLineStatus = Literal["priced", "no_price", "no_cost"]
