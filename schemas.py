@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DealCreate(BaseModel):
@@ -516,3 +516,28 @@ class CallLinkDealIn(BaseModel):
 
     deal_id: int | None = None
     create: bool = False
+
+
+class TelephonyEventIn(BaseModel):
+    """Валидированное событие телефонии для прямого приёма ``POST /telephony/incoming``.
+
+    Прямой приём (fallback/тест) минует шину, поэтому валидируем строго: только известные
+    поля (``extra='forbid'``) с проверенными типами — иначе недоверенное тело могло бы
+    фабриковать ``CallLog`` с произвольными полями (security-review HIGH). Набор полей —
+    ровно те, что читают обработчики ``calls.record_event``/``EVENT_HANDLERS``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_type: str = "telephony.call.incoming"
+    call_id: str = Field(min_length=1)
+    direction: str | None = None
+    phone_e164: str | None = None
+    did: str | None = None
+    agent_ext: str | None = None
+    status: str | None = None
+    event: str | None = None
+    to_ext: str | None = None
+    duration_sec: int | None = None
+    hold_sec: int | None = None
+    recording_url: str | None = None

@@ -92,6 +92,7 @@ from modules.sales.schemas import (
     TaskCreate,
     TaskOut,
     TaskUpdate,
+    TelephonyEventIn,
 )
 from modules.sales.stages import PROBABILITY_BY_STAGE, STAGES, TERMINAL_STAGES
 
@@ -1721,6 +1722,11 @@ async def calls_stream(
 
     from modules.sales import calls as calls_mod
 
+    # ponytail: остаточный IDOR (security-review HIGH) — ``owner`` самоназначаемый, любой
+    # с sales.deal.read подписывается на чужой поток (чужие звонки: номер/контрагент).
+    # Закрыть нечем, пока нет аутентифицированной идентичности продавца: в dev X-User не
+    # шлётся (user.username == "anonymous"), фича держится на ?owner=<ФИО>. Апгрейд —
+    # Keycloak P1 (username↔Deal.owner) → гейт «свой поток / sales.calls.read_all для РОП».
     target = owner or user.username
     queue = calls_mod.subscribe(target)
 
@@ -1827,6 +1833,10 @@ async def call_link_deal(
     """Привязать звонок к существующей сделке (``deal_id``) или создать новую (``create``)."""
     from modules.sales.models import CallLog
 
+    # ponytail: остаточный риск authz (security-review MED) — нет проверки call.owner ==
+    # вызывающий, любой с sales.deal.write привязывает/создаёт сделку по чужому звонку.
+    # Тот же блокер, что у /calls/stream: в dev нет идентичности (user.username ==
+    # "anonymous"), сверять не с чем. Апгрейд — Keycloak P1 → проверка владельца + set owner.
     call = await session.get(CallLog, cid)
     if call is None:
         raise HTTPException(status_code=404, detail="Звонок не найден")
@@ -1863,7 +1873,7 @@ async def call_link_deal(
 
 @router.post("/telephony/incoming")
 async def telephony_incoming(
-    payload: dict,
+    payload: TelephonyEventIn,
     session: AsyncSession = Depends(get_session),
     core: Core = Depends(get_core),
     _: CurrentUser = Depends(require_permission("sales.deal.write")),
@@ -1871,15 +1881,17 @@ async def telephony_incoming(
     """Прямой приём нормализованного события звонка (fallback/тест, если не через шину).
 
     Обрабатывает синхронно (апсерт записи + push карточки), минуя задержку relay.
-    ``payload`` — как от коннектора + ``event_type`` (по умолчанию incoming).
+    Тело строго валидируется (``TelephonyEventIn``: только известные поля, проверенные
+    типы) — недоверенный вызов не может фабриковать ``CallLog`` (security-review HIGH).
     """
     from core.services.eventbus import EventContext
     from modules.sales import calls as calls_mod
 
-    event_type = payload.get("event_type", "telephony.call.incoming")
+    event_type = payload.event_type
     handler = calls_mod.EVENT_HANDLERS.get(event_type)
     if handler is None:
         raise HTTPException(status_code=400, detail=f"Неизвестный тип события: {event_type}")
-    await handler(payload, EventContext(session=session, services=core.services))
+    data = payload.model_dump()
+    await handler(data, EventContext(session=session, services=core.services))
     await session.commit()
-    return {"ok": True, "event_type": event_type, "call_id": payload.get("call_id")}
+    return {"ok": True, "event_type": event_type, "call_id": payload.call_id}
