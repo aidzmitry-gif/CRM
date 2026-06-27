@@ -13,7 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.domain.models import Approval, Contact, Counterparty, Sku
+from core.domain.models import Approval, Contact, Counterparty, CounterpartyAlias, Sku
 from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
@@ -61,6 +61,7 @@ from modules.sales.schemas import (
     ContractPrepareIn,
     ContractTemplateCreate,
     ContractTemplateOut,
+    CounterpartyRef,
     DealCreate,
     DealDetailOut,
     DealItemCreate,
@@ -194,6 +195,26 @@ async def _counterparty_for_deal(
         session.add(cp)
         await session.flush()
     return cp
+
+
+async def _counterparty_ref(session: AsyncSession, deal: Deal) -> CounterpartyRef | None:
+    """Резолв контрагента сделки в MDM для карточки (id/УНП/источники). None — нет в витрине."""
+    cp = await _counterparty_for_deal(session, deal)
+    if cp is None:
+        return None
+    sources = (
+        await session.execute(
+            select(CounterpartyAlias.source).where(CounterpartyAlias.counterparty_id == cp.id)
+        )
+    ).scalars().all()
+    return CounterpartyRef(
+        id=cp.id,
+        name=cp.name,
+        unp=cp.unp,
+        sources=sorted(set(sources)),
+        is_active=cp.is_active,
+        merged_into_id=cp.merged_into_id,
+    )
 
 
 async def _clear_primary(session: AsyncSession, counterparty_id: int) -> None:
@@ -427,7 +448,10 @@ async def get_deal(deal_id: int, session: AsyncSession = Depends(get_session)):
     documents = [DocumentOut.model_validate(d) for d in docs]
 
     return DealDetailOut(
-        **DealRead.model_validate(deal).model_dump(), items=items, documents=documents
+        **DealRead.model_validate(deal).model_dump(),
+        items=items,
+        documents=documents,
+        counterparty_ref=await _counterparty_ref(session, deal),
     )
 
 

@@ -255,11 +255,30 @@ class PackageSentOut(BaseModel):
     sent: bool = True
 
 
+class CounterpartyRef(BaseModel):
+    """Резолв контрагента сделки в MDM-витрине (golden record) — провенанс для карточки.
+
+    Связь сделки с контрагентом — мягкая, по имени; резолвится на чтении (без дубля MDM,
+    [[spravochniki-mdm-decision]]). ``None`` на выходе, если имени нет в MDM → honest-empty
+    на фронте. ``sources`` — внешние системы-источники из ``CounterpartyAlias`` (1c|bitrix|
+    erp|merge); ``unp`` — natural key РБ для бейджа ``<SourceTag>``.
+    """
+
+    id: int
+    name: str
+    unp: str | None = None
+    sources: list[str] = []
+    is_active: bool = True
+    merged_into_id: int | None = None
+
+
 class DealDetailOut(DealRead):
     """Сделка с позициями номенклатуры и документами (для экрана карточки)."""
 
     items: list[DealItemOut] = []
     documents: list[DocumentOut] = []
+    # Контрагент из MDM (резолв по имени на чтении); None — нет в витрине (honest-empty).
+    counterparty_ref: CounterpartyRef | None = None
 
 
 class ActivityCreate(BaseModel):
