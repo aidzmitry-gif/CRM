@@ -235,6 +235,28 @@ class LossReason(Base):
     active: Mapped[bool] = mapped_column(default=True)
 
 
+class Stage(Base):
+    """Стадия воронки — редактируемый справочник (Сделки 2.0, редактор стадий).
+
+    Источник истины доски/группировки, когда таблица заполнена; иначе код падает на канон
+    ``stages.py`` (fallback). ``code`` = значение ``Deal.stage``. ``kind`` — тип стадии:
+    ``normal`` | ``won`` (успех) | ``cond_lost`` (условный отказ, реанимируемый) | ``lost``
+    (отказ, терминал). ``probability`` — дефолтная вероятность закрытия (0..100, SALES-44).
+    """
+
+    __tablename__ = "stage"
+    __table_args__ = {"schema": "sales"}
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True)
+    title: Mapped[str] = mapped_column(String(128))
+    sort_order: Mapped[int] = mapped_column(default=0, server_default="0")
+    probability: Mapped[int] = mapped_column(default=0, server_default="0")
+    kind: Mapped[str] = mapped_column(String(16), default="normal", server_default="normal")
+    color: Mapped[str] = mapped_column(String(16), default="#64748B", server_default="#64748B")
+    is_active: Mapped[bool] = mapped_column(default=True, server_default="true")
+
+
 class DealStageEvent(Base):
     """История смены стадий сделки (SALES-43): из стадии → в стадию, кто и когда."""
 

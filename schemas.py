@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -279,6 +280,46 @@ class DealDetailOut(DealRead):
     documents: list[DocumentOut] = []
     # Контрагент из MDM (резолв по имени на чтении); None — нет в витрине (honest-empty).
     counterparty_ref: CounterpartyRef | None = None
+
+
+StageKind = Literal["normal", "won", "cond_lost", "lost"]
+
+
+class StageOut(BaseModel):
+    """Стадия воронки для доски/редактора (Сделки 2.0)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    code: str
+    title: str
+    sort_order: int
+    probability: int
+    kind: StageKind
+    color: str
+    is_active: bool
+
+
+class StageCreate(BaseModel):
+    """Создание стадии воронки (редактор стадий)."""
+
+    code: str = Field(min_length=1, max_length=32)
+    title: str = Field(min_length=1, max_length=128)
+    sort_order: int = 0
+    probability: int = Field(default=0, ge=0, le=100)
+    kind: StageKind = "normal"
+    color: str = "#64748B"
+    is_active: bool = True
+
+
+class StageUpdate(BaseModel):
+    """Частичное обновление стадии (порядок/вероятность/тип/имя/цвет/активность)."""
+
+    title: str | None = Field(default=None, min_length=1, max_length=128)
+    sort_order: int | None = None
+    probability: int | None = Field(default=None, ge=0, le=100)
+    kind: StageKind | None = None
+    color: str | None = None
+    is_active: bool | None = None
 
 
 class ActivityCreate(BaseModel):

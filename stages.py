@@ -39,3 +39,22 @@ PROBABILITY_BY_STAGE: dict[str, int] = {
 
 # Быстрый lookup: id → dict (для валидации и UI).
 STAGE_BY_ID: dict[str, dict] = {s["id"]: s for s in STAGES}
+
+# Тип стадии для редактора (Сделки 2.0): успех/отказы — особые, прочие — normal.
+KIND_BY_STAGE: dict[str, str] = {"won": "won", "cond_lost": "cond_lost", "lost": "lost"}
+
+
+def canonical_stages() -> list[dict]:
+    """Канон 11 стадий как полные строки — сид таблицы ``sales.stage``, фолбэк редактора."""
+    return [
+        {
+            "code": s["id"],
+            "title": s["title"],
+            "sort_order": i,
+            "probability": PROBABILITY_BY_STAGE.get(s["id"], 0),
+            "kind": KIND_BY_STAGE.get(s["id"], "normal"),
+            "color": s["color"],
+            "is_active": True,
+        }
+        for i, s in enumerate(STAGES)
+    ]

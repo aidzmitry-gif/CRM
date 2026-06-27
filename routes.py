@@ -42,6 +42,7 @@ from modules.sales.models import (
     LossReason,
     Message,
     PriceQuote,
+    Stage,
 )
 from modules.sales.repository import DealRepository, record_stage
 from modules.sales.schemas import (
@@ -89,13 +90,21 @@ from modules.sales.schemas import (
     PriceQuoteCreate,
     SkuOut,
     StageBoard,
+    StageCreate,
     StageEventOut,
+    StageOut,
+    StageUpdate,
     TaskCreate,
     TaskOut,
     TaskUpdate,
     TelephonyEventIn,
 )
-from modules.sales.stages import PROBABILITY_BY_STAGE, STAGES, TERMINAL_STAGES
+from modules.sales.stages import (
+    PROBABILITY_BY_STAGE,
+    STAGES,
+    TERMINAL_STAGES,
+    canonical_stages,
+)
 
 router = APIRouter(tags=["sales"])
 
@@ -111,10 +120,36 @@ PERIOD_DAYS = {"day": 1, "week": 7, "month": 30, "quarter": 90, "year": 365}
 PERIOD_MULT = {"day": 1, "week": 5, "month": 22, "quarter": 65, "year": 250}
 
 
-def _deal_weight(deal: Deal) -> float:
-    """Взвешенная сумма сделки: amount × вероятность (своя или дефолт стадии)."""
-    p = deal.probability if deal.probability is not None else PROBABILITY_BY_STAGE.get(deal.stage, 0)
+def _deal_weight(deal: Deal, prob_by_stage: dict[str, int] | None = None) -> float:
+    """Взвешенная сумма сделки: amount × вероятность (своя или дефолт стадии).
+
+    ``prob_by_stage`` — карта стадия→вероятность из редактируемой таблицы стадий; нет →
+    канон ``PROBABILITY_BY_STAGE`` (фолбэк до материализации таблицы).
+    """
+    defaults = prob_by_stage if prob_by_stage is not None else PROBABILITY_BY_STAGE
+    p = deal.probability if deal.probability is not None else defaults.get(deal.stage, 0)
     return float(deal.amount) * p / 100
+
+
+async def _board_stages(session: AsyncSession) -> list[dict]:
+    """Активные стадии доски (порядок=колонки) из таблицы ``sales.stage``; пусто → канон.
+
+    Таблица — редактируемый источник истины (редактор стадий); пока не материализована,
+    падаем на канон ``stages.py`` (значения идентичны сиду миграции).
+    """
+    rows = (
+        await session.execute(select(Stage).where(Stage.is_active).order_by(Stage.sort_order))
+    ).scalars().all()
+    if rows:
+        return [
+            {"id": r.code, "title": r.title, "color": r.color, "probability": r.probability}
+            for r in rows
+        ]
+    return [
+        {"id": s["id"], "title": s["title"], "color": s["color"],
+         "probability": PROBABILITY_BY_STAGE.get(s["id"], 0)}
+        for s in STAGES
+    ]
 
 
 def _utcnow() -> datetime:
@@ -276,6 +311,8 @@ async def board(owner: str = "", session: AsyncSession = Depends(get_session)) -
     for deal in deals:
         by_stage[deal.stage].append(deal)
 
+    board_stages = await _board_stages(session)
+    prob_by_stage = {s["id"]: s["probability"] for s in board_stages}
     stages = [
         StageBoard(
             id=s["id"],
@@ -283,12 +320,96 @@ async def board(owner: str = "", session: AsyncSession = Depends(get_session)) -
             color=s["color"],
             count=len(by_stage.get(s["id"], [])),
             sum=float(sum(d.amount for d in by_stage.get(s["id"], []))),
-            weighted=float(sum(_deal_weight(d) for d in by_stage.get(s["id"], []))),
+            weighted=float(sum(_deal_weight(d, prob_by_stage) for d in by_stage.get(s["id"], []))),
             deals=[DealRead.model_validate(d) for d in by_stage.get(s["id"], [])],
         )
-        for s in STAGES
+        for s in board_stages
     ]
     return BoardOut(stages=stages)
+
+
+# ── Редактор стадий воронки (Сделки 2.0): CRUD справочника sales.stage ─────────────
+@router.get("/stages", response_model=list[StageOut])
+async def list_stages(
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Стадии воронки для доски/редактора. Первый вызов лениво материализует канон
+    (``stages.py``) в таблицу — дальше источник истины редактируемый."""
+    rows = (
+        await session.execute(select(Stage).order_by(Stage.sort_order))
+    ).scalars().all()
+    if not rows:
+        session.add_all([Stage(**row) for row in canonical_stages()])
+        try:
+            await session.commit()
+        except IntegrityError:  # гонка параллельного первого GET — сид уже сделан рядом
+            await session.rollback()
+        rows = (
+            await session.execute(select(Stage).order_by(Stage.sort_order))
+        ).scalars().all()
+    return rows
+
+
+@router.post("/stages", response_model=StageOut, status_code=201)
+async def create_stage(
+    payload: StageCreate,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Добавить стадию воронки (редактор стадий)."""
+    exists = (
+        await session.execute(select(Stage).where(Stage.code == payload.code))
+    ).scalars().first()
+    if exists is not None:
+        raise HTTPException(status_code=409, detail="Стадия с таким кодом уже есть")
+    stage = Stage(**payload.model_dump())
+    session.add(stage)
+    await session.commit()
+    return stage
+
+
+@router.patch("/stages/{code}", response_model=StageOut)
+async def update_stage(
+    code: str,
+    payload: StageUpdate,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Изменить стадию (имя/порядок/вероятность/тип/цвет/активность)."""
+    stage = (
+        await session.execute(select(Stage).where(Stage.code == code))
+    ).scalars().first()
+    if stage is None:
+        raise HTTPException(status_code=404, detail="Стадия не найдена")
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(stage, field, value)
+    await session.commit()
+    return stage
+
+
+@router.delete("/stages/{code}", status_code=204)
+async def delete_stage(
+    code: str,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Удалить стадию. 409, если в стадии есть сделки (целостность ``Deal.stage``)."""
+    stage = (
+        await session.execute(select(Stage).where(Stage.code == code))
+    ).scalars().first()
+    if stage is None:
+        raise HTTPException(status_code=404, detail="Стадия не найдена")
+    in_use = (
+        await session.execute(select(func.count()).select_from(Deal).where(Deal.stage == code))
+    ).scalar()
+    if in_use:
+        raise HTTPException(
+            status_code=409,
+            detail=f"В стадии есть сделки ({in_use}) — перенесите их или деактивируйте стадию",
+        )
+    await session.delete(stage)
+    await session.commit()
 
 
 @router.get("/kpis", response_model=list[KpiOut])
