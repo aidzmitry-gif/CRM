@@ -336,6 +336,29 @@ class FunnelOut(BaseModel):
     active_deals: int = 0
 
 
+class StageAnalytics(BaseModel):
+    """Аналитика стадии воронки (П6 ТЗ): количество, суммы, конверсия, средний возраст."""
+
+    id: str
+    title: str
+    color: str
+    count: int
+    sum: float
+    weighted: float
+    avg_age_days: float | None = None  # средний возраст текущих сделок в стадии
+    next_conv_pct: int | None = None    # доля сделок этой стадии, ушедших в следующую (по истории)
+
+
+class PipelineAnalyticsOut(BaseModel):
+    """Pipeline-аналитика воронки: стадии + сводные показатели по воронке (forecast/cycle)."""
+
+    funnel: str
+    stages: list[StageAnalytics]
+    forecast_weighted: float
+    avg_cycle_days: float | None = None  # средний цикл won-сделок (created_at→closed)
+    won_count: int = 0
+
+
 MarginLineStatus = Literal["priced", "no_price", "no_cost"]
 
 

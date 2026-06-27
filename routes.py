@@ -89,9 +89,11 @@ from modules.sales.schemas import (
     ObjectionReplyIn,
     ObjectionReplyOut,
     PackageSentOut,
+    PipelineAnalyticsOut,
     PriceInfo,
     PriceQuoteCreate,
     SkuOut,
+    StageAnalytics,
     StageBoard,
     StageCreate,
     StageEventOut,
@@ -349,6 +351,108 @@ async def board(
         for s in board_stages
     ]
     return BoardOut(stages=stages)
+
+
+@router.get("/pipeline/analytics", response_model=PipelineAnalyticsOut)
+async def pipeline_analytics(
+    funnel: str = DEFAULT_FUNNEL,
+    owner: str = "",
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Pipeline-аналитика воронки (П6 ТЗ): по каждой стадии — count/sum/weighted/avg_age/
+    conv→следующая; по воронке — взвеш.прогноз + средняя длина цикла won-сделок.
+
+    Конверсия стадия→next: доля сделок, чья история имеет переход (from=stage, to=next_stage)
+    среди тех, кто хотя бы был в этой стадии. honest-empty: пусто, если истории нет.
+    """
+    stage_rows = await _board_stages(session, funnel)
+    deals = await DealRepository(session).list()
+    deals = [d for d in deals if d.funnel == funnel]
+    if owner:
+        deals = [d for d in deals if d.owner == owner]
+    prob_by_stage = {s["id"]: s["probability"] for s in stage_rows}
+    by_stage: dict[str, list[Deal]] = defaultdict(list)
+    for d in deals:
+        by_stage[d.stage].append(d)
+
+    # История стадий: события для всех сделок этой воронки.
+    deal_ids = [d.id for d in deals]
+    events: list[DealStageEvent] = []
+    if deal_ids:
+        events = (
+            await session.execute(
+                select(DealStageEvent).where(DealStageEvent.deal_id.in_(deal_ids))
+            )
+        ).scalars().all()
+    # Кто вообще был в стадии (был as `to_stage` хоть раз) и кто ушёл из неё (был as
+    # `from_stage` хоть раз, переход в неконечную/следующую стадию).
+    been_in: dict[str, set[int]] = defaultdict(set)
+    moved_to_next: dict[tuple[str, str], set[int]] = defaultdict(set)
+    for ev in events:
+        if ev.to_stage:
+            been_in[ev.to_stage].add(ev.deal_id)
+        if ev.from_stage and ev.to_stage:
+            moved_to_next[(ev.from_stage, ev.to_stage)].add(ev.deal_id)
+    # Текущие сделки тоже учитываем как «были в стадии» (на случай создания без события).
+    for d in deals:
+        been_in[d.stage].add(d.id)
+
+    stage_codes = [s["id"] for s in stage_rows]
+    now = _utcnow()
+    out_stages: list[StageAnalytics] = []
+    for idx, s in enumerate(stage_rows):
+        sid = s["id"]
+        bucket = by_stage.get(sid, [])
+        # средний возраст в стадии — из stage_changed_at
+        ages = [
+            (now - d.stage_changed_at).total_seconds() / 86400.0
+            for d in bucket
+            if d.stage_changed_at is not None
+        ]
+        avg_age = round(sum(ages) / len(ages), 1) if ages else None
+
+        next_sid = stage_codes[idx + 1] if idx + 1 < len(stage_codes) else None
+        conv: int | None = None
+        if next_sid is not None:
+            denom = len(been_in.get(sid, set()))
+            if denom > 0:
+                gone_next = len(moved_to_next.get((sid, next_sid), set()))
+                conv = round(gone_next / denom * 100)
+
+        out_stages.append(
+            StageAnalytics(
+                id=sid,
+                title=s["title"],
+                color=s["color"],
+                count=len(bucket),
+                sum=float(sum(d.amount for d in bucket)),
+                weighted=float(sum(_deal_weight(d, prob_by_stage) for d in bucket)),
+                avg_age_days=avg_age,
+                next_conv_pct=conv,
+            )
+        )
+
+    # Сводно: взвеш. прогноз = сумма по всем нетерминальным стадиям; средняя длина цикла
+    # won-сделок (created_at → closed_date/stage_changed_at).
+    forecast = sum(
+        s.weighted for s in out_stages if s.id not in TERMINAL_STAGES and s.id != "cond_lost"
+    )
+    won_deals = [d for d in deals if d.stage == "won"]
+    cycles: list[float] = []
+    for d in won_deals:
+        end = d.stage_changed_at  # переход в won зафиксирован тут
+        if d.created_at is not None and end is not None:
+            cycles.append((end - d.created_at).total_seconds() / 86400.0)
+    avg_cycle = round(sum(cycles) / len(cycles), 1) if cycles else None
+
+    return PipelineAnalyticsOut(
+        funnel=funnel,
+        stages=out_stages,
+        forecast_weighted=float(forecast),
+        avg_cycle_days=avg_cycle,
+        won_count=len(won_deals),
+    )
 
 
 # ── Редактор стадий воронки (Сделки 2.0): CRUD справочника sales.stage ─────────────
