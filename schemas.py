@@ -322,6 +322,52 @@ class StageUpdate(BaseModel):
     is_active: bool | None = None
 
 
+MarginLineStatus = Literal["priced", "no_price", "no_cost"]
+
+
+class MarginLine(BaseModel):
+    """Маржа позиции сделки: цена клиенту × кол-во минус landed себестоимость × кол-во.
+
+    ``status`` — honest-разбивка: ``priced`` (есть цена И landed → попадает в gross);
+    ``no_price`` (нет последней котировки клиенту); ``no_cost`` (нет закрытого landed по SKU).
+    Позиции без обоих в gross НЕ попадают (не маскируем дыру нулём — [[landed_cost]]).
+    """
+
+    sku_code: str
+    title: str
+    qty: float
+    unit_price: float | None = None
+    revenue: float | None = None
+    unit_landed_cost: float | None = None
+    cogs: float | None = None
+    margin_pct: float | None = None
+    status: MarginLineStatus
+    # Провенанс себестоимости из landed: shipment_id/fixed_at/fx_rate (None если нет landed).
+    cost_shipment_id: int | None = None
+    cost_fixed_at: datetime.datetime | None = None
+    cost_fx_rate: float | None = None
+
+
+class DealMarginOut(BaseModel):
+    """Факт-маржа сделки через landed cost ([[pricing-calculation-todo]] — методику не изобретаем).
+
+    ``revenue``/``cogs_landed``/``gross_profit`` — суммы по позициям со статусом ``priced``;
+    ``margin_pct`` — round(gross/revenue×100) или ``None`` при revenue=0. ``priced_count``/
+    ``total_count`` — частичная оценка для бейджа «N из M». ``reason`` — причина деградации
+    (нет landed-фасада или ничего не оценено), None — есть хоть одна priced-позиция.
+    """
+
+    deal_id: int
+    revenue: float
+    cogs_landed: float | None
+    gross_profit: float | None
+    margin_pct: int | None
+    priced_count: int
+    total_count: int
+    reason: str | None = None
+    lines: list[MarginLine] = []
+
+
 class ActivityCreate(BaseModel):
     """Отметка факта активности (звонок, заявка, отгрузка)."""
 

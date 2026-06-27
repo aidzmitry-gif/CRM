@@ -68,6 +68,7 @@ from modules.sales.schemas import (
     DealItemCreate,
     DealItemOut,
     DealItemUpdate,
+    DealMarginOut,
     DealRead,
     DealUpdate,
     DocumentCreate,
@@ -81,6 +82,7 @@ from modules.sales.schemas import (
     LeadRouteOut,
     LoseRequest,
     LossReasonOut,
+    MarginLine,
     MessageCreate,
     MessageOut,
     ObjectionReplyIn,
@@ -596,6 +598,121 @@ async def update_deal(
     await repo.update(deal, data)
     await session.commit()
     return deal
+
+
+@router.get("/deals/{deal_id}/margin", response_model=DealMarginOut)
+async def deal_margin(
+    deal_id: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Факт-маржа сделки: цена из ``PriceQuote`` × qty минус landed × qty (по позициям).
+
+    Цена — последняя котировка клиенту (``PriceQuote(sku_code, counterparty)``); себес —
+    через фасад ``core.services.landed_cost.last_landed_cost_batch`` (модуль procurement,
+    результат закрытой партии). Деградация honest: фасад ``None`` → ``cogs_landed=None`` +
+    причина; позиции без цены/себеса в gross НЕ попадают (``no_price``/``no_cost``).
+    Методику установки цены НЕ изобретаем — отдаём ФАКТ-маржу где данные уже есть.
+    """
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+
+    rows = (
+        await session.execute(select(DealItem).where(DealItem.deal_id == deal_id))
+    ).scalars().all()
+    if not rows:
+        return DealMarginOut(
+            deal_id=deal_id, revenue=0.0, cogs_landed=0.0, gross_profit=0.0,
+            margin_pct=None, priced_count=0, total_count=0,
+            reason="Позиций нет — маржа не рассчитывается",
+        )
+
+    skus = {
+        s.id: s for s in (
+            await session.execute(select(Sku).where(Sku.id.in_([r.sku_id for r in rows])))
+        ).scalars().all()
+    }
+    codes = sorted({skus[r.sku_id].code for r in rows if r.sku_id in skus})
+
+    # Последняя цена клиенту по (sku_code, counterparty) — как ``_price_summary``.
+    last_price: dict[str, float] = {}
+    if codes:
+        quotes = (
+            await session.execute(
+                select(PriceQuote)
+                .where(PriceQuote.counterparty == deal.counterparty, PriceQuote.sku_code.in_(codes))
+                .order_by(PriceQuote.id)
+            )
+        ).scalars().all()
+        for q in quotes:
+            last_price[q.sku_code] = float(q.price)  # перезаписываем — побеждает последняя
+
+    # Landed себестоимость через фасад ядра (None → procurement не подключён → честная деградация).
+    landed_facade = getattr(core.services, "landed_cost", None)
+    landed_map: dict[str, dict | None] = {}
+    facade_missing = landed_facade is None
+    if not facade_missing and codes:
+        landed_map = await landed_facade.last_landed_cost_batch(session, codes)
+
+    lines: list[MarginLine] = []
+    revenue = 0.0
+    cogs = 0.0
+    priced = 0
+    for r in rows:
+        sku = skus.get(r.sku_id)
+        code = sku.code if sku else ""
+        title = sku.title if sku else ""
+        qty = float(r.qty)
+        price = last_price.get(code)
+        cost_row = landed_map.get(code) if not facade_missing else None
+        unit_cost = float(cost_row["unit_landed_cost_byn"]) if cost_row else None
+
+        line = MarginLine(
+            sku_code=code, title=title, qty=qty,
+            unit_price=price,
+            revenue=price * qty if price is not None else None,
+            unit_landed_cost=unit_cost,
+            cogs=unit_cost * qty if unit_cost is not None else None,
+            margin_pct=(
+                round((price - unit_cost) / price * 100)
+                if price and unit_cost is not None and price > 0 else None
+            ),
+            status=(
+                "priced" if price is not None and unit_cost is not None
+                else ("no_cost" if price is not None else "no_price")
+            ),
+            cost_shipment_id=cost_row.get("shipment_id") if cost_row else None,
+            cost_fixed_at=cost_row.get("fixed_at") if cost_row else None,
+            cost_fx_rate=float(cost_row["fx_rate"]) if cost_row and cost_row.get("fx_rate") is not None else None,
+        )
+        lines.append(line)
+        if line.status == "priced":
+            revenue += line.revenue or 0.0
+            cogs += line.cogs or 0.0
+            priced += 1
+
+    if facade_missing:
+        reason = "Себестоимость закупок не подключена (procurement не реализовал фасад landed_cost)"
+        return DealMarginOut(
+            deal_id=deal_id, revenue=revenue, cogs_landed=None, gross_profit=None,
+            margin_pct=None, priced_count=priced, total_count=len(rows),
+            reason=reason, lines=lines,
+        )
+    if priced == 0:
+        return DealMarginOut(
+            deal_id=deal_id, revenue=revenue, cogs_landed=0.0, gross_profit=0.0,
+            margin_pct=None, priced_count=0, total_count=len(rows),
+            reason="Ни по одной позиции нет одновременно цены клиенту и landed cost",
+            lines=lines,
+        )
+    gross = revenue - cogs
+    margin_pct = round(gross / revenue * 100) if revenue > 0 else None
+    return DealMarginOut(
+        deal_id=deal_id, revenue=revenue, cogs_landed=cogs, gross_profit=gross,
+        margin_pct=margin_pct, priced_count=priced, total_count=len(rows), lines=lines,
+    )
 
 
 @router.get("/loss-reasons", response_model=list[LossReasonOut])
