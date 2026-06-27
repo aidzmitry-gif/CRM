@@ -84,6 +84,111 @@ async def on_shipment_delivered(payload: dict, ctx) -> None:
         logger.info("Sales: сделка %s закрыта успешно (доставлено)", deal_id)
 
 
+async def on_deal_won_handoff(payload: dict, ctx) -> None:
+    """Сделка выиграна → собрать контракт ``sales.deal.handoff`` для downstream (логистика/
+    финансы/офис). Полезная нагрузка: сделка, контрагент, сумма, позиции, ответственный +
+    gross_profit (если landed cost подключён). Никакого write в чужие схемы — только событие.
+
+    Идемпотентно: для одной и той же сделки эмитим один handoff (проверяем по audit-журналу
+    ``OutboxEvent``-логирование произойдёт раз; повторные won-события ничего не делают).
+    """
+    if ctx is None:
+        return
+    deal_id = payload.get("deal_id")
+    number = payload.get("number")
+    if not deal_id:
+        # Старые won-события без deal_id — игнор (закрытие из логистики приходит с deal_id).
+        return
+
+    # Идемпотентность: если уже эмитили handoff по этой сделке — выходим.
+    from core.domain.models import OutboxEvent
+
+    already = (
+        await ctx.session.execute(
+            select(OutboxEvent).where(OutboxEvent.event_type == "sales.deal.handoff")
+        )
+    ).scalars().all()
+    if any(ev.payload.get("deal_id") == deal_id for ev in already):
+        return
+
+    from modules.sales.models import Deal, DealItem
+
+    deal = await ctx.session.get(Deal, deal_id)
+    if deal is None:
+        return
+    items_rows = (
+        await ctx.session.execute(select(DealItem).where(DealItem.deal_id == deal_id))
+    ).scalars().all()
+
+    # Резолв сводки по позициям (sku_code+qty) — без вытаскивания всего Sku, через codes.
+    from core.domain.models import Sku
+
+    sku_ids = [r.sku_id for r in items_rows]
+    sku_map: dict[int, Sku] = {}
+    if sku_ids:
+        sku_map = {
+            s.id: s for s in (
+                await ctx.session.execute(select(Sku).where(Sku.id.in_(sku_ids)))
+            ).scalars().all()
+        }
+    items = [
+        {
+            "sku_code": sku_map[r.sku_id].code if r.sku_id in sku_map else "",
+            "title": sku_map[r.sku_id].title if r.sku_id in sku_map else "",
+            "qty": float(r.qty),
+        }
+        for r in items_rows
+    ]
+
+    # gross_profit — best-effort через landed_cost фасад (None → handoff без маржи).
+    gross_profit: float | None = None
+    facade = getattr(ctx.services, "landed_cost", None)
+    if facade is not None and items:
+        # Бюджет: тянем landed по уникальным кодам, цену клиенту из PriceQuote.
+        codes = sorted({it["sku_code"] for it in items if it["sku_code"]})
+        landed = await facade.last_landed_cost_batch(ctx.session, codes)
+        from modules.sales.models import PriceQuote
+
+        quotes = (
+            await ctx.session.execute(
+                select(PriceQuote)
+                .where(PriceQuote.counterparty == deal.counterparty, PriceQuote.sku_code.in_(codes))
+                .order_by(PriceQuote.id)
+            )
+        ).scalars().all()
+        last_price: dict[str, float] = {}
+        for q in quotes:
+            last_price[q.sku_code] = float(q.price)
+        gp = 0.0
+        any_priced = False
+        for it in items:
+            code = it["sku_code"]
+            price = last_price.get(code)
+            cost_row = landed.get(code)
+            if price is not None and cost_row is not None:
+                any_priced = True
+                gp += (price - float(cost_row["unit_landed_cost_byn"])) * it["qty"]
+        gross_profit = round(gp, 2) if any_priced else None
+
+    ctx.services.event_bus.emit(
+        ctx.session,
+        "sales.deal.handoff",
+        {
+            "deal_id": deal_id,
+            "number": number or deal.number,
+            "counterparty": deal.counterparty,
+            "amount": float(deal.amount),
+            "owner": deal.owner,
+            "funnel": deal.funnel,
+            "items": items,
+            "gross_profit": gross_profit,
+            "actor": "sales",
+            "entity_ref": f"deal:{deal_id}",
+        },
+    )
+    logger.info("Sales: handoff по сделке #%s (контрагент=%s, позиций=%d)", deal_id, deal.counterparty, len(items))
+
+
 async def on_incoming_message_ai(payload: dict, ctx) -> None:
     """AI-агент реагирует на входящее сообщение клиента (§2.5, Итерация 1).
 

@@ -336,6 +336,66 @@ class FunnelOut(BaseModel):
     active_deals: int = 0
 
 
+class HandoffItem(BaseModel):
+    """Позиция в handoff-передаче в исполнение."""
+
+    sku_code: str
+    title: str
+    qty: float
+
+
+class DealHandoffOut(BaseModel):
+    """Сводка «передано в исполнение» по выигранной сделке (П10 ТЗ): полезная нагрузка
+    события ``sales.deal.handoff`` (контракт для downstream — логистика/финансы/офис).
+    None — события ещё нет (сделка не won или handoff не эмитнут)."""
+
+    deal_id: int
+    number: str
+    counterparty: str
+    amount: float
+    owner: str
+    funnel: str
+    items: list[HandoffItem] = []
+    gross_profit: float | None = None
+    handed_off_at: datetime.datetime | None = None
+
+
+PlanStatus = Literal["draft", "pending_approval", "approved", "rejected"]
+
+
+class PlanTargetOut(BaseModel):
+    """План показателя продавца (PlanTarget) для UI: id/owner/метрика/период/цель/статус."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    owner_id: int
+    metric: str
+    period_type: str
+    period_key: str
+    target: float
+    status: PlanStatus
+    approved_by: str | None = None
+    approved_at: datetime.datetime | None = None
+
+
+class PlanTargetIn(BaseModel):
+    """Upsert плана продавца: продавец заявляет (или редактирует draft) свою цель."""
+
+    owner_id: int
+    metric: str = Field(min_length=1, max_length=32)
+    period_type: Literal["day", "week", "month", "quarter", "year"]
+    period_key: str = Field(min_length=1, max_length=10)
+    target: float = Field(ge=0)
+
+
+class PlanDecisionIn(BaseModel):
+    """Решение РОП по плану: approve/reject + опц. комментарий."""
+
+    approved: bool
+    comment: str | None = None
+
+
 class StageAnalytics(BaseModel):
     """Аналитика стадии воронки (П6 ТЗ): количество, суммы, конверсия, средний возраст."""
 

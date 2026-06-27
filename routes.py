@@ -41,6 +41,7 @@ from modules.sales.models import (
     Lead,
     LossReason,
     Message,
+    PlanTarget,
     PriceQuote,
     Stage,
 )
@@ -65,6 +66,7 @@ from modules.sales.schemas import (
     CounterpartyRef,
     DealCreate,
     DealDetailOut,
+    DealHandoffOut,
     DealItemCreate,
     DealItemOut,
     DealItemUpdate,
@@ -75,6 +77,7 @@ from modules.sales.schemas import (
     DocumentDecision,
     DocumentOut,
     FunnelOut,
+    HandoffItem,
     KpiOut,
     LeadConvertOut,
     LeadCreate,
@@ -90,6 +93,9 @@ from modules.sales.schemas import (
     ObjectionReplyOut,
     PackageSentOut,
     PipelineAnalyticsOut,
+    PlanDecisionIn,
+    PlanTargetIn,
+    PlanTargetOut,
     PriceInfo,
     PriceQuoteCreate,
     SkuOut,
@@ -882,6 +888,174 @@ async def deal_margin(
         deal_id=deal_id, revenue=revenue, cogs_landed=cogs, gross_profit=gross,
         margin_pct=margin_pct, priced_count=priced, total_count=len(rows), lines=lines,
     )
+
+
+@router.get("/deals/{deal_id}/handoff", response_model=DealHandoffOut | None)
+async def deal_handoff(
+    deal_id: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Передача выигранной сделки в исполнение (П10 ТЗ): последний эмитнутый
+    ``sales.deal.handoff`` по этой сделке. None — события ещё нет (сделка не won
+    или handoff не эмитнут / событие в outbox без processed_at)."""
+    from core.domain.models import OutboxEvent
+
+    rows = (
+        await session.execute(
+            select(OutboxEvent)
+            .where(OutboxEvent.event_type == "sales.deal.handoff")
+            .order_by(OutboxEvent.id.desc())
+        )
+    ).scalars().all()
+    for ev in rows:
+        if ev.payload.get("deal_id") == deal_id:
+            payload = ev.payload
+            return DealHandoffOut(
+                deal_id=deal_id,
+                number=payload.get("number") or "",
+                counterparty=payload.get("counterparty") or "",
+                amount=float(payload.get("amount") or 0),
+                owner=payload.get("owner") or "",
+                funnel=payload.get("funnel") or "",
+                items=[HandoffItem(**it) for it in payload.get("items") or []],
+                gross_profit=payload.get("gross_profit"),
+                handed_off_at=ev.created_at,
+            )
+    return None
+
+
+# ── Встречное планирование РОП (PlanTarget): продавец предлагает, РОП согласует ────
+@router.get("/plans", response_model=list[PlanTargetOut])
+async def list_plans(
+    owner_id: int | None = None,
+    period_type: str | None = None,
+    period_key: str | None = None,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Список планов продавца по фильтрам. Пусто → []."""
+    stmt = select(PlanTarget)
+    if owner_id is not None:
+        stmt = stmt.where(PlanTarget.owner_id == owner_id)
+    if period_type is not None:
+        stmt = stmt.where(PlanTarget.period_type == period_type)
+    if period_key is not None:
+        stmt = stmt.where(PlanTarget.period_key == period_key)
+    return (await session.execute(stmt.order_by(PlanTarget.metric))).scalars().all()
+
+
+@router.post("/plans", response_model=PlanTargetOut)
+async def upsert_plan(
+    payload: PlanTargetIn,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Поставить/изменить ``draft`` цель по (owner_id, metric, period_type, period_key).
+
+    Upsert по UniqueConstraint; уже согласованный план (``approved``) трогать нельзя — 409.
+    """
+    existing = (
+        await session.execute(
+            select(PlanTarget).where(
+                PlanTarget.owner_id == payload.owner_id,
+                PlanTarget.metric == payload.metric,
+                PlanTarget.period_type == payload.period_type,
+                PlanTarget.period_key == payload.period_key,
+            )
+        )
+    ).scalars().first()
+    if existing is not None:
+        if existing.status == "approved":
+            raise HTTPException(status_code=409, detail="План уже согласован — изменить нельзя")
+        existing.target = payload.target
+        # сброс отказа на draft (продавец может пересогласовать новым значением)
+        if existing.status == "rejected":
+            existing.status = "draft"
+            existing.approved_by = None
+            existing.approved_at = None
+        await session.commit()
+        return existing
+    plan = PlanTarget(
+        owner_id=payload.owner_id,
+        metric=payload.metric,
+        period_type=payload.period_type,
+        period_key=payload.period_key,
+        target=payload.target,
+        status="draft",
+    )
+    session.add(plan)
+    await session.commit()
+    return plan
+
+
+@router.post("/plans/{plan_id}/submit", response_model=PlanTargetOut)
+async def submit_plan(
+    plan_id: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Продавец отправляет ``draft`` план на согласование РОПу (через approvals)."""
+    plan = await session.get(PlanTarget, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="План не найден")
+    if plan.status != "draft":
+        raise HTTPException(status_code=409, detail=f"Нельзя отправить план в статусе {plan.status}")
+    plan.status = "pending_approval"
+    await core.services.approvals.request(
+        session,
+        kind="sales_plan",
+        entity_ref=f"plan:{plan.id}",
+        subject=f"План {plan.metric} {plan.period_type} {plan.period_key} = {float(plan.target)}",
+        requested_by=user.username,
+    )
+    await session.commit()
+    return plan
+
+
+@router.post("/plans/{plan_id}/decide", response_model=PlanTargetOut)
+async def decide_plan(
+    plan_id: int,
+    payload: PlanDecisionIn,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.approve")),
+):
+    """РОП согласует или отклоняет план: approve → approved, иначе → rejected.
+
+    Эмитит ``sales.plan.approved`` / ``sales.plan.rejected`` (actor=РОП → audit). Право
+    ``sales.deal.approve`` уже есть только у роли «РОП».
+    """
+    plan = await session.get(PlanTarget, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="План не найден")
+    if plan.status != "pending_approval":
+        raise HTTPException(
+            status_code=409,
+            detail=f"План в статусе {plan.status} — согласовать нельзя (нужен pending_approval)",
+        )
+    plan.status = "approved" if payload.approved else "rejected"
+    plan.approved_by = user.username
+    plan.approved_at = _utcnow()
+    core.event_bus.emit(
+        session,
+        "sales.plan.approved" if payload.approved else "sales.plan.rejected",
+        {
+            "plan_id": plan.id,
+            "owner_id": plan.owner_id,
+            "metric": plan.metric,
+            "period_type": plan.period_type,
+            "period_key": plan.period_key,
+            "target": float(plan.target),
+            "by": user.username,
+            "comment": payload.comment,
+            "actor": "РОП",
+            "entity_ref": f"plan:{plan.id}",
+        },
+    )
+    await session.commit()
+    return plan
 
 
 @router.get("/loss-reasons", response_model=list[LossReasonOut])

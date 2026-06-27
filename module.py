@@ -20,6 +20,7 @@ from modules.sales.calls import (
 from modules.sales.events import (
     on_campaign_launched,
     on_deal_created,
+    on_deal_won_handoff,
     on_incoming_message_ai,
     on_intake_lead,
     on_payment_paid,
@@ -40,6 +41,8 @@ class SalesModule(ModuleContract):
     def register(self, core: Core) -> None:
         core.include_router(routes.router, prefix=self.api_prefix)
         core.subscribe("sales.deal.created", on_deal_created)
+        # П10 ТЗ: won → handoff downstream (контракт для логистики/финансов/офиса).
+        core.subscribe("sales.deal.won", on_deal_won_handoff)
         # AI-агент модуля как обработчик событий (Итерация 1, §2.5)
         core.subscribe("sales.message.sent", on_incoming_message_ai)
         # обратные межмодульные связи, замыкающие циклы (§2.5)
