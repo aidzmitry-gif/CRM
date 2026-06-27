@@ -314,6 +314,37 @@ class AiTextOut(BaseModel):
     model: str
 
 
+class CallScriptOut(BaseModel):
+    """SALES-54: скрипт результативного звонка по стадии (со-пилот продавца).
+
+    Каркас (goal/target_action/talking_points/questions) детерминирован по стадии —
+    работает и без AI. ``ai_hint`` — доп. подсказка AI (None при выключенном AI-слое).
+    """
+
+    stage: str
+    goal: str
+    target_action: str
+    talking_points: list[str]
+    questions: list[str]
+    ai_hint: str | None = None
+    model: str  # "static" | имя модели | "mock"
+
+
+class ObjectionReplyIn(BaseModel):
+    """SALES-54: реплика-возражение клиента для подсказки ответа."""
+
+    objection: str
+
+
+class ObjectionReplyOut(BaseModel):
+    """SALES-54: категория возражения + ответ-подсказка (+ AI-подсказка при вкл. AI)."""
+
+    category: str  # price | stock | think | competitor | other
+    reply: str
+    ai_hint: str | None = None
+    model: str
+
+
 class LeadCreate(BaseModel):
     """Приём лида из канала (сайт/мессенджер/e-mail/телефония/тендер)."""
 

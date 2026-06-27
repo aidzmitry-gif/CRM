@@ -54,7 +54,7 @@ CRM-модуль: ведёт сделки по воронке (канбан-до
   - `sales.message.sent` (новое сообщение)
   - `sales.price.quoted` (зафиксирована котировка)
   - `sales.lead.received` / `sales.lead.qualified` / `sales.lead.routed`
-  - AI-события: `ai.lead.qualified`, `ai.draft.generated`, `ai.summary.generated`, `ai.next_step.generated`, `ai.draft.suggested` (с `actor: "AI"`, → audit)
+  - AI-события: `ai.lead.qualified`, `ai.draft.generated`, `ai.summary.generated`, `ai.next_step.generated`, `ai.draft.suggested`, `ai.call_script.generated`, `ai.objection.suggested` (с `actor: "AI"`, → audit)
 - **Подписан на** (subscribe):
   - своё: `sales.deal.created`, `sales.message.sent`
   - межмодульные: `marketing.campaign.launched`, `finance.payment.paid`, `logistics.shipment.delivered`
@@ -90,6 +90,7 @@ CRM-модуль: ведёт сделки по воронке (канбан-до
 - `GET /leads?status=`, `POST /leads`, `GET /leads/{id}` — приём лидов.
 - `POST /leads/{id}/qualify`, `/route`, `/convert` — квалификация → распределение → сделка.
 - `POST /deals/{id}/ai/draft-reply`, `/ai/assist` — AI (503 при выключенном feature-flag).
+- **SALES-54 (AI-скрипт звонка):** `POST /calls/{id}/ai/script` — скрипт по стадии сделки (цель/тезисы/вопросы); `POST /calls/{id}/ai/objection` — категория возражения + ответ-подсказка. Каркас **детерминирован** (плейбук `STAGE_PLAYBOOK`, классификатор `classify_objection` в `ai.py`) — работает БЕЗ AI (не 503); вкл. AI добавляет `ai_hint` + событие `ai.call_script.generated`/`ai.objection.suggested`.
 
 ## Межмодульные связи и зависимости
 - Реагирует на события: `marketing.campaign.launched` (создаёт лиды в приёме), `finance.payment.paid` (счёт → paid по `number == ref`), `logistics.shipment.delivered` (сделка → `won` по `deal_id`).

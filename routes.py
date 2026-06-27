@@ -18,7 +18,16 @@ from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
 from core.services.auth import CurrentUser, get_current_user, require_permission
-from modules.sales.ai import draft_reply, next_step, qualify_lead, summarize
+from modules.sales.ai import (
+    call_script_hint,
+    classify_objection,
+    draft_reply,
+    next_step,
+    objection_hint,
+    qualify_lead,
+    static_call_script,
+    summarize,
+)
 from modules.sales.leads import lead_priority, route_lead, score_lead
 from modules.sales.models import (
     Activity,
@@ -45,6 +54,7 @@ from modules.sales.schemas import (
     CallLinkDealIn,
     CallOut,
     CallResultIn,
+    CallScriptOut,
     ChatOut,
     ContactCreate,
     ContactOut,
@@ -71,6 +81,8 @@ from modules.sales.schemas import (
     LossReasonOut,
     MessageCreate,
     MessageOut,
+    ObjectionReplyIn,
+    ObjectionReplyOut,
     PackageSentOut,
     PriceInfo,
     PriceQuoteCreate,
@@ -1593,6 +1605,101 @@ async def ai_assist(
     )
     await session.commit()
     return AiTextOut(kind=kind, text=text, model=model)
+
+
+@router.post("/calls/{cid}/ai/script", response_model=CallScriptOut)
+async def call_ai_script(
+    cid: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """SALES-54: скрипт результативного звонка по стадии сделки (со-пилот продавца).
+
+    Каркас (цель/целевое действие/тезисы/вопросы) детерминирован по стадии — работает
+    и при ВЫКЛЮЧЕННОМ AI (не 503, продавцу всегда нужен скрипт). Включённый AI добавляет
+    контекстную подсказку ``ai_hint`` (событие ``ai.call_script.generated`` → audit).
+    Звонок не привязан к сделке → плейбук входа воронки.
+    """
+    from modules.sales.models import CallLog
+
+    call = await session.get(CallLog, cid)
+    if call is None:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    deal = await session.get(Deal, call.deal_id) if call.deal_id else None
+    stage = deal.stage if deal else None
+    play = static_call_script(stage)
+
+    llm = core.services.llm
+    ai_hint, model = None, "static"
+    if llm.enabled:
+        ai_hint = await call_script_hint(llm, deal, play)
+        model = llm.model or "mock"
+        core.event_bus.emit(
+            session,
+            "ai.call_script.generated",
+            {
+                "call_id": cid,
+                "deal_id": call.deal_id,
+                "stage": stage or "",
+                "model": model,
+                "actor": "AI",
+                "entity_ref": f"call:{cid}",
+            },
+        )
+        await session.commit()
+    return CallScriptOut(
+        stage=stage or "new",
+        goal=play["goal"],
+        target_action=play["target_action"],
+        talking_points=play["talking_points"],
+        questions=play["questions"],
+        ai_hint=ai_hint,
+        model=model,
+    )
+
+
+@router.post("/calls/{cid}/ai/objection", response_model=ObjectionReplyOut)
+async def call_ai_objection(
+    cid: int,
+    payload: ObjectionReplyIn,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """SALES-54: подсказка ответа на возражение клиента (со-пилот продавца).
+
+    Категория и базовый ответ — детерминированные (работают без AI); включённый AI
+    добавляет ``ai_hint`` (событие ``ai.objection.suggested`` → audit).
+    """
+    from modules.sales.models import CallLog
+
+    call = await session.get(CallLog, cid)
+    if call is None:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    if not payload.objection.strip():
+        raise HTTPException(status_code=422, detail="Пустое возражение")
+    category, reply = classify_objection(payload.objection)
+
+    llm = core.services.llm
+    ai_hint, model = None, "static"
+    if llm.enabled:
+        deal = await session.get(Deal, call.deal_id) if call.deal_id else None
+        ai_hint = await objection_hint(llm, payload.objection, deal)
+        model = llm.model or "mock"
+        core.event_bus.emit(
+            session,
+            "ai.objection.suggested",
+            {
+                "call_id": cid,
+                "category": category,
+                "model": model,
+                "actor": "AI",
+                "entity_ref": f"call:{cid}",
+            },
+        )
+        await session.commit()
+    return ObjectionReplyOut(category=category, reply=reply, ai_hint=ai_hint, model=model)
 
 
 # --- Окно входящего звонка (SALES-50): SSE-поток, журнал, действия --------------------
