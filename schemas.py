@@ -24,6 +24,7 @@ class DealCreate(BaseModel):
     starred: bool = False
     probability: int | None = None
     expected_close_date: str | None = None
+    funnel: str = "new_clients"
 
 
 class DealUpdate(BaseModel):
