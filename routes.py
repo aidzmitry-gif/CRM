@@ -129,6 +129,9 @@ from modules.sales.stages import (
 )
 
 router = APIRouter(tags=["sales"])
+# Лиды (вход воронки) — отдельный роутер. Монтируется и на /leads (фронт бьёт туда), и на
+# /sales/leads (back-compat). Полный вынос в modules/leads — Шаг 2 ТЗ принятия выноса лидов.
+leads_router = APIRouter(tags=["leads"])
 
 # Префикс номера и человекочитаемое название документа по типу.
 DOC_NUMBER_PREFIX = {"invoice": "СЧ", "contract": "ДГ", "order": "ЗК"}
@@ -2192,7 +2195,7 @@ async def _manager_loads(session: AsyncSession) -> dict[str, int]:
     return loads
 
 
-@router.get("/leads", response_model=list[LeadOut])
+@leads_router.get("", response_model=list[LeadOut])
 async def list_leads(status: str = "", session: AsyncSession = Depends(get_session)):
     """Приём лидов: входящие заявки воронки (новые — первыми; опц. фильтр по статусу)."""
     query = select(Lead).order_by(Lead.id.desc())
@@ -2201,7 +2204,7 @@ async def list_leads(status: str = "", session: AsyncSession = Depends(get_sessi
     return (await session.execute(query)).scalars().all()
 
 
-@router.post("/leads", response_model=LeadOut, status_code=201)
+@leads_router.post("", response_model=LeadOut, status_code=201)
 async def create_lead(
     payload: LeadCreate,
     core: Core = Depends(get_core),
@@ -2220,7 +2223,7 @@ async def create_lead(
     return lead
 
 
-@router.get("/leads/{lead_id}", response_model=LeadOut)
+@leads_router.get("/{lead_id}", response_model=LeadOut)
 async def get_lead(lead_id: int, session: AsyncSession = Depends(get_session)):
     """Один лид по id."""
     lead = await session.get(Lead, lead_id)
@@ -2229,7 +2232,7 @@ async def get_lead(lead_id: int, session: AsyncSession = Depends(get_session)):
     return lead
 
 
-@router.post("/leads/{lead_id}/qualify", response_model=LeadQualifyOut)
+@leads_router.post("/{lead_id}/qualify", response_model=LeadQualifyOut)
 async def qualify(
     lead_id: int,
     core: Core = Depends(get_core),
@@ -2281,7 +2284,7 @@ async def qualify(
     )
 
 
-@router.post("/leads/{lead_id}/route", response_model=LeadRouteOut)
+@leads_router.post("/{lead_id}/route", response_model=LeadRouteOut)
 async def route(
     lead_id: int,
     core: Core = Depends(get_core),
@@ -2315,7 +2318,7 @@ async def route(
     return LeadRouteOut(id=lead.id, status=lead.status, assigned_to=manager, funnel=funnel)
 
 
-@router.post("/leads/{lead_id}/convert", response_model=LeadConvertOut, status_code=201)
+@leads_router.post("/{lead_id}/convert", response_model=LeadConvertOut, status_code=201)
 async def convert_lead(
     lead_id: int,
     core: Core = Depends(get_core),

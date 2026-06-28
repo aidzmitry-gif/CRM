@@ -42,6 +42,10 @@ class SalesModule(ModuleContract):
 
     def register(self, core: Core) -> None:
         core.include_router(routes.router, prefix=self.api_prefix)
+        # Лиды: фронт бьёт в /leads (был 404 — отдавались на /sales/leads). Монтируем тот же
+        # роутер на /leads (фронт) и /sales/leads (back-compat). Полный вынос — Шаг 2 ТЗ.
+        core.include_router(routes.leads_router, prefix="/leads")
+        core.include_router(routes.leads_router, prefix="/sales/leads")
         core.subscribe("sales.deal.created", on_deal_created)
         # П10 ТЗ: won → handoff downstream (контракт для логистики/финансов/офиса).
         core.subscribe("sales.deal.won", on_deal_won_handoff)
