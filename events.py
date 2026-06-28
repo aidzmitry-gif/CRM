@@ -247,3 +247,100 @@ async def on_intake_lead(payload: dict, ctx) -> None:
         {"lead_id": lead.id, "source": lead.source, "entity_ref": f"lead:{lead.id}"},
     )
     logger.info("Sales: лид из «%s» принят в воронку (#%s)", src, lead.id)
+
+
+async def on_procurement_received(payload: dict, ctx) -> None:
+    """Поставка пришла (``procurement.received``) → сигнал продавцу на активных сделках с этим SKU.
+
+    Находит активные (нетерминальные) сделки, у которых в позициях есть пришедший SKU, и
+    эмитит ``sales.supply.arrived {deal_ids, sku_code, qty}`` (инфо, в audit). Стадию НЕ меняет.
+    SKU берём из ``sku_code`` или ``item``; нет SKU / нет активных сделок — тихий ранний выход
+    (S3-3, close-deferred: продюсер может появиться позже — подписка не падает на чужом payload).
+    """
+    if ctx is None:
+        return
+    sku_code = payload.get("sku_code") or payload.get("item")
+    if not sku_code:
+        return
+
+    from core.domain.models import Sku
+    from modules.sales.models import Deal, DealItem
+    from modules.sales.stages import TERMINAL_STAGES
+
+    sku = (
+        await ctx.session.execute(select(Sku).where(Sku.code == sku_code))
+    ).scalars().first()
+    if sku is None:
+        return
+    deal_ids = (
+        await ctx.session.execute(select(DealItem.deal_id).where(DealItem.sku_id == sku.id))
+    ).scalars().all()
+    if not deal_ids:
+        return
+    deals = (
+        await ctx.session.execute(
+            select(Deal).where(Deal.id.in_(set(deal_ids)), Deal.stage.notin_(TERMINAL_STAGES))
+        )
+    ).scalars().all()
+    active_ids = [d.id for d in deals]
+    if not active_ids:
+        return
+    ctx.services.event_bus.emit(
+        ctx.session,
+        "sales.supply.arrived",
+        {
+            "deal_ids": active_ids,
+            "sku_code": sku_code,
+            "qty": payload.get("qty"),
+            "warehouse": payload.get("warehouse"),
+            "actor": "sales",
+            "entity_ref": payload.get("entity_ref") or f"sku:{sku_code}",
+        },
+    )
+    logger.info(
+        "Sales: поставка SKU %s → сигнал на %d активн. сделок", sku_code, len(active_ids)
+    )
+
+
+async def on_plan_approved(payload: dict, ctx) -> None:
+    """Согласованный план РОП (``sales.plan.approved``) → мягкий upsert цели скорборда (S3-5).
+
+    Для метрики, совпадающей с ключом скорборда (``KpiTarget.key == metric``), пишем
+    ``target`` из плана; метрика вне скорборда — игнор (строк не плодим). Идемпотентно
+    (повторная установка того же значения — no-op). Так ``/sales/kpis`` берёт цель из
+    согласованных чисел, а не из сида.
+    """
+    if ctx is None:
+        return
+    metric = payload.get("metric")
+    target = payload.get("target")
+    if not metric or target is None:
+        return
+
+    from decimal import Decimal, InvalidOperation
+
+    from modules.sales.models import KpiTarget
+    from modules.sales.routes import PERIOD_MULT
+
+    # Кривой target (нечисловая строка, nan/inf) НЕ должен валить relay → poison-pill всей шины
+    # (relay не изолирует хендлеры try/except; падение не выставит processed_at → вечный реплей).
+    try:
+        value = Decimal(str(target))
+    except (InvalidOperation, ValueError):
+        return
+    if not value.is_finite():
+        return
+
+    kpi = (
+        await ctx.session.execute(select(KpiTarget).where(KpiTarget.key == metric))
+    ).scalars().first()
+    if kpi is None:
+        return  # метрика вне скорборда — не создаём строк
+    # KpiTarget.target — ДНЕВНОЙ seed: /kpis домножает на рабочие дни периода (PERIOD_MULT).
+    # План — ИТОГ за свой период, поэтому нормализуем в дневной (иначе план месяца раздуется ×22).
+    mult = PERIOD_MULT.get(payload.get("period_type", "day"), 1)
+    kpi.target = (value / Decimal(mult)).quantize(Decimal("0.01"))
+    logger.info(
+        "Sales: KpiTarget '%s' ← план РОП %s/%s = %s",
+        metric, payload.get("period_type"), payload.get("period_key"), target,
+    )

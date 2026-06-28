@@ -24,6 +24,8 @@ from modules.sales.events import (
     on_incoming_message_ai,
     on_intake_lead,
     on_payment_paid,
+    on_plan_approved,
+    on_procurement_received,
     on_shipment_delivered,
 )
 from modules.sales.permissions import PERMISSIONS, ROLES
@@ -50,6 +52,10 @@ class SalesModule(ModuleContract):
         core.subscribe("intake.lead.received", on_intake_lead)  # сайт/почта → приём лидов
         core.subscribe("finance.payment.paid", on_payment_paid)  # оплата → документ оплачен
         core.subscribe("logistics.shipment.delivered", on_shipment_delivered)  # доставка → won
+        # S3-3: поставка пришла → сигнал продавцу на сделках с этим SKU (sales.supply.arrived)
+        core.subscribe("procurement.received", on_procurement_received)
+        # S3-5: согласованный план РОП → цель скорборда (KpiTarget), не из сида
+        core.subscribe("sales.plan.approved", on_plan_approved)
         # телефония (SALES-50): события коннектора → журнал звонков + push карточки продавцу
         core.subscribe("telephony.call.incoming", on_incoming_call)
         core.subscribe("telephony.call.answered", on_call_answered)
