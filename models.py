@@ -52,6 +52,13 @@ class Deal(Base):
     funnel: Mapped[str] = mapped_column(
         String(32), default="new_clients", server_default="new_clients"
     )
+    # Крайняя дата отгрузки клиенту + штрафные санкции за опоздание (условие сделки). Дата уходит
+    # сигналом в закупки (``sales.deal.ship_deadline.set``). Дата — строка (как остальные даты
+    # сделки); штраф гибрид: ставка %/день просрочки + потолок % от суммы + свободное примечание.
+    ship_deadline: Mapped[str | None] = mapped_column(String(32))
+    penalty_rate_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 2))
+    penalty_cap_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 2))
+    penalty_terms: Mapped[str | None] = mapped_column(String(512))
 
 
 class KpiTarget(Base):

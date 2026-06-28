@@ -770,10 +770,58 @@ async def get_deal(deal_id: int, session: AsyncSession = Depends(get_session)):
     )
 
 
+async def _emit_ship_deadline(session: AsyncSession, core: Core, deal: Deal) -> None:
+    """Сигнал в закупки о крайней дате отгрузки сделки (``sales.deal.ship_deadline.set``).
+
+    Несёт дату + сводку штрафа за опоздание + позиции (sku/qty) — чтобы закупки видели риск
+    срыва и что закупать к сроку. Новое ребро sales→procurement (потребитель подключится позже).
+    """
+    items_rows = (
+        await session.execute(select(DealItem).where(DealItem.deal_id == deal.id))
+    ).scalars().all()
+    sku_ids = [r.sku_id for r in items_rows]
+    sku_map: dict[int, Sku] = {}
+    if sku_ids:
+        sku_map = {
+            s.id: s for s in (
+                await session.execute(select(Sku).where(Sku.id.in_(sku_ids)))
+            ).scalars().all()
+        }
+    items = [
+        {
+            "sku_code": sku_map[r.sku_id].code if r.sku_id in sku_map else "",
+            "title": sku_map[r.sku_id].title if r.sku_id in sku_map else "",
+            "qty": float(r.qty),
+        }
+        for r in items_rows
+    ]
+    core.event_bus.emit(
+        session,
+        "sales.deal.ship_deadline.set",
+        {
+            "deal_id": deal.id,
+            "number": deal.number,
+            "counterparty": deal.counterparty,
+            "ship_deadline": deal.ship_deadline,
+            "penalty_rate_pct": (
+                float(deal.penalty_rate_pct) if deal.penalty_rate_pct is not None else None
+            ),
+            "penalty_cap_pct": (
+                float(deal.penalty_cap_pct) if deal.penalty_cap_pct is not None else None
+            ),
+            "penalty_terms": deal.penalty_terms,
+            "items": items,
+            "actor": "sales",
+            "entity_ref": f"deal:{deal.id}",
+        },
+    )
+
+
 @router.patch("/deals/{deal_id}", response_model=DealRead)
 async def update_deal(
     deal_id: int,
     payload: DealUpdate,
+    core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
     user: CurrentUser = Depends(get_current_user),
 ):
@@ -798,7 +846,11 @@ async def update_deal(
         deal.next_step = f"Воронка: {from_stage} → {new_funnel}"
     if new_stage is not None and new_stage != deal.stage:
         record_stage(session, deal, new_stage, by=user.username)
+    old_deadline = deal.ship_deadline
     await repo.update(deal, data)
+    # Крайняя дата отгрузки выставлена/изменена → сигнал в закупки (ребро sales→procurement).
+    if "ship_deadline" in data and deal.ship_deadline and deal.ship_deadline != old_deadline:
+        await _emit_ship_deadline(session, core, deal)
     await session.commit()
     return deal
 
@@ -1447,6 +1499,8 @@ async def create_deal(
     try:
         deal = await DealRepository(session).create(payload)
         core.event_bus.emit(session, "sales.deal.created", {"number": deal.number, "title": deal.title})
+        if deal.ship_deadline:
+            await _emit_ship_deadline(session, core, deal)
         await session.commit()
     except IntegrityError:
         await session.rollback()

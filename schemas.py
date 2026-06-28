@@ -25,6 +25,12 @@ class DealCreate(BaseModel):
     probability: int | None = None
     expected_close_date: str | None = None
     funnel: str = "new_clients"
+    # Крайняя дата отгрузки + штрафные санкции за опоздание (дата уходит в закупки).
+    # Границы режут переполнение колонок БД (Numeric(6,2)/String) в 422 на валидации, а не в 500.
+    ship_deadline: str | None = Field(default=None, max_length=32)
+    penalty_rate_pct: float | None = Field(default=None, ge=0, le=9999.99)
+    penalty_cap_pct: float | None = Field(default=None, ge=0, le=9999.99)
+    penalty_terms: str | None = Field(default=None, max_length=512)
 
 
 class DealUpdate(BaseModel):
@@ -45,6 +51,12 @@ class DealUpdate(BaseModel):
     expected_close_date: str | None = None
     # Смена воронки (мульти-воронки): фиксируется в истории как смена стадии.
     funnel: str | None = None
+    # Крайняя дата отгрузки + штраф за опоздание; смена даты → сигнал в закупки.
+    # Границы (см. DealCreate) режут переполнение колонок БД в 422, а не в 500.
+    ship_deadline: str | None = Field(default=None, max_length=32)
+    penalty_rate_pct: float | None = Field(default=None, ge=0, le=9999.99)
+    penalty_cap_pct: float | None = Field(default=None, ge=0, le=9999.99)
+    penalty_terms: str | None = Field(default=None, max_length=512)
 
 
 class DealRead(BaseModel):
@@ -72,6 +84,11 @@ class DealRead(BaseModel):
     lost_reason_code: str | None = None
     lost_comment: str | None = None
     funnel: str = "new_clients"
+    # Крайняя дата отгрузки + штрафные санкции за опоздание.
+    ship_deadline: str | None = None
+    penalty_rate_pct: float | None = None
+    penalty_cap_pct: float | None = None
+    penalty_terms: str | None = None
 
 
 class StageBoard(BaseModel):
