@@ -834,6 +834,25 @@ async def update_deal(
     data = payload.model_dump(exclude_unset=True)
     new_stage = data.pop("stage", None)
     new_funnel = data.pop("funnel", None)
+    # R5-3: нельзя двинуть сделку в стадию ЧУЖОЙ воронки — иначе сделка выпадает с обеих досок
+    # (funnel=new_clients + stage=rp_won не существует ни в одной колонке). Валидируем против
+    # стадий целевой воронки (новой, если меняем; иначе текущей).
+    target_funnel = new_funnel if new_funnel is not None else deal.funnel
+    if new_stage is not None and new_stage != deal.stage:
+        valid_codes = {
+            r.code for r in (
+                await session.execute(
+                    select(Stage).where(Stage.funnel == target_funnel, Stage.is_active)
+                )
+            ).scalars().all()
+        }
+        if not valid_codes:  # таблица стадий не материализована → канон
+            valid_codes = {s["code"] for s in canonical_stages() if s["funnel"] == target_funnel}
+        if new_stage not in valid_codes:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Стадия {new_stage!r} не принадлежит воронке {target_funnel!r}",
+            )
     # Смена воронки фиксируется в истории как смена стадии (источник → стадия первой стадии
     # новой воронки), чтобы фронт-таймлайн не терял этот шаг; реальный новый стадия-код может
     # прилететь следующим PATCH (drag&drop на доске уже другой воронки).
@@ -1014,8 +1033,10 @@ async def deal_margin(
             lines=lines,
         )
     if priced == 0:
+        # R5-4: фасад есть, но ни одна позиция не оценена → маржа НЕИЗВЕСТНА (None), а не 0.
+        # 0 ≠ «неизвестно»: продавец не должен принять «нулевую маржу» вместо «нет данных».
         return DealMarginOut(
-            deal_id=deal_id, revenue=revenue, cogs_landed=0.0, gross_profit=0.0,
+            deal_id=deal_id, revenue=revenue, cogs_landed=None, gross_profit=None,
             margin_pct=None, priced_count=0, total_count=total,
             reason="Ни по одной позиции нет одновременно цены клиенту и landed cost",
             lines=lines,
@@ -1074,6 +1095,9 @@ async def pipeline_margin_forecast(
             gross_weighted = (gross_weighted or 0.0) + deal_gross * w
             deals_priced += 1
 
+    # R5-4: фасад есть, но ни одна активная сделка не оценена → вал.прибыль НЕИЗВЕСТНА (null), не 0.
+    if not facade_missing and deals_priced == 0:
+        gross_weighted = None
     margin_pct_blended: int | None = None
     if gross_weighted is not None and revenue_weighted > 0:
         margin_pct_blended = round(gross_weighted / revenue_weighted * 100)
