@@ -466,6 +466,45 @@ class DealMarginOut(BaseModel):
     lines: list[MarginLine] = []
 
 
+class MarginForecastOut(BaseModel):
+    """Взвешенный прогноз валовой маржи воронки (S3-1) — маржа из карточки на уровень воронки.
+
+    ``revenue_weighted`` — Σ(выручка по цене клиенту × вероятность стадии); НЕ зависит от
+    landed, всегда число. ``gross_weighted`` — Σ(вал.прибыль ``priced``-позиций × вероятность);
+    ``None`` при отсутствии фасада landed_cost (честная деградация, НЕ 0). ``margin_pct_blended``
+    — round(gross/revenue×100) или None. ``deals_priced``/``deals_total`` — покрытие маржой
+    (по скольким активным сделкам она вообще считается). ``reason`` — причина деградации.
+    """
+
+    funnel: str
+    owner: str | None = None
+    revenue_weighted: float
+    gross_weighted: float | None
+    margin_pct_blended: int | None
+    deals_priced: int
+    deals_total: int
+    reason: str | None = None
+
+
+class MarginReconcileOut(BaseModel):
+    """Сверка прогнозной маржи sales с фактической себестоимостью из аудита (S3-4, ось A).
+
+    Уровень — sku/агрегат сделки: событие ``procurement.landed_cost.calculated`` НЕ несёт
+    deal_id (PO обслуживает много сделок), поэтому сверяем по ``sku_code`` позиций.
+    ``sales_forecast_gross`` — наш расчёт (landed snapshot фасада); ``finance_actual_gross`` —
+    та же выручка минус landed из аудита событий шины; ``None`` если фактов нет.
+    ``delta`` = sales − finance. ``status``: ``converged`` (|delta|<0.01) / ``diverged`` /
+    ``no_finance`` (нет landed-событий по позициям) — никогда не 500.
+    """
+
+    deal_id: int
+    sales_forecast_gross: float | None
+    finance_actual_gross: float | None
+    delta: float | None
+    level: Literal["sku_aggregate"] = "sku_aggregate"
+    status: Literal["converged", "diverged", "no_finance"]
+
+
 class ActivityCreate(BaseModel):
     """Отметка факта активности (звонок, заявка, отгрузка)."""
 

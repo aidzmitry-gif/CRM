@@ -5,7 +5,7 @@ import os
 import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse
@@ -13,7 +13,14 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.domain.models import Approval, Contact, Counterparty, CounterpartyAlias, Sku
+from core.domain.models import (
+    Approval,
+    Contact,
+    Counterparty,
+    CounterpartyAlias,
+    OutboxEvent,
+    Sku,
+)
 from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
@@ -86,7 +93,9 @@ from modules.sales.schemas import (
     LeadRouteOut,
     LoseRequest,
     LossReasonOut,
+    MarginForecastOut,
     MarginLine,
+    MarginReconcileOut,
     MessageCreate,
     MessageOut,
     ObjectionReplyIn,
@@ -791,34 +800,24 @@ async def update_deal(
     return deal
 
 
-@router.get("/deals/{deal_id}/margin", response_model=DealMarginOut)
-async def deal_margin(
-    deal_id: int,
-    core: Core = Depends(get_core),
-    session: AsyncSession = Depends(get_session),
-    _: CurrentUser = Depends(require_permission("sales.deal.read")),
-):
-    """Факт-маржа сделки: цена из ``PriceQuote`` × qty минус landed × qty (по позициям).
+async def _deal_margin(
+    session: AsyncSession, core: Core, deal: Deal
+) -> tuple[list[MarginLine], bool]:
+    """Маржа позиций сделки: список ``MarginLine`` + признак отсутствия landed-фасада.
 
-    Цена — последняя котировка клиенту (``PriceQuote(sku_code, counterparty)``); себес —
-    через фасад ``core.services.landed_cost.last_landed_cost_batch`` (модуль procurement,
-    результат закрытой партии). Деградация honest: фасад ``None`` → ``cogs_landed=None`` +
-    причина; позиции без цены/себеса в gross НЕ попадают (``no_price``/``no_cost``).
-    Методику установки цены НЕ изобретаем — отдаём ФАКТ-маржу где данные уже есть.
+    Единый расчёт для карточки (``GET /deals/{id}/margin``) и прогноза воронки
+    (``GET /pipeline/margin-forecast``) — DRY, обе считают одинаково. Каждая строка несёт
+    цену клиенту (``revenue = price×qty`` при наличии котировки, НЕ зависит от landed) и
+    landed-себес (``cogs`` при возврате партии фасадом). Агрегаты считает вызывающий:
+    карточка — по ``priced``-позициям, прогноз — выручку по цене, прибыль по ``priced``.
+    Пустой список = у сделки нет позиций.
     """
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
-
     rows = (
-        await session.execute(select(DealItem).where(DealItem.deal_id == deal_id))
+        await session.execute(select(DealItem).where(DealItem.deal_id == deal.id))
     ).scalars().all()
+    facade_missing = getattr(core.services, "landed_cost", None) is None
     if not rows:
-        return DealMarginOut(
-            deal_id=deal_id, revenue=0.0, cogs_landed=0.0, gross_profit=0.0,
-            margin_pct=None, priced_count=0, total_count=0,
-            reason="Позиций нет — маржа не рассчитывается",
-        )
+        return [], facade_missing
 
     skus = {
         s.id: s for s in (
@@ -843,14 +842,10 @@ async def deal_margin(
     # Landed себестоимость через фасад ядра (None → procurement не подключён → честная деградация).
     landed_facade = getattr(core.services, "landed_cost", None)
     landed_map: dict[str, dict | None] = {}
-    facade_missing = landed_facade is None
     if not facade_missing and codes:
         landed_map = await landed_facade.last_landed_cost_batch(session, codes)
 
     lines: list[MarginLine] = []
-    revenue = 0.0
-    cogs = 0.0
-    priced = 0
     for r in rows:
         sku = skus.get(r.sku_id)
         code = sku.code if sku else ""
@@ -859,42 +854,114 @@ async def deal_margin(
         price = last_price.get(code)
         cost_row = landed_map.get(code) if not facade_missing else None
         unit_cost = float(cost_row["unit_landed_cost_byn"]) if cost_row else None
-
-        line = MarginLine(
-            sku_code=code, title=title, qty=qty,
-            unit_price=price,
-            revenue=price * qty if price is not None else None,
-            unit_landed_cost=unit_cost,
-            cogs=unit_cost * qty if unit_cost is not None else None,
-            margin_pct=(
-                round((price - unit_cost) / price * 100)
-                if price and unit_cost is not None and price > 0 else None
-            ),
-            status=(
-                "priced" if price is not None and unit_cost is not None
-                else ("no_cost" if price is not None else "no_price")
-            ),
-            cost_shipment_id=cost_row.get("shipment_id") if cost_row else None,
-            cost_fixed_at=cost_row.get("fixed_at") if cost_row else None,
-            cost_fx_rate=float(cost_row["fx_rate"]) if cost_row and cost_row.get("fx_rate") is not None else None,
+        lines.append(
+            MarginLine(
+                sku_code=code, title=title, qty=qty,
+                unit_price=price,
+                revenue=price * qty if price is not None else None,
+                unit_landed_cost=unit_cost,
+                cogs=unit_cost * qty if unit_cost is not None else None,
+                margin_pct=(
+                    round((price - unit_cost) / price * 100)
+                    if price and unit_cost is not None and price > 0 else None
+                ),
+                status=(
+                    "priced" if price is not None and unit_cost is not None
+                    else ("no_cost" if price is not None else "no_price")
+                ),
+                cost_shipment_id=cost_row.get("shipment_id") if cost_row else None,
+                cost_fixed_at=cost_row.get("fixed_at") if cost_row else None,
+                cost_fx_rate=(
+                    float(cost_row["fx_rate"])
+                    if cost_row and cost_row.get("fx_rate") is not None else None
+                ),
+            )
         )
-        lines.append(line)
-        if line.status == "priced":
-            revenue += line.revenue or 0.0
-            cogs += line.cogs or 0.0
-            priced += 1
+    return lines, facade_missing
+
+
+async def _audit_landed_unit_by_sku(
+    session: AsyncSession, codes: list[str]
+) -> dict[str, Decimal]:
+    """Актуальная landed-себестоимость по ``sku_code`` из аудита событий
+    ``procurement.landed_cost.calculated`` (через outbox/шину, БЕЗ импорта procurement/finance).
+
+    Берём ПОСЛЕДНЕЕ событие на sku_code (по ``id`` — позже зафиксированный ``actual`` бьёт
+    ранний ``estimated``). Возвращаем ``{sku_code: unit_landed_cost_byn}``; пусто = нет фактов.
+
+    ponytail: full-scan по event_type без БД-фильтра по sku и без LIMIT — приемлемо для dev/MVP;
+    при росте append-only outbox_event сузить (JSON-фильтр payload->>'sku_code' IN codes на PG /
+    последнее событие на sku через подзапрос). На event_type индекса пока нет.
+    """
+    if not codes:
+        return {}
+    codeset = set(codes)
+    events = (
+        await session.execute(
+            select(OutboxEvent)
+            .where(OutboxEvent.event_type == "procurement.landed_cost.calculated")
+            .order_by(OutboxEvent.id)
+        )
+    ).scalars().all()
+    out: dict[str, Decimal] = {}
+    for ev in events:  # id по возрастанию → последнее (actual) побеждает estimated
+        payload = ev.payload or {}
+        sku = payload.get("sku_code")
+        if sku not in codeset:
+            continue
+        val = payload.get("unit_landed_cost_byn")
+        if val is None:
+            continue
+        try:
+            out[sku] = Decimal(str(val))
+        except (InvalidOperation, ValueError):
+            continue
+    return out
+
+
+@router.get("/deals/{deal_id}/margin", response_model=DealMarginOut)
+async def deal_margin(
+    deal_id: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Факт-маржа сделки: цена из ``PriceQuote`` × qty минус landed × qty (по позициям).
+
+    Цена — последняя котировка клиенту (``PriceQuote(sku_code, counterparty)``); себес —
+    через фасад ``core.services.landed_cost.last_landed_cost_batch`` (модуль procurement,
+    результат закрытой партии). Деградация honest: фасад ``None`` → ``cogs_landed=None`` +
+    причина; позиции без цены/себеса в gross НЕ попадают (``no_price``/``no_cost``).
+    Методику установки цены НЕ изобретаем — отдаём ФАКТ-маржу где данные уже есть.
+    """
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+
+    lines, facade_missing = await _deal_margin(session, core, deal)
+    if not lines:
+        return DealMarginOut(
+            deal_id=deal_id, revenue=0.0, cogs_landed=0.0, gross_profit=0.0,
+            margin_pct=None, priced_count=0, total_count=0,
+            reason="Позиций нет — маржа не рассчитывается",
+        )
+
+    revenue = sum((ln.revenue or 0.0) for ln in lines if ln.status == "priced")
+    cogs = sum((ln.cogs or 0.0) for ln in lines if ln.status == "priced")
+    priced = sum(1 for ln in lines if ln.status == "priced")
+    total = len(lines)
 
     if facade_missing:
-        reason = "Себестоимость закупок не подключена (procurement не реализовал фасад landed_cost)"
         return DealMarginOut(
             deal_id=deal_id, revenue=revenue, cogs_landed=None, gross_profit=None,
-            margin_pct=None, priced_count=priced, total_count=len(rows),
-            reason=reason, lines=lines,
+            margin_pct=None, priced_count=priced, total_count=total,
+            reason="Себестоимость закупок не подключена (procurement не реализовал фасад landed_cost)",
+            lines=lines,
         )
     if priced == 0:
         return DealMarginOut(
             deal_id=deal_id, revenue=revenue, cogs_landed=0.0, gross_profit=0.0,
-            margin_pct=None, priced_count=0, total_count=len(rows),
+            margin_pct=None, priced_count=0, total_count=total,
             reason="Ни по одной позиции нет одновременно цены клиенту и landed cost",
             lines=lines,
         )
@@ -902,7 +969,138 @@ async def deal_margin(
     margin_pct = round(gross / revenue * 100) if revenue > 0 else None
     return DealMarginOut(
         deal_id=deal_id, revenue=revenue, cogs_landed=cogs, gross_profit=gross,
-        margin_pct=margin_pct, priced_count=priced, total_count=len(rows), lines=lines,
+        margin_pct=margin_pct, priced_count=priced, total_count=total, lines=lines,
+    )
+
+
+@router.get("/pipeline/margin-forecast", response_model=MarginForecastOut)
+async def pipeline_margin_forecast(
+    funnel: str = DEFAULT_FUNNEL,
+    owner: str = "",
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Взвешенный прогноз ВАЛОВОЙ МАРЖИ воронки (S3-1) — маржа из карточки на уровень воронки.
+
+    По активным (нетерминальным) сделкам считаем factual-маржу тем же путём, что
+    ``/deals/{id}/margin`` (общий хелпер ``_deal_margin``), и взвешиваем на вероятность стадии:
+    ``revenue_weighted`` — по позициям с ценой клиенту (не зависит от landed, всегда число),
+    ``gross_weighted`` — по ``priced``-позициям (есть и цена, и landed). Нет фасада landed_cost
+    → ``gross_weighted=null`` + причина (честная деградация, НЕ 0), выручка остаётся числом.
+
+    ponytail: O(сделок) вызовов фасада (по сделке) — допустимо для десятков активных сделок;
+    батч-расчёт по всей воронке за один проход — если вырастет.
+    """
+    stage_rows = await _board_stages(session, funnel)
+    prob_by_stage = {s["id"]: s["probability"] for s in stage_rows}
+
+    deals = await DealRepository(session).list()
+    deals = [
+        d for d in deals
+        if d.funnel == funnel and d.stage not in TERMINAL_STAGES and d.stage != "cond_lost"
+    ]
+    if owner:
+        deals = [d for d in deals if d.owner == owner]
+
+    facade_missing = getattr(core.services, "landed_cost", None) is None
+    revenue_weighted = 0.0
+    gross_weighted: float | None = None if facade_missing else 0.0
+    deals_priced = 0
+    for d in deals:
+        lines, _fm = await _deal_margin(session, core, d)
+        prob = d.probability if d.probability is not None else prob_by_stage.get(d.stage, 0)
+        w = prob / 100
+        revenue_weighted += sum((ln.revenue or 0.0) for ln in lines if ln.revenue is not None) * w
+        if not facade_missing and any(ln.status == "priced" for ln in lines):
+            deal_gross = sum(
+                (ln.revenue or 0.0) - (ln.cogs or 0.0) for ln in lines if ln.status == "priced"
+            )
+            gross_weighted = (gross_weighted or 0.0) + deal_gross * w
+            deals_priced += 1
+
+    margin_pct_blended: int | None = None
+    if gross_weighted is not None and revenue_weighted > 0:
+        margin_pct_blended = round(gross_weighted / revenue_weighted * 100)
+
+    reason: str | None = None
+    if facade_missing:
+        reason = "Себестоимость закупок не подключена (procurement не реализовал фасад landed_cost)"
+    elif deals_priced == 0:
+        reason = "Ни по одной активной сделке нет одновременно цены клиенту и landed cost"
+
+    return MarginForecastOut(
+        funnel=funnel,
+        owner=owner or None,
+        revenue_weighted=round(revenue_weighted, 2),
+        gross_weighted=round(gross_weighted, 2) if gross_weighted is not None else None,
+        margin_pct_blended=margin_pct_blended,
+        deals_priced=deals_priced,
+        deals_total=len(deals),
+        reason=reason,
+    )
+
+
+@router.get("/deals/{deal_id}/margin/reconcile", response_model=MarginReconcileOut)
+async def deal_margin_reconcile(
+    deal_id: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Сверка прогнозной маржи sales с фактической себестоимостью из аудита шины (S3-4, ось A).
+
+    Уровень — sku/агрегат сделки: ``procurement.landed_cost.calculated`` НЕ несёт deal_id
+    (PO обслуживает много сделок), поэтому сверяем по ``sku_code`` позиций. ``sales_forecast_gross``
+    — наш расчёт (landed snapshot фасада, как карточка); ``finance_actual_gross`` — та же выручка
+    минус landed из аудита событий (БЕЗ импорта finance/procurement). Нет landed-событий по
+    позициям → ``no_finance`` (никогда не 500). ``delta`` = sales − finance.
+    """
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+
+    lines, facade_missing = await _deal_margin(session, core, deal)
+    priced_lines = [ln for ln in lines if ln.status == "priced"]
+    sales_forecast_gross: float | None = None
+    if not facade_missing and priced_lines:
+        sales_forecast_gross = round(
+            sum((ln.revenue or 0.0) - (ln.cogs or 0.0) for ln in priced_lines), 2
+        )
+
+    # Факт себестоимости из аудита шины по тем же sku (агрегат, не по сделке).
+    audit_unit = await _audit_landed_unit_by_sku(
+        session, sorted({ln.sku_code for ln in priced_lines if ln.sku_code})
+    )
+    finance_actual_gross: float | None = None
+    if audit_unit:
+        total = 0.0
+        matched = False
+        for ln in priced_lines:
+            unit_actual = audit_unit.get(ln.sku_code)
+            if unit_actual is not None and ln.unit_price is not None:
+                matched = True
+                total += (ln.unit_price - float(unit_actual)) * ln.qty
+        if matched:
+            finance_actual_gross = round(total, 2)
+
+    delta: float | None = None
+    if sales_forecast_gross is not None and finance_actual_gross is not None:
+        delta = round(sales_forecast_gross - finance_actual_gross, 2)
+    if finance_actual_gross is None:
+        status = "no_finance"
+    elif delta is None:
+        status = "diverged"  # факт есть, но sales-сторона недоступна (нет фасада/priced)
+    else:
+        status = "converged" if abs(delta) < 0.01 else "diverged"
+
+    return MarginReconcileOut(
+        deal_id=deal_id,
+        sales_forecast_gross=sales_forecast_gross,
+        finance_actual_gross=finance_actual_gross,
+        delta=delta,
+        level="sku_aggregate",
+        status=status,
     )
 
 
