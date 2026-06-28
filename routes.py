@@ -469,15 +469,27 @@ async def list_funnels(
 ):
     """Воронки sales: код + титул + сколько активных сделок. Имена — из ``FUNNELS``
     (справочник в коде), порядок — как там; неизвестные коды (созданы через редактор
-    стадий, но не описаны в справочнике) добавляются в конец с code как title."""
+    стадий, но не описаны в справочнике) добавляются в конец с code как title.
+
+    Graceful fallback: если колонки ``Deal.funnel``/``Stage.funnel`` нет (старая dev.db
+    создана до миграции 0062), считаем все сделки относящимися к дефолтной воронке
+    и возвращаем только ``FUNNELS``-справочник — без падения 500 и без ремонта схемы.
+    """
+    from sqlalchemy.exc import OperationalError, ProgrammingError
+
     # код → активных сделок (исключаем терминальные стадии)
-    stage_counts = (
-        await session.execute(
-            select(Deal.funnel, func.count())
-            .where(Deal.stage.notin_(TERMINAL_STAGES))
-            .group_by(Deal.funnel)
-        )
-    ).all()
+    try:
+        stage_counts = (
+            await session.execute(
+                select(Deal.funnel, func.count())
+                .where(Deal.stage.notin_(TERMINAL_STAGES))
+                .group_by(Deal.funnel)
+            )
+        ).all()
+    except (OperationalError, ProgrammingError):
+        # старый dev.db без колонки funnel — отдаём только справочник, без счётчиков
+        await session.rollback()
+        return [FunnelOut(code=f["code"], title=f["title"], active_deals=0) for f in FUNNELS]
     counts = {code: n for code, n in stage_counts}
     seen: set[str] = set()
     rows: list[FunnelOut] = []
@@ -485,9 +497,13 @@ async def list_funnels(
         rows.append(FunnelOut(code=f["code"], title=f["title"], active_deals=counts.get(f["code"], 0)))
         seen.add(f["code"])
     # Воронки из таблицы stage, не описанные в FUNNELS — показываем как есть.
-    extras = (
-        await session.execute(select(Stage.funnel).distinct())
-    ).scalars().all()
+    try:
+        extras = (
+            await session.execute(select(Stage.funnel).distinct())
+        ).scalars().all()
+    except (OperationalError, ProgrammingError):
+        await session.rollback()
+        extras = []
     for code in extras:
         if code not in seen:
             rows.append(FunnelOut(code=code, title=code, active_deals=counts.get(code, 0)))
@@ -1374,11 +1390,22 @@ async def add_contact(
 
 @router.get("/chats", response_model=list[ChatOut])
 async def list_chats(session: AsyncSession = Depends(get_session)):
-    """Диалоги для панели «Чаты и дела»: сделки с последним сообщением переписки."""
-    msgs = (
-        await session.execute(select(Message).order_by(Message.id.desc()).limit(100))
-    ).scalars().all()
-    deals = {d.id: d for d in (await session.execute(select(Deal))).scalars().all()}
+    """Диалоги для панели «Чаты и дела»: сделки с последним сообщением переписки.
+
+    Graceful fallback: при ``OperationalError`` (колонка/таблица отсутствует — старый
+    dev.db до миграции 0062) возвращаем ``[]`` — фронт честно покажет «нет диалогов»
+    вместо 500.
+    """
+    from sqlalchemy.exc import OperationalError, ProgrammingError
+
+    try:
+        msgs = (
+            await session.execute(select(Message).order_by(Message.id.desc()).limit(100))
+        ).scalars().all()
+        deals = {d.id: d for d in (await session.execute(select(Deal))).scalars().all()}
+    except (OperationalError, ProgrammingError):
+        await session.rollback()
+        return []
     # SALES-49: непрочитанные входящие по сделкам (для бейджа в панели чатов)
     unread_map = {
         deal_id: int(n)
