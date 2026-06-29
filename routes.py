@@ -2835,8 +2835,8 @@ async def rop_plan_fact(
     rows = (await session.execute(
         select(Deal.owner, func.count(Deal.id), func.sum(Deal.amount))
         .where(Deal.stage == "won")
-        .where(func.date(Deal.updated_at) >= first_day)
-        .where(func.date(Deal.updated_at) <= last_day)
+        .where(func.date(Deal.stage_changed_at) >= first_day)
+        .where(func.date(Deal.stage_changed_at) <= last_day)
         .group_by(Deal.owner)
     )).all()
 
