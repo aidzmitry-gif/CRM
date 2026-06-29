@@ -2806,3 +2806,57 @@ async def telephony_incoming(
     await handler(data, EventContext(session=session, services=core.services))
     await session.commit()
     return {"ok": True, "event_type": event_type, "call_id": payload.call_id}
+
+
+# ── ROP план/факт менеджеров ───────────────────────────────────────────────
+@router.get("/rop/plan-fact", tags=["sales"])
+async def rop_plan_fact(
+    period: str = "",
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Plan/Fact по менеджерам за месяц (YYYY-MM). Demo-план, если KpiTarget пуст."""
+    import calendar
+
+    from modules.sales.models import Deal, KpiTarget
+
+    if not period:
+        today = date.today()
+        period = today.strftime("%Y-%m")
+
+    try:
+        year, month = int(period[:4]), int(period[5:7])
+    except (ValueError, IndexError):
+        raise HTTPException(status_code=400, detail="period must be YYYY-MM")
+
+    first_day = date(year, month, 1)
+    last_day = date(year, month, calendar.monthrange(year, month)[1])
+
+    rows = (await session.execute(
+        select(Deal.owner, func.count(Deal.id), func.sum(Deal.amount))
+        .where(Deal.stage == "won")
+        .where(func.date(Deal.updated_at) >= first_day)
+        .where(func.date(Deal.updated_at) <= last_day)
+        .group_by(Deal.owner)
+    )).all()
+
+    # Попробуем взять планы из KpiTarget (поле revenue_plan на менеджера)
+    targets_row = (await session.execute(
+        select(KpiTarget).where(KpiTarget.key == "plan_revenue_per_manager")
+    )).scalars().first()
+    plan_revenue_default = float(targets_row.target) if targets_row else 5000000.0
+    plan_deals_default = 5
+
+    managers = [
+        {
+            "name": owner or "Менеджер",
+            "plan_deals": plan_deals_default,
+            "fact_deals": int(cnt),
+            "plan_revenue": plan_revenue_default,
+            "fact_revenue": float(total or 0),
+            "conversion_pct": round(int(cnt) / plan_deals_default * 100, 1),
+        }
+        for owner, cnt, total in rows
+    ]
+
+    return {"period": period, "managers": managers, "demo_plans": targets_row is None}
