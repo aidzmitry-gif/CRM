@@ -238,13 +238,25 @@ async def on_intake_lead(payload: dict, ctx) -> None:
         product=payload.get("product", "") or "",
         message=payload.get("message", "") or "",
         status="new",
+        utm_source=str(payload.get("utm_source") or payload.get("utmSource") or ""),
+        utm_medium=str(payload.get("utm_medium") or payload.get("utmMedium") or ""),
+        utm_campaign=str(payload.get("utm_campaign") or payload.get("utmCampaign") or ""),
+        landing_url=str(payload.get("landing_url") or payload.get("landingUrl") or ""),
     )
     ctx.session.add(lead)
     await ctx.session.flush()
     ctx.services.event_bus.emit(
         ctx.session,
         "sales.lead.received",
-        {"lead_id": lead.id, "source": lead.source, "entity_ref": f"lead:{lead.id}"},
+        {
+            "lead_id": lead.id,
+            "source": lead.source,
+            "entity_ref": f"lead:{lead.id}",
+            "utm_source": lead.utm_source,
+            "utm_medium": lead.utm_medium,
+            "utm_campaign": lead.utm_campaign,
+            "landing_url": lead.landing_url,
+        },
     )
     logger.info("Sales: лид из «%s» принят в воронку (#%s)", src, lead.id)
 

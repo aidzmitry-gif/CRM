@@ -230,6 +230,10 @@ class Lead(Base):
     assigned_to: Mapped[str] = mapped_column(String(128), default="", server_default="")
     funnel: Mapped[str] = mapped_column(String(16), default="", server_default="")
     deal_id: Mapped[int | None] = mapped_column()
+    utm_source: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    utm_medium: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    utm_campaign: Mapped[str] = mapped_column(String(255), default="", server_default="")
+    landing_url: Mapped[str] = mapped_column(String(512), default="", server_default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
