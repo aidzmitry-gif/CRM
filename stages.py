@@ -50,6 +50,7 @@ DEFAULT_FUNNEL = "new_clients"
 FUNNELS: list[dict] = [
     {"code": "new_clients", "title": "Новые клиенты"},
     {"code": "repeat_clients", "title": "Постоянные клиенты"},
+    {"code": "tenders", "title": "Тендеры"},
 ]
 
 # Канон «Постоянные клиенты»: укороченная воронка (перезаказ, цена уже известна) +
@@ -63,12 +64,22 @@ REPEAT_STAGES: list[tuple[str, str, int, str, str]] = [
     ("rp_lost", "Отказ", 0, "lost", "#EF4444"),
 ]
 
+# Канон «Тендеры»: воронка госзакупок/конкурсов (цвета — sales-board-mockup.html, ~1899-1910).
+TENDER_STAGES: list[tuple[str, str, int, str, str]] = [
+    # (code, title, probability, kind, color)
+    ("tn_announced", "Объявлен", 15, "normal", "#3B82F6"),
+    ("tn_submitted", "Заявка подана", 35, "normal", "#F59E0B"),
+    ("tn_bidding", "Торги", 60, "normal", "#14B8A6"),
+    ("tn_won", "Выигран", 100, "won", "#22C55E"),
+    ("tn_lost", "Проигран", 0, "lost", "#EF4444"),
+]
+
 
 def canonical_stages() -> list[dict]:
     """Канон всех воронок как полные строки — сид таблицы ``sales.stage``, фолбэк редактора.
 
-    Возвращает воронку «Новые клиенты» (11 стадий) + «Постоянные клиенты» (5 стадий).
-    ``sort_order`` уникален в пределах воронки (порядок колонок доски).
+    Возвращает воронку «Новые клиенты» (11 стадий) + «Постоянные клиенты» (5 стадий) +
+    «Тендеры» (5 стадий). ``sort_order`` уникален в пределах воронки (порядок колонок доски).
     """
     rows: list[dict] = [
         {
@@ -95,5 +106,18 @@ def canonical_stages() -> list[dict]:
             "funnel": "repeat_clients",
         }
         for i, (code, title, prob, kind, color) in enumerate(REPEAT_STAGES)
+    ]
+    rows += [
+        {
+            "code": code,
+            "title": title,
+            "sort_order": i,
+            "probability": prob,
+            "kind": kind,
+            "color": color,
+            "is_active": True,
+            "funnel": "tenders",
+        }
+        for i, (code, title, prob, kind, color) in enumerate(TENDER_STAGES)
     ]
     return rows
