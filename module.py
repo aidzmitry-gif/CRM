@@ -18,11 +18,10 @@ from modules.sales.calls import (
     on_incoming_call,
 )
 from modules.sales.events import (
-    on_campaign_launched,
     on_deal_created,
     on_deal_won_handoff,
     on_incoming_message_ai,
-    on_intake_lead,
+    on_lead_converted,
     on_payment_paid,
     on_plan_approved,
     on_procurement_received,
@@ -52,8 +51,7 @@ class SalesModule(ModuleContract):
         # AI-агент модуля как обработчик событий (Итерация 1, §2.5)
         core.subscribe("sales.message.sent", on_incoming_message_ai)
         # обратные межмодульные связи, замыкающие циклы (§2.5)
-        core.subscribe("marketing.campaign.launched", on_campaign_launched)  # лиды → воронка
-        core.subscribe("intake.lead.received", on_intake_lead)  # сайт/почта → приём лидов
+        core.subscribe("leads.lead.converted", on_lead_converted)  # лид → сделка (репо лидов)
         core.subscribe("finance.payment.paid", on_payment_paid)  # оплата → документ оплачен
         core.subscribe("logistics.shipment.delivered", on_shipment_delivered)  # доставка → won
         # S3-3: поставка пришла → сигнал продавцу на сделках с этим SKU (sales.supply.arrived)
