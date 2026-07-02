@@ -1,6 +1,7 @@
 """HTTP-API модуля Sales. Монтируется ядром под префиксом ``/sales``."""
 from __future__ import annotations
 
+import calendar
 import os
 import re
 from collections import defaultdict
@@ -632,29 +633,55 @@ async def delete_stage(
     await session.commit()
 
 
+MONTH_PERIOD_RE = re.compile(r"^(\d{4})-(\d{2})$")
+
+
 @router.get("/kpis", response_model=list[KpiOut])
 async def kpis(period: str = "day", session: AsyncSession = Depends(get_session)):
     """Показатели «План/Факт» за период (день/неделя/месяц/квартал/год, sales-34).
 
     Факт — сумма активностей за окно периода (от последней даты назад); план —
-    дневная цель, масштабированная на число рабочих дней периода.
+    дневная цель, масштабированная на число рабочих дней периода. Период также
+    принимает конкретный месяц вида ``"YYYY-MM"`` (напр. ``"2026-05"``) — тогда
+    окно факта фиксировано на этот календарный месяц (а не «от последней даты
+    назад»), а план масштабируется на число рабочих дней (пн-пт) этого месяца.
     """
     targets = (
         await session.execute(select(KpiTarget).order_by(KpiTarget.sort_order))
     ).scalars().all()
 
-    latest = (await session.execute(select(func.max(Activity.date)))).scalar()
+    month_match = MONTH_PERIOD_RE.match(period)
+    if month_match and not (1 <= int(month_match.group(2)) <= 12):
+        month_match = None  # "2026-13" и т.п. — не месяц, честный фоллбэк ниже
+
     actuals: dict[str, float] = {}
-    if latest is not None:
-        start = latest - timedelta(days=PERIOD_DAYS.get(period, 1) - 1)
+    if month_match:
+        year, month = int(month_match.group(1)), int(month_match.group(2))
+        _, days_in_month = calendar.monthrange(year, month)
+        start = date(year, month, 1)
+        end = date(year, month, days_in_month)
         rows = await session.execute(
             select(Activity.kpi_key, func.coalesce(func.sum(Activity.value), 0))
-            .where(Activity.date >= start, Activity.date <= latest)
+            .where(Activity.date >= start, Activity.date <= end)
             .group_by(Activity.kpi_key)
         )
         actuals = {key: float(total) for key, total in rows.all()}
-
-    mult = PERIOD_MULT.get(period, 1)
+        mult = sum(
+            1
+            for day in range(1, days_in_month + 1)
+            if date(year, month, day).weekday() < 5
+        )
+    else:
+        latest = (await session.execute(select(func.max(Activity.date)))).scalar()
+        if latest is not None:
+            start = latest - timedelta(days=PERIOD_DAYS.get(period, 1) - 1)
+            rows = await session.execute(
+                select(Activity.kpi_key, func.coalesce(func.sum(Activity.value), 0))
+                .where(Activity.date >= start, Activity.date <= latest)
+                .group_by(Activity.kpi_key)
+            )
+            actuals = {key: float(total) for key, total in rows.all()}
+        mult = PERIOD_MULT.get(period, 1)
     result: list[KpiOut] = []
     for t in targets:
         actual = actuals.get(t.key, 0.0)
