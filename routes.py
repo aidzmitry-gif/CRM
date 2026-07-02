@@ -1626,6 +1626,33 @@ async def list_deal_items(deal_id: int, session: AsyncSession = Depends(get_sess
     return [await _build_item_out(session, r, counterparty) for r in rows]
 
 
+@router.get("/deals/{deal_id}/repeat-last-order", response_model=list[DealItemOut])
+async def repeat_last_order(deal_id: int, session: AsyncSession = Depends(get_session)):
+    """Позиции из последней ДРУГОЙ сделки того же контрагента (повтор заказа).
+
+    Пусто, если сделка не найдена или предыдущих сделок этого контрагента с позициями нет.
+    """
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    prior_deals = (
+        await session.execute(
+            select(Deal)
+            .where(Deal.counterparty == deal.counterparty, Deal.id != deal_id)
+            .order_by(Deal.created_at.desc(), Deal.id.desc())
+        )
+    ).scalars().all()
+    for prior in prior_deals:
+        rows = (
+            await session.execute(
+                select(DealItem).where(DealItem.deal_id == prior.id).order_by(DealItem.id)
+            )
+        ).scalars().all()
+        if rows:
+            return [await _build_item_out(session, r, deal.counterparty) for r in rows]
+    return []
+
+
 @router.post("/deals/{deal_id}/items", response_model=DealItemOut, status_code=201)
 async def add_deal_item(
     deal_id: int,
