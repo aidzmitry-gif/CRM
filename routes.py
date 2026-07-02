@@ -6,7 +6,7 @@ import os
 import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse
@@ -26,6 +26,7 @@ from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
 from core.services.auth import CurrentUser, get_current_user, require_permission
+from modules.sales._money_words import money_words
 from modules.sales.ai import (
     call_script_hint,
     classify_objection,
@@ -1993,6 +1994,164 @@ def _render_contract(body: str, ctx: dict[str, str]) -> str:
     return _PLACEHOLDER.sub(lambda m: ctx.get(m.group(1), ""), body)
 
 
+# ──────────────────────── Счёт по шаблону (печатная форма sales-invoice-template.html) ────────────────────────
+
+_INVOICE_VAT_RATE = Decimal("20")  # % — как в шаблоне (vatRate=20)
+
+
+async def _invoice_items(session: AsyncSession, deal_id: int) -> list[dict]:
+    """Позиции счёта: наименование/кол-во/ед.изм. из сделки + цена — последняя котировка клиента.
+
+    Цена берётся по последней ``PriceQuote`` для пары (sku.code, deal.counterparty);
+    нет котировки — честный ноль (счёт без цены на позицию — сигнал менеджеру, не падение).
+    """
+    deal = await DealRepository(session).get(deal_id)
+    counterparty = deal.counterparty if deal else ""
+    rows = (
+        await session.execute(
+            select(DealItem, Sku)
+            .join(Sku, Sku.id == DealItem.sku_id, isouter=True)
+            .where(DealItem.deal_id == deal_id)
+            .order_by(DealItem.id)
+        )
+    ).all()
+    items = []
+    for item, sku in rows:
+        name = sku.title if sku else f"позиция #{item.sku_id}"
+        unit = sku.unit if sku else "шт"
+        price = Decimal("0")
+        if sku is not None:
+            quote = (
+                await session.execute(
+                    select(PriceQuote)
+                    .where(PriceQuote.sku_code == sku.code, PriceQuote.counterparty == counterparty)
+                    .order_by(PriceQuote.created_at.desc(), PriceQuote.id.desc())
+                )
+            ).scalars().first()
+            if quote is not None:
+                price = quote.price
+        items.append({"name": name, "qty": item.qty, "unit": unit, "price": price})
+    return items
+
+
+def _money(n: Decimal) -> str:
+    return f"{n:,.2f}".replace(",", " ")
+
+
+def _req_line(p: dict) -> str:
+    """Строка реквизитов «Наименование, УНП …, адрес, тел., р/с … в банке … БИК …» (честный минимум при пропусках)."""
+    parts = [f"<b>{p.get('name', '')}</b>"]
+    if p.get("unp"):
+        parts.append(f"УНП {p['unp']}")
+    if p.get("address"):
+        parts.append(str(p["address"]))
+    if p.get("phone"):
+        parts.append(f"тел.: {p['phone']}")
+    if p.get("account"):
+        bank = f" в банке {p['bank']}" if p.get("bank") else ""
+        bik = f" БИК {p['bik']}" if p.get("bik") else ""
+        parts.append(f"р/с {p['account']}{bank}{bik}")
+    return ", ".join(parts)
+
+
+def _render_invoice(
+    doc: DealDocument, deal: Deal | None, seller: dict, buyer: dict, items: list[dict]
+) -> str:
+    """Печатная форма «Счёт-протокол на оплату» — вёрстка 1:1 с sales-invoice-template.html."""
+    date_str = doc.created_at.strftime("%d.%m.%Y") if doc.created_at else ""
+    rows_html, grand, vat_sum = [], Decimal("0"), Decimal("0")
+    for i, it in enumerate(items, start=1):
+        qty, price = Decimal(it["qty"]), Decimal(it["price"])
+        net = (qty * price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        vat = (net * _INVOICE_VAT_RATE / 100).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        total = (net + vat).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        grand += total
+        vat_sum += vat
+        rows_html.append(
+            "<tr>"
+            f'<td class="c">{i}</td><td>{it["name"]}</td><td class="c">{qty}</td>'
+            f'<td class="c">{it["unit"]}</td><td class="r">{_money(price)}</td><td class="r">{_money(net)}</td>'
+            f'<td class="c">{_INVOICE_VAT_RATE}%</td><td class="r">{_money(vat)}</td><td class="r">{_money(total)}</td>'
+            "</tr>"
+        )
+    valid_days = int(os.getenv("AIOS_INVOICE_VALID_DAYS", "5"))
+    order_no = deal.number if deal else ""
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Счёт-протокол на оплату № {doc.number}</title>
+<style>
+  :root{{--ink:#0f172a;--muted:#475569;--line:#0f172a;--soft:#64748b;--paper:#fff;--font:"Arial","Segoe UI",system-ui,sans-serif;}}
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:var(--font);background:#fff;color:var(--ink);font-size:13px;line-height:1.35}}
+  .sheet{{background:var(--paper);max-width:820px;margin:0 auto;padding:34px 40px 40px}}
+  h1{{text-align:center;font-size:16px;font-weight:800;margin:6px 0 16px}}
+  .party{{display:flex;gap:10px;font-size:12px;margin-bottom:9px;line-height:1.4}}
+  .party .lbl{{font-weight:700;flex-shrink:0;width:78px}}
+  table.doc{{width:100%;border-collapse:collapse;margin:14px 0 4px;font-size:12px}}
+  table.doc th,table.doc td{{border:1px solid var(--line);padding:5px 7px;vertical-align:middle}}
+  table.doc th{{font-weight:700;text-align:center;font-size:11px;background:#f3f5f8}}
+  table.doc td.c{{text-align:center}}table.doc td.r{{text-align:right;white-space:nowrap}}
+  table.doc tfoot td{{font-weight:800;border:none;text-align:right;padding-top:7px}}
+  table.doc tfoot td.lbl{{text-align:right}}
+  .sums{{margin:8px 0 4px;font-size:12.5px}}
+  .sums .row{{margin:3px 0}}
+  .order{{margin:12px 0;font-size:12.5px}}
+  .sign{{display:flex;gap:50px;margin-top:26px;font-size:12px}}
+  .sign .role{{font-weight:700;width:110px}}
+  .sign .line{{flex:1;max-width:230px}}
+  .sign .ln{{border-bottom:1px solid var(--ink);height:20px;position:relative}}
+  .sign .ln .nm{{position:absolute;right:6px;bottom:2px;font-weight:700}}
+  .sign .cap{{font-size:9.5px;color:var(--soft);text-align:center;margin-top:2px}}
+  .terms{{margin-top:20px;font-size:11px;line-height:1.5}}
+  .terms .b{{font-weight:700}}
+  @media print{{@page{{size:A4;margin:14mm}}}}
+</style>
+</head>
+<body>
+<div class="sheet">
+  <h1>Счёт-протокол на оплату № {doc.number} от {date_str}</h1>
+  <div class="party"><div class="lbl">Поставщик:</div><div class="body">{_req_line(seller)}</div></div>
+  <div class="party"><div class="lbl">Покупатель:</div><div class="body">{_req_line(buyer)}</div></div>
+  <table class="doc">
+    <thead><tr>
+      <th style="width:26px">№</th><th>Товары (работы, услуги)</th><th style="width:62px">Кол-во</th>
+      <th style="width:52px">Ед. изм.</th><th style="width:70px">Цена</th><th style="width:80px">Стоимость</th>
+      <th style="width:54px">Ставка НДС</th><th style="width:74px">Сумма НДС</th><th style="width:84px">Всего с НДС</th>
+    </tr></thead>
+    <tbody>{"".join(rows_html)}</tbody>
+    <tfoot><tr><td colspan="8" class="lbl">Итого с НДС:</td><td class="r">{_money(grand)}</td></tr></tfoot>
+  </table>
+  <div class="sums">
+    <div class="row">Сумма НДС: <b>{money_words(vat_sum)}</b></div>
+    <div class="row">Всего к оплате сумма с НДС: <b>{money_words(grand)}</b></div>
+  </div>
+  <div class="order">Оплата по заказу клиента № {order_no}</div>
+  <div class="sign">
+    <div class="role">Руководитель</div>
+    <div class="line"><div class="ln"></div><div class="cap">подпись</div></div>
+    <div class="line"><div class="ln"><span class="nm">{seller.get("director", "")}</span></div><div class="cap">расшифровка подписи</div></div>
+  </div>
+  <div class="sign">
+    <div class="role">Бухгалтер</div>
+    <div class="line"><div class="ln"></div><div class="cap">подпись</div></div>
+    <div class="line"><div class="ln"></div><div class="cap">расшифровка подписи</div></div>
+  </div>
+  <div class="terms">
+    <div class="b">Счёт действителен в течение {valid_days} банковских дней.</div>
+    Отгрузка товара клиенту при самовывозе осуществляется только при наличии следующих документов:<br>
+    1. Подписанный Счёт-протокол с синей печатью<br>
+    2. — если товар получает ИП — копия свидетельства о регистрации<br>
+    &nbsp;&nbsp;&nbsp;— если товар получает Директор — копия приказа о назначении<br>
+    &nbsp;&nbsp;&nbsp;— если товар получает доверенное лицо — доверенность на получение ТМЦ и путевой лист (при необходимости).<br>
+    <span class="b">Без документов товар со склада не выдаётся!</span>
+  </div>
+</div>
+</body>
+</html>"""
+
+
 async def _submit_contract_for_approval(
     core: Core,
     session: AsyncSession,
@@ -2120,13 +2279,13 @@ async def prepare_contract(
 
 
 @router.get("/documents/{doc_id}/render", response_class=HTMLResponse)
-async def render_contract(
+async def render_document(
     doc_id: int,
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
     _: object = Depends(require_permission("sales.deal.read")),
 ):
-    """Рендер договора по шаблону в HTML (печатная форма, ТЗ C.2). Только kind=contract.
+    """Рендер документа в HTML: договор по шаблону (ТЗ C.2) или счёт-протокол (kind=invoice).
 
     Гард ``sales.deal.read``: форма содержит реквизиты продавца и покупателя (ЕГР) —
     не отдаём анонимно (прод публичен).
@@ -2134,8 +2293,18 @@ async def render_contract(
     doc = await session.get(DealDocument, doc_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="Документ не найден")
+
+    if doc.kind == "invoice":
+        deal = await DealRepository(session).get(doc.deal_id)
+        seller = _seller_requisites(core)
+        buyer = (doc.terms_json or {}).get("buyer") or {"name": deal.counterparty if deal else ""}
+        items = await _invoice_items(session, doc.deal_id)
+        return HTMLResponse(_render_invoice(doc, deal, seller, buyer, items))
+
     if doc.kind != "contract":
-        raise HTTPException(status_code=400, detail="Рендер по шаблону — только для договора")
+        raise HTTPException(
+            status_code=400, detail="Рендер по шаблону — только для договора/счёта"
+        )
     tpl = await session.get(ContractTemplate, doc.template_id) if doc.template_id else None
     if tpl is None:
         raise HTTPException(status_code=409, detail="У договора не задан шаблон")
