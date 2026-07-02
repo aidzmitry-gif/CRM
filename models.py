@@ -35,6 +35,8 @@ class Deal(Base):
     stage: Mapped[str] = mapped_column(String(32), default="new", server_default="new")
     owner: Mapped[str] = mapped_column(String(128), default="", server_default="")
     next_step: Mapped[str | None] = mapped_column(String(128))
+    # Дата+время следующего шага (открытый хвост с круга 2) — next_step остаётся текстом-описанием.
+    next_step_at: Mapped[datetime | None] = mapped_column(DateTime)
     deal_date: Mapped[str | None] = mapped_column(String(32))
     closed_date: Mapped[str | None] = mapped_column(String(32))
     focus: Mapped[bool] = mapped_column(default=False)

@@ -18,6 +18,7 @@ class DealCreate(BaseModel):
     stage: str = "new"
     owner: str = ""
     next_step: str | None = None
+    next_step_at: datetime.datetime | None = None
     deal_date: str | None = None
     closed_date: str | None = None
     focus: bool = False
@@ -43,6 +44,7 @@ class DealUpdate(BaseModel):
     stage: str | None = None
     owner: str | None = None
     next_step: str | None = None
+    next_step_at: datetime.datetime | None = None
     deal_date: str | None = None
     closed_date: str | None = None
     focus: bool | None = None
@@ -73,6 +75,7 @@ class DealRead(BaseModel):
     stage: str
     owner: str
     next_step: str | None = None
+    next_step_at: datetime.datetime | None = None
     deal_date: str | None = None
     closed_date: str | None = None
     focus: bool
