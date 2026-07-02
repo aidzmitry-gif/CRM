@@ -336,6 +336,36 @@ async def ping() -> dict:
     return {"module": "sales", "status": "ok"}
 
 
+async def _supply_arrivals(
+    session: AsyncSession, deal_ids: list[int], window_days: int = 7
+) -> dict[int, dict]:
+    """Бейдж «🚚 под приход» (П6 UI ТЗ) — читаем живьём из аудита событий
+    ``sales.supply.arrived`` (эмитит ``on_procurement_received``, БЕЗ новой колонки/миграции —
+    паттерн как в ``_audit_landed_unit_by_sku``). Берём события за последние ``window_days``
+    (иначе бейдж висел бы вечно); на сделку — самое свежее.
+    """
+    if not deal_ids:
+        return {}
+    idset = set(deal_ids)
+    cutoff = _utcnow() - timedelta(days=window_days)
+    events = (
+        await session.execute(
+            select(OutboxEvent)
+            .where(OutboxEvent.event_type == "sales.supply.arrived")
+            .where(OutboxEvent.created_at >= cutoff)
+            .order_by(OutboxEvent.id)
+        )
+    ).scalars().all()
+    out: dict[int, dict] = {}
+    for ev in events:  # id по возрастанию → самое свежее для сделки побеждает
+        payload = ev.payload or {}
+        sku = payload.get("sku_code")
+        for deal_id in payload.get("deal_ids") or []:
+            if deal_id in idset:
+                out[deal_id] = {"supply_arrived_at": ev.created_at, "supply_arrived_sku": sku}
+    return out
+
+
 @router.get("/board", response_model=BoardOut)
 async def board(
     owner: str = "",
@@ -356,6 +386,7 @@ async def board(
 
     board_stages = await _board_stages(session, funnel)
     prob_by_stage = {s["id"]: s["probability"] for s in board_stages}
+    arrivals = await _supply_arrivals(session, [d.id for d in deals])
     stages = [
         StageBoard(
             id=s["id"],
@@ -364,7 +395,10 @@ async def board(
             count=len(by_stage.get(s["id"], [])),
             sum=float(sum(d.amount for d in by_stage.get(s["id"], []))),
             weighted=float(sum(_deal_weight(d, prob_by_stage) for d in by_stage.get(s["id"], []))),
-            deals=[DealRead.model_validate(d) for d in by_stage.get(s["id"], [])],
+            deals=[
+                DealRead.model_validate(d).model_copy(update=arrivals.get(d.id, {}))
+                for d in by_stage.get(s["id"], [])
+            ],
         )
         for s in board_stages
     ]

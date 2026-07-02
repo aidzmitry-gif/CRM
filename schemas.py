@@ -89,6 +89,9 @@ class DealRead(BaseModel):
     penalty_rate_pct: float | None = None
     penalty_cap_pct: float | None = None
     penalty_terms: str | None = None
+    # Живой бейдж «под приход» (П6 UI ТЗ) — читается из OutboxEvent, не из колонки.
+    supply_arrived_at: datetime.datetime | None = None
+    supply_arrived_sku: str | None = None
 
 
 class StageBoard(BaseModel):
