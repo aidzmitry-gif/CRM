@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import calendar
+import html
 import os
 import re
 from collections import defaultdict
@@ -652,21 +653,21 @@ async def kpis(period: str = "day", session: AsyncSession = Depends(get_session)
     ).scalars().all()
 
     month_match = MONTH_PERIOD_RE.match(period)
-    if month_match and not (1 <= int(month_match.group(2)) <= 12):
-        month_match = None  # "2026-13" и т.п. — не месяц, честный фоллбэк ниже
+    if month_match and not (
+        1 <= int(month_match.group(1)) and 1 <= int(month_match.group(2)) <= 12
+    ):
+        # "2026-13" (месяц вне 1-12) или "0000-05" (год < 1, date() кинул бы ValueError) —
+        # не валидный месяц, честный фоллбэк на relative-период ниже (а не 500).
+        month_match = None
 
-    actuals: dict[str, float] = {}
+    # Обе ветки вычисляют окно факта [start, end] и множитель плана mult; сам агрегат
+    # по Activity выполняется ОДИН раз ниже (не дублируем запрос — иначе правки логики
+    # факта разъезжаются между «месяцем» и relative-периодом).
     if month_match:
         year, month = int(month_match.group(1)), int(month_match.group(2))
         _, days_in_month = calendar.monthrange(year, month)
-        start = date(year, month, 1)
+        start: date | None = date(year, month, 1)
         end = date(year, month, days_in_month)
-        rows = await session.execute(
-            select(Activity.kpi_key, func.coalesce(func.sum(Activity.value), 0))
-            .where(Activity.date >= start, Activity.date <= end)
-            .group_by(Activity.kpi_key)
-        )
-        actuals = {key: float(total) for key, total in rows.all()}
         mult = sum(
             1
             for day in range(1, days_in_month + 1)
@@ -674,15 +675,18 @@ async def kpis(period: str = "day", session: AsyncSession = Depends(get_session)
         )
     else:
         latest = (await session.execute(select(func.max(Activity.date)))).scalar()
-        if latest is not None:
-            start = latest - timedelta(days=PERIOD_DAYS.get(period, 1) - 1)
-            rows = await session.execute(
-                select(Activity.kpi_key, func.coalesce(func.sum(Activity.value), 0))
-                .where(Activity.date >= start, Activity.date <= latest)
-                .group_by(Activity.kpi_key)
-            )
-            actuals = {key: float(total) for key, total in rows.all()}
+        start = None if latest is None else latest - timedelta(days=PERIOD_DAYS.get(period, 1) - 1)
+        end = latest
         mult = PERIOD_MULT.get(period, 1)
+
+    actuals: dict[str, float] = {}
+    if start is not None:
+        rows = await session.execute(
+            select(Activity.kpi_key, func.coalesce(func.sum(Activity.value), 0))
+            .where(Activity.date >= start, Activity.date <= end)
+            .group_by(Activity.kpi_key)
+        )
+        actuals = {key: float(total) for key, total in rows.all()}
     result: list[KpiOut] = []
     for t in targets:
         actual = actuals.get(t.key, 0.0)
@@ -1629,29 +1633,34 @@ async def list_deal_items(deal_id: int, session: AsyncSession = Depends(get_sess
 
 @router.get("/deals/{deal_id}/repeat-last-order", response_model=list[DealItemOut])
 async def repeat_last_order(deal_id: int, session: AsyncSession = Depends(get_session)):
-    """Позиции из последней ДРУГОЙ сделки того же контрагента (повтор заказа).
+    """Позиции из последней ПРЕДЫДУЩЕЙ сделки того же контрагента (повтор заказа).
 
-    Пусто, если сделка не найдена или предыдущих сделок этого контрагента с позициями нет.
+    «Предыдущая» = созданная раньше текущей (``Deal.id < deal_id`` — id монотонен по
+    вставке, null-безопасен), у которой есть позиции. Параллельная более новая сделка
+    (id больше) в повтор не попадёт. Пусто, если сделки нет или прошлых заказов нет.
     """
     deal = await DealRepository(session).get(deal_id)
     if deal is None:
         raise HTTPException(status_code=404, detail="Сделка не найдена")
-    prior_deals = (
+    # Одним запросом: последний (по дате, tie-break по id) предыдущий заказ С позициями —
+    # join к DealItem отсекает пустые сделки, limit 1 берёт самый свежий (без N+1-скана).
+    prior_id = (
         await session.execute(
-            select(Deal)
-            .where(Deal.counterparty == deal.counterparty, Deal.id != deal_id)
+            select(DealItem.deal_id)
+            .join(Deal, Deal.id == DealItem.deal_id)
+            .where(Deal.counterparty == deal.counterparty, Deal.id < deal_id)
             .order_by(Deal.created_at.desc(), Deal.id.desc())
+            .limit(1)
+        )
+    ).scalar()
+    if prior_id is None:
+        return []
+    rows = (
+        await session.execute(
+            select(DealItem).where(DealItem.deal_id == prior_id).order_by(DealItem.id)
         )
     ).scalars().all()
-    for prior in prior_deals:
-        rows = (
-            await session.execute(
-                select(DealItem).where(DealItem.deal_id == prior.id).order_by(DealItem.id)
-            )
-        ).scalars().all()
-        if rows:
-            return [await _build_item_out(session, r, deal.counterparty) for r in rows]
-    return []
+    return [await _build_item_out(session, r, deal.counterparty) for r in rows]
 
 
 @router.post("/deals/{deal_id}/items", response_model=DealItemOut, status_code=201)
@@ -2038,19 +2047,26 @@ def _money(n: Decimal) -> str:
     return f"{n:,.2f}".replace(",", " ")
 
 
+def _esc(v: object) -> str:
+    """HTML-экранирование значения для печатных форм (счёт/договор): наименования SKU,
+    реквизиты покупателя из ЕГР/terms_json, номер документа — недоверенные данные,
+    попадают в HTMLResponse под сессией → без escape это stored XSS."""
+    return html.escape(str(v))
+
+
 def _req_line(p: dict) -> str:
     """Строка реквизитов «Наименование, УНП …, адрес, тел., р/с … в банке … БИК …» (честный минимум при пропусках)."""
-    parts = [f"<b>{p.get('name', '')}</b>"]
+    parts = [f"<b>{_esc(p.get('name', ''))}</b>"]
     if p.get("unp"):
-        parts.append(f"УНП {p['unp']}")
+        parts.append(f"УНП {_esc(p['unp'])}")
     if p.get("address"):
-        parts.append(str(p["address"]))
+        parts.append(_esc(p["address"]))
     if p.get("phone"):
-        parts.append(f"тел.: {p['phone']}")
+        parts.append(f"тел.: {_esc(p['phone'])}")
     if p.get("account"):
-        bank = f" в банке {p['bank']}" if p.get("bank") else ""
-        bik = f" БИК {p['bik']}" if p.get("bik") else ""
-        parts.append(f"р/с {p['account']}{bank}{bik}")
+        bank = f" в банке {_esc(p['bank'])}" if p.get("bank") else ""
+        bik = f" БИК {_esc(p['bik'])}" if p.get("bik") else ""
+        parts.append(f"р/с {_esc(p['account'])}{bank}{bik}")
     return ", ".join(parts)
 
 
@@ -2069,8 +2085,8 @@ def _render_invoice(
         vat_sum += vat
         rows_html.append(
             "<tr>"
-            f'<td class="c">{i}</td><td>{it["name"]}</td><td class="c">{qty}</td>'
-            f'<td class="c">{it["unit"]}</td><td class="r">{_money(price)}</td><td class="r">{_money(net)}</td>'
+            f'<td class="c">{i}</td><td>{_esc(it["name"])}</td><td class="c">{qty}</td>'
+            f'<td class="c">{_esc(it["unit"])}</td><td class="r">{_money(price)}</td><td class="r">{_money(net)}</td>'
             f'<td class="c">{_INVOICE_VAT_RATE}%</td><td class="r">{_money(vat)}</td><td class="r">{_money(total)}</td>'
             "</tr>"
         )
@@ -2080,7 +2096,7 @@ def _render_invoice(
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<title>Счёт-протокол на оплату № {doc.number}</title>
+<title>Счёт-протокол на оплату № {_esc(doc.number)}</title>
 <style>
   :root{{--ink:#0f172a;--muted:#475569;--line:#0f172a;--soft:#64748b;--paper:#fff;--font:"Arial","Segoe UI",system-ui,sans-serif;}}
   *{{box-sizing:border-box;margin:0;padding:0}}
@@ -2111,7 +2127,7 @@ def _render_invoice(
 </head>
 <body>
 <div class="sheet">
-  <h1>Счёт-протокол на оплату № {doc.number} от {date_str}</h1>
+  <h1>Счёт-протокол на оплату № {_esc(doc.number)} от {date_str}</h1>
   <div class="party"><div class="lbl">Поставщик:</div><div class="body">{_req_line(seller)}</div></div>
   <div class="party"><div class="lbl">Покупатель:</div><div class="body">{_req_line(buyer)}</div></div>
   <table class="doc">
@@ -2127,11 +2143,11 @@ def _render_invoice(
     <div class="row">Сумма НДС: <b>{money_words(vat_sum)}</b></div>
     <div class="row">Всего к оплате сумма с НДС: <b>{money_words(grand)}</b></div>
   </div>
-  <div class="order">Оплата по заказу клиента № {order_no}</div>
+  <div class="order">Оплата по заказу клиента № {_esc(order_no)}</div>
   <div class="sign">
     <div class="role">Руководитель</div>
     <div class="line"><div class="ln"></div><div class="cap">подпись</div></div>
-    <div class="line"><div class="ln"><span class="nm">{seller.get("director", "")}</span></div><div class="cap">расшифровка подписи</div></div>
+    <div class="line"><div class="ln"><span class="nm">{_esc(seller.get("director", ""))}</span></div><div class="cap">расшифровка подписи</div></div>
   </div>
   <div class="sign">
     <div class="role">Бухгалтер</div>
