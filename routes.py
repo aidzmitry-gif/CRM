@@ -39,6 +39,7 @@ from modules.sales.ai import (
 )
 from modules.sales.models import (
     Activity,
+    CompanyBranding,
     ContractTemplate,
     Deal,
     DealDocument,
@@ -59,6 +60,8 @@ from modules.sales.schemas import (
     AiDraftOut,
     AiTextOut,
     BoardOut,
+    BrandingIn,
+    BrandingOut,
     CallCommentIn,
     CallLinkDealIn,
     CallOut,
@@ -2061,6 +2064,49 @@ def _seller_requisites(core: Core) -> dict[str, str]:
     }
 
 
+# Лого — предел размера data-URI (~1.4МБ base64 ≈ 1МБ исходного файла): печатная форма
+# должна оставаться лёгкой (лого встраивается в HTML целиком, без диска/CDN).
+_LOGO_MAX_LEN = 1_400_000
+
+
+async def _current_logo(session: AsyncSession) -> str | None:
+    """Текущее лого продавца (data-URI) или None — singleton-строка id=1."""
+    row = await session.get(CompanyBranding, 1)
+    return row.logo_data_url if row else None
+
+
+@router.get("/branding", response_model=BrandingOut)
+async def get_branding(
+    session: AsyncSession = Depends(get_session),
+    _: object = Depends(require_permission("sales.deal.read")),
+):
+    """Текущее лого продавца для печатных форм (honest-empty — None, не 404)."""
+    return BrandingOut(logo_data_url=await _current_logo(session))
+
+
+@router.put("/branding", response_model=BrandingOut)
+async def put_branding(
+    payload: BrandingIn,
+    session: AsyncSession = Depends(get_session),
+    _: object = Depends(require_permission("sales.deal.write")),
+):
+    """Загрузить/заменить лого продавца. Клиент кодирует файл в data-URI (FileReader) —
+    сервер multipart не принимает (в проекте нет паттерна загрузки бинарных файлов).
+    """
+    if not payload.logo_data_url.startswith("data:image/"):
+        raise HTTPException(status_code=422, detail="Ожидается data-URI изображения (data:image/...)")
+    if len(payload.logo_data_url) > _LOGO_MAX_LEN:
+        raise HTTPException(status_code=422, detail="Файл слишком большой (лимит ~1 МБ)")
+    row = await session.get(CompanyBranding, 1)
+    if row is None:
+        row = CompanyBranding(id=1, logo_data_url=payload.logo_data_url)
+        session.add(row)
+    else:
+        row.logo_data_url = payload.logo_data_url
+    await session.commit()
+    return BrandingOut(logo_data_url=row.logo_data_url)
+
+
 async def _buyer_requisites(
     session: AsyncSession, core: Core, deal: Deal, unp: str
 ) -> dict[str, str]:
@@ -2225,11 +2271,14 @@ def _render_invoice(
   .sign .cap{{font-size:9.5px;color:var(--soft);text-align:center;margin-top:2px}}
   .terms{{margin-top:20px;font-size:11px;line-height:1.5}}
   .terms .b{{font-weight:700}}
+  .logo{{margin-bottom:14px}}
+  .logo img{{max-height:60px;max-width:260px}}
   @media print{{@page{{size:A4;margin:14mm}}}}
 </style>
 </head>
 <body>
 <div class="sheet">
+  {f'<div class="logo"><img src="{_esc(seller.get("logo_data_url"))}" alt="{_esc(seller.get("name", ""))}"></div>' if seller.get("logo_data_url") else ""}
   <h1>Счёт-протокол на оплату № {_esc(doc.number)} от {date_str}</h1>
   <div class="party"><div class="lbl">Поставщик:</div><div class="body">{_req_line(seller)}</div></div>
   <div class="party"><div class="lbl">Покупатель:</div><div class="body">{_req_line(buyer)}</div></div>
@@ -2416,6 +2465,7 @@ async def render_document(
     if doc.kind == "invoice":
         deal = await DealRepository(session).get(doc.deal_id)
         seller = _seller_requisites(core)
+        seller["logo_data_url"] = await _current_logo(session) or ""
         buyer = (doc.terms_json or {}).get("buyer") or {"name": deal.counterparty if deal else ""}
         items = await _invoice_items(session, doc.deal_id)
         return HTMLResponse(_render_invoice(doc, deal, seller, buyer, items))

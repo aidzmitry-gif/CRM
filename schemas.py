@@ -767,3 +767,16 @@ class TelephonyEventIn(BaseModel):
     duration_sec: int | None = None
     hold_sec: int | None = None
     recording_url: str | None = None
+
+
+class BrandingOut(BaseModel):
+    """Текущее лого продавца для печатных форм (счёт/договор). ``None`` — не загружено."""
+
+    logo_data_url: str | None = None
+
+
+class BrandingIn(BaseModel):
+    """Загрузка/замена лого. ``logo_data_url`` — data-URI (``data:image/...;base64,...``),
+    формируется на клиенте через FileReader — сервер файлы не парсит (нет multipart)."""
+
+    logo_data_url: str = Field(min_length=1)

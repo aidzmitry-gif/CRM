@@ -342,3 +342,20 @@ class PlanTarget(Base):
     status: Mapped[str] = mapped_column(String(16), default="draft", server_default="draft")
     approved_by: Mapped[str | None] = mapped_column(String(128))
     approved_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class CompanyBranding(Base):
+    """Лого продавца для печатных форм (счёт-протокол/договор) — singleton (id=1).
+
+    Хранится как data-URI (base64) прямо в колонке — в проекте нет установившегося
+    паттерна загрузки файлов (диск/S3/StaticFiles), а лого небольшое и единственное
+    на компанию; тот же приём, что у ContractTemplate.body (текстовый контент формы
+    целиком в БД). Одна строка — оверрайдится при повторной загрузке, история не нужна.
+    """
+
+    __tablename__ = "company_branding"
+    __table_args__ = {"schema": "sales"}
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    logo_data_url: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
