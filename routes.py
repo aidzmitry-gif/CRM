@@ -107,6 +107,8 @@ from modules.sales.schemas import (
     StageBoard,
     StageCreate,
     StageEventOut,
+    StageMetric,
+    StageMetricsOut,
     StageOut,
     StageUpdate,
     TaskCreate,
@@ -500,6 +502,107 @@ async def pipeline_analytics(
         avg_cycle_days=avg_cycle,
         won_count=len(won_deals),
     )
+
+
+STAGE_METRICS_PERIOD_DAYS = {"week": 7, "month": 30, "quarter": 90}
+
+
+@router.get("/pipeline/stage-metrics", response_model=StageMetricsOut)
+async def pipeline_stage_metrics(
+    funnel: str = DEFAULT_FUNNEL,
+    owner: str = "",
+    period: str = "month",
+    date_from: date | None = None,
+    date_to: date | None = None,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Период-срез конверсии стадия→след.стадия и среднего времени на стадии.
+
+    В отличие от ``/pipeline/analytics`` (снимок текущей доски), тут — ИСТОРИЯ по
+    ``DealStageEvent`` внутри окна ``[date_from, date_to]``: для каждой сделки строим
+    сегменты пребывания в стадии (первый сегмент — от ``Deal.created_at``, т.к. запись
+    смены стадии пишется только на переходах, см. ``record_stage``), затем считаем на
+    сколько сегментов ВОШЛИ и сколько ЗАВЕРШИЛИСЬ (закрытым концом) внутри окна.
+    ``date_from``/``date_to`` — явный диапазон (приоритет); иначе ``period`` (week/
+    month/quarter) от сегодняшней даты. honest-empty: без истории — ``None``, не 0.
+    """
+    today = _utcnow().date()
+    if date_from is not None and date_to is not None:
+        start, end = date_from, date_to
+    else:
+        span = STAGE_METRICS_PERIOD_DAYS.get(period, 30)
+        start, end = today - timedelta(days=span - 1), today
+
+    stage_rows = await _board_stages(session, funnel)
+    stage_codes = [s["id"] for s in stage_rows]
+    deals = await DealRepository(session).list()
+    deals = [d for d in deals if d.funnel == funnel]
+    if owner:
+        deals = [d for d in deals if d.owner == owner]
+
+    deal_ids = [d.id for d in deals]
+    events_by_deal: dict[int, list[DealStageEvent]] = defaultdict(list)
+    if deal_ids:
+        rows = (
+            await session.execute(
+                select(DealStageEvent)
+                .where(DealStageEvent.deal_id.in_(deal_ids))
+                .order_by(DealStageEvent.changed_at)
+            )
+        ).scalars().all()
+        for ev in rows:
+            events_by_deal[ev.deal_id].append(ev)
+
+    # Сегмент = (стадия, начало, конец|None-открыт). Начало первого сегмента — created_at
+    # (синтетический «вход», т.к. record_stage не пишет событие на создание сделки).
+    entered_in_window: dict[str, int] = defaultdict(int)
+    moved_to_next_in_window: dict[tuple[str, str], int] = defaultdict(int)
+    completed_durations: dict[str, list[float]] = defaultdict(list)
+    window_start = datetime.combine(start, datetime.min.time())
+    window_end = datetime.combine(end, datetime.max.time())
+    for d in deals:
+        events = events_by_deal.get(d.id, [])
+        first_stage = events[0].from_stage if events else d.stage
+        prev_stage, prev_time = first_stage, d.created_at
+        segments: list[tuple[str, datetime, datetime | None]] = []
+        for ev in events:
+            segments.append((prev_stage, prev_time, ev.changed_at))
+            prev_stage, prev_time = ev.to_stage, ev.changed_at
+        segments.append((prev_stage, prev_time, None))  # текущий, открытый сегмент
+
+        for idx, (stage, seg_start, seg_end) in enumerate(segments):
+            if seg_start is not None and window_start <= seg_start <= window_end:
+                entered_in_window[stage] += 1
+            if seg_end is not None and window_start <= seg_end <= window_end:
+                completed_durations[stage].append((seg_end - seg_start).total_seconds() / 86400.0)
+                next_stage = segments[idx + 1][0] if idx + 1 < len(segments) else None
+                if next_stage is not None:
+                    moved_to_next_in_window[(stage, next_stage)] += 1
+
+    out_stages: list[StageMetric] = []
+    for idx, s in enumerate(stage_rows):
+        sid = s["id"]
+        next_sid = stage_codes[idx + 1] if idx + 1 < len(stage_codes) else None
+        entered = entered_in_window.get(sid, 0)
+        conv: int | None = None
+        if next_sid is not None and entered > 0:
+            conv = round(moved_to_next_in_window.get((sid, next_sid), 0) / entered * 100)
+        durations = completed_durations.get(sid, [])
+        avg_time = round(sum(durations) / len(durations), 1) if durations else None
+        out_stages.append(
+            StageMetric(
+                id=sid,
+                title=s["title"],
+                color=s["color"],
+                entered_count=entered,
+                conv_next_pct=conv,
+                avg_time_days=avg_time,
+                completed_count=len(durations),
+            )
+        )
+
+    return StageMetricsOut(funnel=funnel, date_from=start, date_to=end, stages=out_stages)
 
 
 # ── Редактор стадий воронки (Сделки 2.0): CRUD справочника sales.stage ─────────────

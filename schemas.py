@@ -443,6 +443,32 @@ class PipelineAnalyticsOut(BaseModel):
     won_count: int = 0
 
 
+class StageMetric(BaseModel):
+    """Период-метрика стадии: сколько вошло/ушло в след. стадию и сколько там пробыли.
+
+    В отличие от ``StageAnalytics`` (текущий снимок доски) — это ИСТОРИЯ за окно
+    ``[date_from, date_to]`` по ``DealStageEvent``: honest-empty (``None``), если за
+    период не было ни одного завершённого перехода/пребывания.
+    """
+
+    id: str
+    title: str
+    color: str
+    entered_count: int  # сколько сделок вошло в стадию за период
+    conv_next_pct: int | None = None  # доля вошедших, ушедших в след. стадию за период
+    avg_time_days: float | None = None  # средняя длительность завершённых пребываний за период
+    completed_count: int = 0  # сколько завершённых пребываний вошло в avg_time_days
+
+
+class StageMetricsOut(BaseModel):
+    """Ответ `/pipeline/stage-metrics`: период-срез конверсии и времени на стадии по воронке."""
+
+    funnel: str
+    date_from: datetime.date
+    date_to: datetime.date
+    stages: list[StageMetric]
+
+
 MarginLineStatus = Literal["priced", "no_price", "no_cost"]
 
 
