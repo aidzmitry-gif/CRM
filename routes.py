@@ -53,6 +53,7 @@ from modules.sales.models import (
     PriceQuote,
     Stage,
 )
+from modules.sales.kpi_facts import BOARD_EXTRA_TARGETS, OPERATIONAL_KPI_KEYS, compute_operational_kpi_facts
 from modules.sales.repository import DealRepository, record_stage
 from modules.sales.schemas import (
     ActivityCreate,
@@ -762,8 +763,6 @@ async def kpis(period: str = "day", session: AsyncSession = Depends(get_session)
     if month_match and not (
         1 <= int(month_match.group(1)) and 1 <= int(month_match.group(2)) <= 12
     ):
-        # "2026-13" (месяц вне 1-12) или "0000-05" (год < 1, date() кинул бы ValueError) —
-        # не валидный месяц, честный фоллбэк на relative-период ниже (а не 500).
         month_match = None
 
     # Обе ветки вычисляют окно факта [start, end] и множитель плана mult; сам агрегат
@@ -793,7 +792,13 @@ async def kpis(period: str = "day", session: AsyncSession = Depends(get_session)
             .group_by(Activity.kpi_key)
         )
         actuals = {key: float(total) for key, total in rows.all()}
+        if month_match and end is not None:
+            facts = await compute_operational_kpi_facts(session, start, end)
+            for key, value in facts.items():
+                if key in OPERATIONAL_KPI_KEYS or key in BOARD_EXTRA_TARGETS:
+                    actuals[key] = value
     result: list[KpiOut] = []
+    seen: set[str] = set()
     for t in targets:
         actual = actuals.get(t.key, 0.0)
         target = float(t.target) * mult
@@ -808,6 +813,26 @@ async def kpis(period: str = "day", session: AsyncSession = Depends(get_session)
                 unit=t.unit,
                 icon=t.icon,
                 tone=t.tone,
+            )
+        )
+        seen.add(t.key)
+    # Метрики первичного ряда доски, отсутствующие в kpi_target.
+    for key, (title, unit, icon, tone, daily) in BOARD_EXTRA_TARGETS.items():
+        if key in seen:
+            continue
+        actual = actuals.get(key, 0.0)
+        target = daily * mult
+        percent = round(min(100.0, actual / target * 100)) if target else 0
+        result.append(
+            KpiOut(
+                key=key,
+                title=title,
+                target=target,
+                actual=actual,
+                percent=percent,
+                unit=unit,
+                icon=icon,
+                tone=tone,
             )
         )
     return result
@@ -1719,9 +1744,21 @@ async def request_approval(
 
 
 @router.get("/skus", response_model=list[SkuOut])
-async def list_skus(session: AsyncSession = Depends(get_session)):
-    """Справочник номенклатуры (для подбора позиций в сделку, sales-12)."""
-    return (await session.execute(select(Sku).order_by(Sku.code))).scalars().all()
+async def list_skus(
+    for_picker: bool = False,
+    session: AsyncSession = Depends(get_session),
+):
+    """Справочник номенклатуры (для подбора позиций в сделку, sales-12).
+
+    ``for_picker=1`` — без seed-позиций «(демо)»/«(тест)» (подбор в сделке/звонке).
+    """
+    stmt = select(Sku).order_by(Sku.code)
+    if for_picker:
+        stmt = stmt.where(
+            ~Sku.title.like("%(демо)%"),
+            ~Sku.title.like("%(тест)%"),
+        )
+    return (await session.execute(stmt)).scalars().all()
 
 
 @router.get("/deals/{deal_id}/items", response_model=list[DealItemOut])
