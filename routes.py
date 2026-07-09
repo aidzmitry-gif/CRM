@@ -37,6 +37,11 @@ from modules.sales.ai import (
     static_call_script,
     summarize,
 )
+from modules.sales.kpi_facts import (
+    BOARD_EXTRA_TARGETS,
+    OPERATIONAL_KPI_KEYS,
+    compute_operational_kpi_facts,
+)
 from modules.sales.models import (
     Activity,
     CompanyBranding,
@@ -53,7 +58,6 @@ from modules.sales.models import (
     PriceQuote,
     Stage,
 )
-from modules.sales.kpi_facts import BOARD_EXTRA_TARGETS, OPERATIONAL_KPI_KEYS, compute_operational_kpi_facts
 from modules.sales.repository import DealRepository, record_stage
 from modules.sales.schemas import (
     ActivityCreate,
