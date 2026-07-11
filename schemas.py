@@ -557,6 +557,33 @@ class MarginReconcileOut(BaseModel):
     status: Literal["converged", "diverged", "no_finance"]
 
 
+class JournalRowOut(BaseModel):
+    """Строка «Журнала продаж» (``GET /sales/journal``) — реестр закрытых won-сделок
+    (все воронки: new_clients/repeat_clients/tenders) с фактом закрытия, маржой,
+    оплатой и отгрузкой. Контракт согласован с фронтом (``frontend/src/lib/sales-journal.ts``).
+
+    ``revenue``/``gross_profit``/``margin_pct`` — как в ``DealMarginOut`` (по ``priced``-позициям,
+    ``None`` = честная деградация, НЕ 0); ``margin_reason`` — те же формулировки, что там же.
+    ``payment`` — "paid" ТОЛЬКО по статусу счёта ``paid`` (``posted`` = записан в 1С, не оплачен).
+    """
+
+    deal_id: int
+    number: str
+    title: str
+    counterparty: str
+    owner: str
+    funnel: str
+    amount: float
+    closed_on: str | None = None  # ISO yyyy-mm-dd
+    revenue: float | None = None
+    gross_profit: float | None = None
+    margin_pct: int | None = None
+    margin_reason: str | None = None
+    payment: Literal["paid", "invoiced", "none"] = "none"
+    invoice_number: str | None = None
+    shipment: Literal["delivered", "none"] = "none"
+
+
 class ActivityCreate(BaseModel):
     """Отметка факта активности (звонок, заявка, отгрузка)."""
 

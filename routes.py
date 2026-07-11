@@ -93,6 +93,7 @@ from modules.sales.schemas import (
     DocumentOut,
     FunnelOut,
     HandoffItem,
+    JournalRowOut,
     KpiOut,
     LoseRequest,
     LossReasonOut,
@@ -1389,6 +1390,149 @@ async def deal_margin_reconcile(
         level="sku_aggregate",
         status=status,
     )
+
+
+def _journal_closed_on(deal: Deal) -> date | None:
+    """Дата закрытия won-сделки для журнала: ``closed_date`` ("dd.mm.yyyy"), а если пуст/не
+    парсится (legacy-won/мусор) — фолбэк на дату ``stage_changed_at`` (переход в won зафиксирован
+    там же — тот же приём, что средний цикл в ``pipeline_analytics``)."""
+    if deal.closed_date:
+        try:
+            return datetime.strptime(deal.closed_date, "%d.%m.%Y").date()
+        except ValueError:
+            pass
+    return deal.stage_changed_at.date() if deal.stage_changed_at is not None else None
+
+
+@router.get("/journal", response_model=list[JournalRowOut])
+async def sales_journal(
+    owner: str = "",
+    # ponytail: срез по last-N без keyset-курсора — реестр won-сделок за всё время может
+    # вырасти в тысячи; курсорная пагинация — если понадобится глубокая история.
+    limit: int = 200,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """«Журнал продаж» — реестр ЗАКРЫТЫХ WON-сделок по всем воронкам (факт закрытия, маржа,
+    оплата, отгрузка) для экрана ``/crm/sales`` (лента как журнал документов 1С).
+
+    Funnel-aware: won-код стадии свой у каждой воронки (``won``/``rp_won``/``tn_won``) —
+    резолвим через ``_stage_kind_map`` по КАЖДОЙ известной воронке (канон ``FUNNELS`` +
+    материализованные в ``sales.stage``), затем фильтруем по точной паре (funnel, stage) —
+    коды воронок уникальны, но пара надёжнее на случай будущего пересечения кодов.
+    Маржа — тем же хелпером ``_deal_margin``, что и карточка/прогноз (DRY); честная
+    деградация (``None`` + ``margin_reason``), НЕ 0.
+    """
+    funnel_codes = {f["code"] for f in FUNNELS}
+    funnel_codes |= set((await session.execute(select(Stage.funnel).distinct())).scalars().all())
+
+    won_pairs: set[tuple[str, str]] = set()
+    for funnel in funnel_codes:
+        kind_map = await _stage_kind_map(session, funnel)
+        won_pairs |= {(funnel, code) for code, kind in kind_map.items() if kind == "won"}
+    if not won_pairs:
+        return []
+    won_codes = {code for _, code in won_pairs}
+
+    deals = (
+        await session.execute(select(Deal).where(Deal.stage.in_(won_codes)))
+    ).scalars().all()
+    deals = [d for d in deals if (d.funnel, d.stage) in won_pairs]
+    if owner:
+        deals = [d for d in deals if d.owner == owner]
+
+    closed_by_deal = {d.id: _journal_closed_on(d) for d in deals}
+    deals.sort(key=lambda d: (closed_by_deal[d.id] or date.min, d.id), reverse=True)
+    deals = deals[: max(limit, 0)]
+    deal_ids = [d.id for d in deals]
+
+    # Оплата: один запрос по всем сделкам разом — счета (kind=invoice), paid побеждает
+    # posted; posted ("записан в 1С") — НЕ оплата, это уже ловили на ревью.
+    paid_number: dict[int, str] = {}
+    posted_number: dict[int, str] = {}
+    if deal_ids:
+        docs = (
+            await session.execute(
+                select(DealDocument)
+                .where(DealDocument.deal_id.in_(deal_ids), DealDocument.kind == "invoice")
+                .order_by(DealDocument.id)
+            )
+        ).scalars().all()
+        for doc in docs:  # id по возрастанию
+            if doc.status == "paid":
+                paid_number.setdefault(doc.deal_id, doc.number)
+            elif doc.status == "posted":
+                posted_number[doc.deal_id] = doc.number  # перезаписываем — последний побеждает
+
+    # Отгрузка: full-scan outbox по event_type (образец — ``_audit_landed_unit_by_sku``,
+    # тот же ponytail: без БД-фильтра по deal_id и без индекса на event_type — приемлемо
+    # для dev/MVP; сузить при росте append-only outbox_event).
+    delivered_ids: set[int] = set()
+    if deal_ids:
+        idset = set(deal_ids)
+        events = (
+            await session.execute(
+                select(OutboxEvent).where(OutboxEvent.event_type == "logistics.shipment.delivered")
+            )
+        ).scalars().all()
+        for ev in events:
+            did = (ev.payload or {}).get("deal_id")
+            if did in idset:
+                delivered_ids.add(did)
+
+    rows: list[JournalRowOut] = []
+    for d in deals:
+        # ponytail: O(сделок) вызовов _deal_margin (по сделке) — как в margin-forecast;
+        # приемлемо для среза last-N, батч-расчёт — если вырастет.
+        lines, facade_missing = await _deal_margin(session, core, d)
+        priced = [ln for ln in lines if ln.status == "priced"]
+        revenue: float | None = None
+        gross_profit: float | None = None
+        margin_pct: int | None = None
+        margin_reason: str | None = None
+        if not lines:
+            margin_reason = "Позиций нет — маржа не рассчитывается"
+        elif facade_missing:
+            margin_reason = (
+                "Себестоимость закупок не подключена (procurement не реализовал фасад landed_cost)"
+            )
+        elif not priced:
+            margin_reason = "Ни по одной позиции нет одновременно цены клиенту и landed cost"
+        else:
+            revenue = sum((ln.revenue or 0.0) for ln in priced)
+            cogs = sum((ln.cogs or 0.0) for ln in priced)
+            gross_profit = revenue - cogs
+            margin_pct = round(gross_profit / revenue * 100) if revenue > 0 else None
+
+        if d.id in paid_number:
+            payment, invoice_number = "paid", paid_number[d.id]
+        elif d.id in posted_number:
+            payment, invoice_number = "invoiced", posted_number[d.id]
+        else:
+            payment, invoice_number = "none", None
+
+        closed_on = closed_by_deal[d.id]
+        rows.append(
+            JournalRowOut(
+                deal_id=d.id,
+                number=d.number,
+                title=d.title,
+                counterparty=d.counterparty,
+                owner=d.owner,
+                funnel=d.funnel,
+                amount=float(d.amount),
+                closed_on=closed_on.isoformat() if closed_on else None,
+                revenue=revenue,
+                gross_profit=gross_profit,
+                margin_pct=margin_pct,
+                margin_reason=margin_reason,
+                payment=payment,
+                invoice_number=invoice_number,
+                shipment="delivered" if d.id in delivered_ids else "none",
+            )
+        )
+    return rows
 
 
 @router.get("/deals/{deal_id}/handoff", response_model=DealHandoffOut | None)
