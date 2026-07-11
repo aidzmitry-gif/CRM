@@ -11,7 +11,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -54,6 +54,7 @@ from modules.sales.models import (
     KpiTarget,
     LossReason,
     Message,
+    PlanItem,
     PlanTarget,
     PriceQuote,
     Stage,
@@ -67,12 +68,14 @@ from modules.sales.schemas import (
     BoardOut,
     BrandingIn,
     BrandingOut,
+    CalcDefaultsOut,
     CallCommentIn,
     CallLinkDealIn,
     CallOut,
     CallResultIn,
     CallScriptOut,
     ChatOut,
+    CommittedRowOut,
     ContactCreate,
     ContactOut,
     ContractPrepareIn,
@@ -107,10 +110,14 @@ from modules.sales.schemas import (
     PackageSentOut,
     PipelineAnalyticsOut,
     PlanDecisionIn,
+    PlanItemIn,
+    PlanItemOut,
+    PlanSourcesOut,
     PlanTargetIn,
     PlanTargetOut,
     PriceInfo,
     PriceQuoteCreate,
+    RegularRowOut,
     SkuOut,
     StageAnalytics,
     StageBoard,
@@ -149,6 +156,8 @@ RESERVES_STOCK = {"invoice", "order"}
 # План/факт по периодам (sales-34): окно факта (дней) и множитель плана (рабочих дней).
 PERIOD_DAYS = {"day": 1, "week": 7, "month": 30, "quarter": 90, "year": 365}
 PERIOD_MULT = {"day": 1, "week": 5, "month": 22, "quarter": 65, "year": 250}
+# Конструктор месячного плана продавца: месяц — строго "YYYY-MM" (plan-sources/plan-items).
+MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
 
 def _deal_weight(deal: Deal, prob_by_stage: dict[str, int] | None = None) -> float:
@@ -197,6 +206,28 @@ async def _board_stages(session: AsyncSession, funnel: str = DEFAULT_FUNNEL) -> 
 def _utcnow() -> datetime:
     # наивный UTC — единообразно для SQLite и PostgreSQL
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _month_bounds(month: str) -> tuple[date, date]:
+    """Валидировать ``month`` ("YYYY-MM") и вернуть (первый, последний день месяца).
+
+    422 на кривом формате — используется и ``GET /plan-sources``, и ``PUT /plan-items``
+    (конструктор месячного плана продавца).
+    """
+    if not MONTH_RE.match(month):
+        raise HTTPException(status_code=422, detail="month должен быть в формате YYYY-MM")
+    year, mon = (int(p) for p in month.split("-"))
+    return date(year, mon, 1), date(year, mon, calendar.monthrange(year, mon)[1])
+
+
+def _parse_ddmmyyyy(value: str | None) -> date | None:
+    """Безопасный парсинг даты сделки ("dd.mm.yyyy") — None на пустом/мусорном значении."""
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%d.%m.%Y").date()
+    except ValueError:
+        return None
 
 
 def _task_out(task: DealTask) -> TaskOut:
@@ -1030,6 +1061,20 @@ async def _stage_kind_map(session: AsyncSession, funnel: str) -> dict[str, str]:
     return {s["code"]: s["kind"] for s in canonical_stages() if s["funnel"] == funnel}
 
 
+async def _won_pairs(session: AsyncSession) -> set[tuple[str, str]]:
+    """(funnel, код_стадии) c kind == "won" по ВСЕМ известным воронкам (канон ``FUNNELS`` +
+    материализованные в ``sales.stage``) — won-код стадии свой у каждой воронки
+    (``won``/``rp_won``/``tn_won``). Общий резолвер для ``/journal`` и ``/plan-sources``.
+    """
+    funnel_codes = {f["code"] for f in FUNNELS}
+    funnel_codes |= set((await session.execute(select(Stage.funnel).distinct())).scalars().all())
+    pairs: set[tuple[str, str]] = set()
+    for funnel in funnel_codes:
+        kind_map = await _stage_kind_map(session, funnel)
+        pairs |= {(funnel, code) for code, kind in kind_map.items() if kind == "won"}
+    return pairs
+
+
 @router.patch("/deals/{deal_id}", response_model=DealRead)
 async def update_deal(
     deal_id: int,
@@ -1418,19 +1463,13 @@ async def sales_journal(
     оплата, отгрузка) для экрана ``/crm/sales`` (лента как журнал документов 1С).
 
     Funnel-aware: won-код стадии свой у каждой воронки (``won``/``rp_won``/``tn_won``) —
-    резолвим через ``_stage_kind_map`` по КАЖДОЙ известной воронке (канон ``FUNNELS`` +
-    материализованные в ``sales.stage``), затем фильтруем по точной паре (funnel, stage) —
-    коды воронок уникальны, но пара надёжнее на случай будущего пересечения кодов.
+    резолвим общим хелпером ``_won_pairs`` (канон ``FUNNELS`` + материализованные в
+    ``sales.stage``), затем фильтруем по точной паре (funnel, stage) — коды воронок
+    уникальны, но пара надёжнее на случай будущего пересечения кодов.
     Маржа — тем же хелпером ``_deal_margin``, что и карточка/прогноз (DRY); честная
     деградация (``None`` + ``margin_reason``), НЕ 0.
     """
-    funnel_codes = {f["code"] for f in FUNNELS}
-    funnel_codes |= set((await session.execute(select(Stage.funnel).distinct())).scalars().all())
-
-    won_pairs: set[tuple[str, str]] = set()
-    for funnel in funnel_codes:
-        kind_map = await _stage_kind_map(session, funnel)
-        won_pairs |= {(funnel, code) for code, kind in kind_map.items() if kind == "won"}
+    won_pairs = await _won_pairs(session)
     if not won_pairs:
         return []
     won_codes = {code for _, code in won_pairs}
@@ -1568,6 +1607,218 @@ async def deal_handoff(
                 handed_off_at=ev.created_at,
             )
     return None
+
+
+# ── Конструктор месячного плана продавца (источники + снапшот строк) ──────────────
+@router.get("/plan-sources", response_model=PlanSourcesOut)
+async def plan_sources(
+    month: str,
+    owner: str = "",
+    owner_id: int | None = None,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Источники месячного плана продавца — конструктор собирает план из трёх источников:
+    открытые сделки месяца (``committed``, по ``expected_close_date``/``ship_deadline``),
+    постоянные клиенты по циклу перезаказа (``regulars``, из won-истории) и дефолты
+    калькулятора активности по новым (``defaults``). ``saved_items`` — уже сохранённый
+    снапшот строк (``PlanItem``, см. ``PUT /plan-items``); ``base_gross`` — согласованный
+    план ``gross_profit`` за месяц (существующий ``PlanTarget``), если он есть.
+    """
+    month_start, month_end = _month_bounds(month)
+
+    won_pairs = await _won_pairs(session)
+    deals = (await session.execute(select(Deal))).scalars().all()
+    if owner:
+        deals = [d for d in deals if d.owner == owner]
+    won_deals = [d for d in deals if (d.funnel, d.stage) in won_pairs]
+
+    # Открытые (normal) сделки — kind резолвим по СВОЕЙ воронке каждой сделки, с кэшем.
+    kind_cache: dict[str, dict[str, str]] = {}
+
+    async def _kind_map(funnel: str) -> dict[str, str]:
+        if funnel not in kind_cache:
+            kind_cache[funnel] = await _stage_kind_map(session, funnel)
+        return kind_cache[funnel]
+
+    open_deals = [d for d in deals if (await _kind_map(d.funnel)).get(d.stage, "normal") == "normal"]
+
+    # committed: expected_close_date ИЛИ ship_deadline попадают в месяц.
+    committed_rows: list[tuple[Deal, date | None, date | None, bool]] = []
+    for d in open_deals:
+        exp = _parse_ddmmyyyy(d.expected_close_date)
+        ship = _parse_ddmmyyyy(d.ship_deadline)
+        use_exp = exp is not None and month_start <= exp <= month_end
+        use_ship = ship is not None and month_start <= ship <= month_end
+        if use_exp or use_ship:
+            committed_rows.append((d, exp, ship, use_exp))
+
+    # Резерв склада — одним запросом по всем сделкам разом (не N+1).
+    reserved_deal_ids: set[int] = set()
+    committed_ids = [d.id for d, *_ in committed_rows]
+    if committed_ids:
+        reserved_deal_ids = set(
+            (
+                await session.execute(
+                    select(DealDocument.deal_id).where(
+                        DealDocument.deal_id.in_(committed_ids),
+                        DealDocument.reserve_status == "reserved",
+                    )
+                )
+            ).scalars().all()
+        )
+
+    stage_prob_cache: dict[str, dict[str, int]] = {}
+
+    async def _prob_by_stage(funnel: str) -> dict[str, int]:
+        if funnel not in stage_prob_cache:
+            stage_prob_cache[funnel] = {
+                r["id"]: r["probability"] for r in await _board_stages(session, funnel)
+            }
+        return stage_prob_cache[funnel]
+
+    committed: list[CommittedRowOut] = []
+    for d, exp, ship, use_exp in committed_rows:
+        when_label = (
+            f"закрытие ~{exp.strftime('%d.%m')}" if use_exp
+            else f"отгрузка до {ship.strftime('%d.%m')}"
+        )
+        if d.id in reserved_deal_ids:
+            when_label = f"🔒 резерв · {when_label}"
+        lines, _facade_missing = await _deal_margin(session, core, d)
+        priced = [ln for ln in lines if ln.status == "priced"]
+        gross = None
+        if priced:
+            revenue = sum((ln.revenue or 0.0) for ln in priced)
+            cogs = sum((ln.cogs or 0.0) for ln in priced)
+            gross = round(revenue - cogs, 2)
+        prob_by_stage = await _prob_by_stage(d.funnel)
+        probability = (
+            d.probability if d.probability is not None else prob_by_stage.get(d.stage, 50)
+        )
+        committed.append(
+            CommittedRowOut(
+                ref=f"deal:{d.id}", title=d.title, when_label=when_label,
+                revenue=float(d.amount), gross=gross, probability=probability,
+            )
+        )
+
+    # defaults: по won-сделкам владельца — средний чек и маржа (для regulars.gross ниже).
+    avg_check_default = (
+        round(sum(float(d.amount) for d in won_deals) / len(won_deals), 2) if won_deals else None
+    )
+    total_revenue = 0.0
+    total_gross = 0.0
+    has_priced = False
+    for d in won_deals:
+        lines, _facade_missing = await _deal_margin(session, core, d)
+        priced = [ln for ln in lines if ln.status == "priced"]
+        if priced:
+            has_priced = True
+            revenue = sum((ln.revenue or 0.0) for ln in priced)
+            cogs = sum((ln.cogs or 0.0) for ln in priced)
+            total_revenue += revenue
+            total_gross += revenue - cogs
+    margin_pct_default = (
+        round(total_gross / total_revenue * 100) if has_priced and total_revenue > 0 else None
+    )
+    defaults = CalcDefaultsOut(avg_check=avg_check_default, margin_pct=margin_pct_default)
+
+    # regulars: won-сделки, сгруппированные по контрагенту; цикл перезаказа из closed_on.
+    by_counterparty: dict[str, list[Deal]] = defaultdict(list)
+    for d in won_deals:
+        by_counterparty[d.counterparty].append(d)
+
+    regulars: list[RegularRowOut] = []
+    for cp, cp_deals in sorted(by_counterparty.items()):
+        closed_dates = sorted(
+            dt for dt in (_journal_closed_on(dl) for dl in cp_deals) if dt is not None
+        )
+        orders_count = len(cp_deals)
+        cycle_days: int | None = None
+        expected: date | None = None
+        in_month = False
+        if len(closed_dates) >= 2:
+            intervals = [
+                (closed_dates[i + 1] - closed_dates[i]).days for i in range(len(closed_dates) - 1)
+            ]
+            cycle_days = round(sum(intervals) / len(intervals))
+            expected = closed_dates[-1] + timedelta(days=cycle_days)
+            in_month = (month_start <= expected <= month_end) or (expected < month_start)
+        last_order = closed_dates[-1] if closed_dates else None
+        avg_check = round(sum(float(dl.amount) for dl in cp_deals) / len(cp_deals), 2)
+        probability = 80 if orders_count >= 3 else 60
+        gross = (
+            round(avg_check * margin_pct_default / 100, 2) if margin_pct_default is not None else None
+        )
+        regulars.append(
+            RegularRowOut(
+                counterparty=cp, orders_count=orders_count, cycle_days=cycle_days,
+                last_order=last_order.isoformat() if last_order else "",
+                expected=expected.isoformat() if expected else None,
+                in_month=in_month, avg_check=avg_check, probability=probability, gross=gross,
+            )
+        )
+
+    base_gross: float | None = None
+    if owner_id is not None:
+        plan = (
+            await session.execute(
+                select(PlanTarget).where(
+                    PlanTarget.owner_id == owner_id,
+                    PlanTarget.metric == "gross_profit",
+                    PlanTarget.period_type == "month",
+                    PlanTarget.period_key == month,
+                    PlanTarget.status == "approved",
+                )
+            )
+        ).scalars().first()
+        base_gross = float(plan.target) if plan is not None else None
+
+    saved_items: list[PlanItem] = []
+    if owner_id is not None:
+        saved_items = (
+            await session.execute(
+                select(PlanItem)
+                .where(PlanItem.owner_id == owner_id, PlanItem.period_key == month)
+                .order_by(PlanItem.id)
+            )
+        ).scalars().all()
+
+    return PlanSourcesOut(
+        month=month, owner=owner or None, base_gross=base_gross,
+        committed=committed, regulars=regulars, defaults=defaults, saved_items=saved_items,
+    )
+
+
+@router.put("/plan-items", response_model=list[PlanItemOut])
+async def put_plan_items(
+    owner_id: int,
+    period_key: str,
+    payload: list[PlanItemIn],
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Заменить целиком (replace-all) снапшот строк конструктора плана продавца за месяц.
+
+    Пустой ``payload`` — валидный способ очистить снапшот. Строки не участвуют в
+    approvals сами по себе — согласование идёт существующим ``PlanTarget``
+    (``POST /plans`` + ``/submit`` + ``/decide``), продавец сам суммирует строки в цель.
+    """
+    _month_bounds(period_key)  # 422 на кривом формате, границы месяца здесь не нужны
+    await session.execute(
+        delete(PlanItem).where(PlanItem.owner_id == owner_id, PlanItem.period_key == period_key)
+    )
+    items = [
+        PlanItem(owner_id=owner_id, period_key=period_key, **item.model_dump())
+        for item in payload
+    ]
+    session.add_all(items)
+    await session.commit()
+    for item in items:
+        await session.refresh(item)
+    return items
 
 
 # ── Встречное планирование РОП (PlanTarget): продавец предлагает, РОП согласует ────

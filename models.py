@@ -344,6 +344,34 @@ class PlanTarget(Base):
     approved_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
+class PlanItem(Base):
+    """Строка декомпозиции месячного плана продавца (конструктор плана).
+
+    Источник строки (``source``): ``committed`` (открытая сделка месяца), ``regular``
+    (постоянный клиент по циклу перезаказа) или ``activity`` (калькулятор активности по
+    новым). Снапшот целиком на (``owner_id``, ``period_key``) — сохраняется через
+    ``PUT /plan-items`` (replace-all, без истории версий); отправка РОПу идёт существующим
+    механизмом ``PlanTarget`` (сумма строк → метрика ``gross_profit``), сам ``PlanItem``
+    в approvals не участвует.
+    """
+
+    __tablename__ = "plan_item"
+    __table_args__ = {"schema": "sales"}
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column()
+    period_key: Mapped[str] = mapped_column(String(10))  # месяц "2026-08"
+    source: Mapped[str] = mapped_column(String(16))  # committed|regular|activity
+    ref: Mapped[str] = mapped_column(String(64))
+    title: Mapped[str] = mapped_column(String(255))
+    when_label: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    revenue: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0"), server_default="0")
+    gross: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0"), server_default="0")
+    probability: Mapped[int] = mapped_column(default=100, server_default="100")
+    enabled: Mapped[bool] = mapped_column(default=True, server_default="true")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class CompanyBranding(Base):
     """Лого продавца для печатных форм (счёт-протокол/договор) — singleton (id=1).
 

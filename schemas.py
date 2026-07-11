@@ -584,6 +584,80 @@ class JournalRowOut(BaseModel):
     shipment: Literal["delivered", "none"] = "none"
 
 
+PlanItemSource = Literal["committed", "regular", "activity"]
+
+
+class PlanItemIn(BaseModel):
+    """Строка конструктора плана продавца — вход ``PUT /plan-items`` (снапшот, replace-all)."""
+
+    source: PlanItemSource
+    ref: str = Field(min_length=1, max_length=64)
+    title: str = Field(min_length=1, max_length=255)
+    when_label: str = ""
+    revenue: float = 0.0
+    gross: float = 0.0
+    probability: int = Field(default=100, ge=0, le=100)
+    enabled: bool = True
+
+
+class PlanItemOut(PlanItemIn):
+    """Сохранённая строка конструктора плана — ``PlanItemIn`` + идентификаторы снапшота."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    owner_id: int
+    period_key: str
+
+
+class CommittedRowOut(BaseModel):
+    """Открытая сделка месяца — источник «сделки месяца» конструктора плана продавца."""
+
+    ref: str
+    title: str
+    when_label: str
+    revenue: float
+    gross: float | None = None
+    probability: int
+
+
+class RegularRowOut(BaseModel):
+    """Постоянный клиент по циклу перезаказа — источник «постоянные клиенты» конструктора."""
+
+    counterparty: str
+    orders_count: int
+    cycle_days: int | None = None
+    last_order: str  # ISO yyyy-mm-dd
+    expected: str | None = None  # ISO yyyy-mm-dd
+    in_month: bool
+    avg_check: float
+    probability: int
+    gross: float | None = None
+
+
+class CalcDefaultsOut(BaseModel):
+    """Дефолты калькулятора активности по новым — источник «новые» конструктора плана."""
+
+    avg_check: float | None = None
+    margin_pct: int | None = None
+
+
+class PlanSourcesOut(BaseModel):
+    """Источники месячного плана продавца (``GET /plan-sources``) — конструктор плана:
+    открытые сделки месяца (``committed``), постоянные клиенты по циклу перезаказа
+    (``regulars``), дефолты калькулятора активности (``defaults``) и уже сохранённый
+    снапшот строк (``saved_items``, ``PlanItem`` через ``PUT /plan-items``).
+    """
+
+    month: str
+    owner: str | None = None
+    base_gross: float | None = None
+    committed: list[CommittedRowOut] = []
+    regulars: list[RegularRowOut] = []
+    defaults: CalcDefaultsOut
+    saved_items: list[PlanItemOut] = []
+
+
 class ActivityCreate(BaseModel):
     """Отметка факта активности (звонок, заявка, отгрузка)."""
 
