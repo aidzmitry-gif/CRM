@@ -1922,17 +1922,19 @@ async def list_chats(session: AsyncSession = Depends(get_session)):
     except (OperationalError, ProgrammingError):
         await session.rollback()
         return []
-    # SALES-49: непрочитанные входящие по сделкам (для бейджа в панели чатов)
-    unread_map = {
-        deal_id: int(n)
-        for deal_id, n in (
-            await session.execute(
-                select(Message.deal_id, func.count())
-                .where(Message.direction == "in", Message.read_at.is_(None))
-                .group_by(Message.deal_id)
-            )
-        ).all()
-    }
+    # SALES-49: непрочитанные входящие по сделкам (для бейджа в панели чатов).
+    # Цикл 17: тем же агрегатом — created_at самого старого непрочитанного (waiting_since).
+    unread_map: dict[int, int] = {}
+    waiting_since_map: dict[int, datetime] = {}
+    for deal_id, n, oldest in (
+        await session.execute(
+            select(Message.deal_id, func.count(), func.min(Message.created_at))
+            .where(Message.direction == "in", Message.read_at.is_(None))
+            .group_by(Message.deal_id)
+        )
+    ).all():
+        unread_map[deal_id] = int(n)
+        waiting_since_map[deal_id] = oldest
     chats: list[ChatOut] = []
     seen: set[int] = set()
     for m in msgs:
@@ -1949,6 +1951,7 @@ async def list_chats(session: AsyncSession = Depends(get_session)):
                 channel=m.channel,
                 direction=m.direction,
                 unread=unread_map.get(m.deal_id, 0),
+                waiting_since=waiting_since_map.get(m.deal_id),
             )
         )
         if len(chats) >= 20:

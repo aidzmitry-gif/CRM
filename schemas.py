@@ -196,6 +196,9 @@ class ChatOut(BaseModel):
     channel: str
     direction: str
     unread: int = 0  # SALES-49: непрочитанных входящих по диалогу
+    # Цикл 17: с какого момента клиент ждёт ответа (created_at самого старого
+    # непрочитанного входящего); None — непрочитанных нет.
+    waiting_since: datetime.datetime | None = None
 
 
 class PriceQuoteCreate(BaseModel):
