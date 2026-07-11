@@ -1010,6 +1010,25 @@ async def _emit_ship_deadline(session: AsyncSession, core: Core, deal: Deal) -> 
     )
 
 
+async def _stage_kind_map(session: AsyncSession, funnel: str) -> dict[str, str]:
+    """code → kind (won|lost|cond_lost|normal) для активных стадий воронки.
+
+    Источник — таблица ``Stage``; если для воронки она не материализована (пусто),
+    фолбэк на канон ``stages.py``. Общий резолвер для win_deal (won-код воронки) и
+    update_deal (терминальность стадии при реверсе) — цикл 18 верификации.
+    """
+    rows = (
+        await session.execute(
+            select(Stage.code, Stage.kind)
+            .where(Stage.funnel == funnel, Stage.is_active)
+            .order_by(Stage.sort_order)
+        )
+    ).all()
+    if rows:
+        return {code: kind for code, kind in rows}
+    return {s["code"]: s["kind"] for s in canonical_stages() if s["funnel"] == funnel}
+
+
 @router.patch("/deals/{deal_id}", response_model=DealRead)
 async def update_deal(
     deal_id: int,
@@ -1032,20 +1051,16 @@ async def update_deal(
     # стадий целевой воронки (новой, если меняем; иначе текущей).
     target_funnel = new_funnel if new_funnel is not None else deal.funnel
     if new_stage is not None and new_stage != deal.stage:
-        valid_codes = {
-            r.code for r in (
-                await session.execute(
-                    select(Stage).where(Stage.funnel == target_funnel, Stage.is_active)
-                )
-            ).scalars().all()
-        }
-        if not valid_codes:  # таблица стадий не материализована → канон
-            valid_codes = {s["code"] for s in canonical_stages() if s["funnel"] == target_funnel}
-        if new_stage not in valid_codes:
+        kind_by_code = await _stage_kind_map(session, target_funnel)
+        if new_stage not in kind_by_code:
             raise HTTPException(
                 status_code=422,
                 detail=f"Стадия {new_stage!r} не принадлежит воронке {target_funnel!r}",
             )
+        # Фикс 2 (цикл 18 верификации): реверс в НЕтерминальную стадию (normal/cond_lost) —
+        # сбросить closed_date, иначе сделка, возвращённая в работу, числится закрытой в отчётах.
+        if kind_by_code.get(new_stage, "normal") not in ("won", "lost") and deal.closed_date:
+            deal.closed_date = None
     # Смена воронки фиксируется в истории как смена стадии (источник → стадия первой стадии
     # новой воронки), чтобы фронт-таймлайн не терял этот шаг; реальный новый стадия-код может
     # прилететь следующим PATCH (drag&drop на доске уже другой воронки).
@@ -1605,14 +1620,21 @@ async def win_deal(
     user: CurrentUser = Depends(get_current_user),
 ):
     """Закрыть сделку успешно (SALES-40). Единый путь с логистикой (`record_stage`):
-    стадия ``won``, дата закрытия, событие ``sales.deal.won`` (→ audit)."""
+    стадия ``won`` воронки сделки, дата закрытия, событие ``sales.deal.won`` (→ audit).
+
+    Фикс 1 (цикл 18 верификации): won-код резолвится по воронке сделки, а не литералом
+    "won" — для repeat_clients/tenders это rp_won/tn_won; литерал "won" не входит ни в одну
+    их колонку и после перезагрузки сделка пропадала с доски.
+    """
     deal = await DealRepository(session).get(deal_id)
     if deal is None:
         raise HTTPException(status_code=404, detail="Сделка не найдена")
-    if deal.stage == "won":
+    kind_map = await _stage_kind_map(session, deal.funnel)
+    won_code = next((code for code, kind in kind_map.items() if kind == "won"), "won")
+    if deal.stage == won_code:
         raise HTTPException(status_code=409, detail="Сделка уже выиграна")
     deal.closed_date = date.today().strftime("%d.%m.%Y")
-    record_stage(session, deal, "won", by=user.username)
+    record_stage(session, deal, won_code, by=user.username)
     core.event_bus.emit(
         session,
         "sales.deal.won",
@@ -1956,6 +1978,34 @@ async def list_chats(session: AsyncSession = Depends(get_session)):
         )
         if len(chats) >= 20:
             break
+    # Цикл 18 (фикс верификации): непрочитанные диалоги — first-class, не заложники окна
+    # топ-100/капа-20. Сделка с непрочитанным, чьё последнее сообщение старше окна 100,
+    # иначе вообще не попадала бы в ответ — доска не показала бы «клиент ждёт».
+    missing = [d for d in unread_map if d not in seen and d in deals]
+    if missing:
+        extra_msgs = (
+            await session.execute(
+                select(Message).where(Message.deal_id.in_(missing)).order_by(Message.id.desc())
+            )
+        ).scalars().all()
+        seen_missing: set[int] = set()
+        for m in extra_msgs:
+            if m.deal_id in seen_missing:
+                continue
+            seen_missing.add(m.deal_id)
+            deal = deals[m.deal_id]
+            chats.append(
+                ChatOut(
+                    deal_id=m.deal_id,
+                    number=deal.number,
+                    company=deal.counterparty,
+                    last_text=m.text,
+                    channel=m.channel,
+                    direction=m.direction,
+                    unread=unread_map.get(m.deal_id, 0),
+                    waiting_since=waiting_since_map.get(m.deal_id),
+                )
+            )
     return chats
 
 
