@@ -1580,12 +1580,18 @@ async def lose_deal(
     """Закрыть сделку в отказ с обязательной причиной (SALES-40).
 
     Причина обязательна; если справочник заполнен — должна быть активным кодом.
-    Ставит стадию ``lost`` (через ``record_stage`` → история + ``stage_changed_at``),
-    дату закрытия и публикует ``sales.deal.lost`` (→ audit)."""
+    Ставит lost-стадию воронки сделки (через ``record_stage`` → история +
+    ``stage_changed_at``), дату закрытия и публикует ``sales.deal.lost`` (→ audit).
+
+    Как и в win_deal (Фикс 1, цикл 18): lost-код резолвится по воронке сделки, а не
+    литералом "lost" — для repeat_clients/tenders это rp_lost/tn_lost; литерал "lost"
+    не входит ни в одну их колонку и сделка пропадала бы с доски."""
     deal = await DealRepository(session).get(deal_id)
     if deal is None:
         raise HTTPException(status_code=404, detail="Сделка не найдена")
-    if deal.stage == "lost":
+    kind_map = await _stage_kind_map(session, deal.funnel)
+    lost_code = next((code for code, kind in kind_map.items() if kind == "lost"), "lost")
+    if deal.stage == lost_code:
         raise HTTPException(status_code=409, detail="Сделка уже закрыта в отказ")
     code = (payload.reason_code or "").strip()
     if not code:
@@ -1599,7 +1605,7 @@ async def lose_deal(
     deal.lost_reason_code = code
     deal.lost_comment = payload.comment
     deal.closed_date = date.today().strftime("%d.%m.%Y")
-    record_stage(session, deal, "lost", by=user.username)
+    record_stage(session, deal, lost_code, by=user.username)
     core.event_bus.emit(
         session,
         "sales.deal.lost",
