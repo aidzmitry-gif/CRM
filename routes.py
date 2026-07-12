@@ -2564,10 +2564,26 @@ def _seller_requisites(core: Core) -> dict[str, str]:
 _LOGO_MAX_LEN = 1_400_000
 
 
-async def _current_logo(session: AsyncSession) -> str | None:
-    """Текущее лого продавца (data-URI) или None — singleton-строка id=1."""
-    row = await session.get(CompanyBranding, 1)
-    return row.logo_data_url if row else None
+async def _current_branding(session: AsyncSession) -> CompanyBranding | None:
+    """Текущий блок факсимиле продавца (лого/печать/подпись) — singleton-строка id=1."""
+    return await session.get(CompanyBranding, 1)
+
+
+def _branding_out(row: CompanyBranding | None) -> BrandingOut:
+    return BrandingOut(
+        logo_data_url=row.logo_data_url if row else None,
+        stamp_data_url=row.stamp_data_url if row else None,
+        signature_data_url=row.signature_data_url if row else None,
+    )
+
+
+def _seller_with_facsimile(core: Core, branding: CompanyBranding | None) -> dict:
+    """Реквизиты продавца + факсимиле (лого/печать/подпись) для печатных форм."""
+    seller = _seller_requisites(core)
+    seller["logo_data_url"] = (branding.logo_data_url if branding else None) or ""
+    seller["stamp_data_url"] = branding.stamp_data_url if branding else None
+    seller["signature_data_url"] = branding.signature_data_url if branding else None
+    return seller
 
 
 @router.get("/branding", response_model=BrandingOut)
@@ -2575,8 +2591,8 @@ async def get_branding(
     session: AsyncSession = Depends(get_session),
     _: object = Depends(require_permission("sales.deal.read")),
 ):
-    """Текущее лого продавца для печатных форм (honest-empty — None, не 404)."""
-    return BrandingOut(logo_data_url=await _current_logo(session))
+    """Факсимиле продавца для печатных форм: лого/печать/подпись (honest-empty — None, не 404)."""
+    return _branding_out(await _current_branding(session))
 
 
 @router.put("/branding", response_model=BrandingOut)
@@ -2585,21 +2601,33 @@ async def put_branding(
     session: AsyncSession = Depends(get_session),
     _: object = Depends(require_permission("sales.deal.write")),
 ):
-    """Загрузить/заменить лого продавца. Клиент кодирует файл в data-URI (FileReader) —
-    сервер multipart не принимает (в проекте нет паттерна загрузки бинарных файлов).
+    """Загрузить/заменить факсимиле продавца (лого/печать/подпись) — частичное обновление.
+    Клиент кодирует файл в data-URI (FileReader) — сервер multipart не принимает (в проекте
+    нет паттерна загрузки бинарных файлов). Обновляются только переданные (не None) поля.
     """
-    if not payload.logo_data_url.startswith("data:image/"):
-        raise HTTPException(status_code=422, detail="Ожидается data-URI изображения (data:image/...)")
-    if len(payload.logo_data_url) > _LOGO_MAX_LEN:
-        raise HTTPException(status_code=422, detail="Файл слишком большой (лимит ~1 МБ)")
+    updates = {
+        k: v
+        for k, v in (
+            ("logo_data_url", payload.logo_data_url),
+            ("stamp_data_url", payload.stamp_data_url),
+            ("signature_data_url", payload.signature_data_url),
+        )
+        if v is not None
+    }
+    for value in updates.values():
+        if not value.startswith("data:image/"):
+            raise HTTPException(status_code=422, detail="Ожидается data-URI изображения (data:image/...)")
+        if len(value) > _LOGO_MAX_LEN:
+            raise HTTPException(status_code=422, detail="Файл слишком большой (лимит ~1 МБ)")
     row = await session.get(CompanyBranding, 1)
     if row is None:
-        row = CompanyBranding(id=1, logo_data_url=payload.logo_data_url)
+        row = CompanyBranding(id=1, **updates)
         session.add(row)
     else:
-        row.logo_data_url = payload.logo_data_url
+        for k, v in updates.items():
+            setattr(row, k, v)
     await session.commit()
-    return BrandingOut(logo_data_url=row.logo_data_url)
+    return _branding_out(row)
 
 
 async def _buyer_requisites(
@@ -2642,9 +2670,44 @@ async def _contract_items(session: AsyncSession, deal_id: int) -> list[str]:
     return lines
 
 
-def _render_contract(body: str, ctx: dict[str, str]) -> str:
-    """Подставить плейсхолдеры {{key}} (плоские ключи seller.name/buyer.unp/…)."""
-    return _PLACEHOLDER.sub(lambda m: ctx.get(m.group(1), ""), body)
+def _render_contract(body: str, ctx: dict[str, str], facsimile: str = "") -> str:
+    """Подставить плейсхолдеры {{key}} (плоские ключи seller.name/buyer.unp/…).
+
+    ``facsimile`` — хвостовой блок подписей/печати, добавляется ПОСЛЕ тела договора
+    (пусто, если факсимиле не загружено) — единый источник факсимиле на договоре.
+    """
+    return _PLACEHOLDER.sub(lambda m: ctx.get(m.group(1), ""), body) + facsimile
+
+
+def _contract_facsimile_block(seller: dict) -> str:
+    """Стандартный хвост договора «Поставщик [подпись][печать] / Покупатель [подпись]».
+
+    Рисуется только если у продавца есть подпись или печать — иначе честно пусто
+    (живые подписи ставят вручную). Стили инлайновые: тело договора — произвольный шаблон.
+    """
+    sig, stamp = seller.get("signature_data_url"), seller.get("stamp_data_url")
+    if not sig and not stamp:
+        return ""
+    sig_img = (
+        f'<img src="{_esc(sig)}" alt="подпись" style="max-height:44px;max-width:150px">' if sig else ""
+    )
+    stamp_img = (
+        f'<img src="{_esc(stamp)}" alt="печать" '
+        'style="max-height:120px;max-width:150px;opacity:.85;margin-left:8px">'
+        if stamp
+        else ""
+    )
+    director = _esc(seller.get("director", ""))
+    return (
+        '<div style="display:flex;gap:60px;margin-top:36px;font-family:Arial,sans-serif;font-size:13px">'
+        '<div><div style="font-weight:700;margin-bottom:4px">Поставщик</div>'
+        f'<div style="height:78px;display:flex;align-items:flex-end">{sig_img}{stamp_img}</div>'
+        f'<div style="border-top:1px solid #000;padding-top:3px;width:220px">{director}</div></div>'
+        '<div><div style="font-weight:700;margin-bottom:4px">Покупатель</div>'
+        '<div style="height:78px"></div>'
+        '<div style="border-top:1px solid #000;padding-top:3px;width:220px">&nbsp;</div></div>'
+        "</div>"
+    )
 
 
 # ──────────────────────── Счёт по шаблону (печатная форма sales-invoice-template.html) ────────────────────────
@@ -2714,6 +2777,18 @@ def _req_line(p: dict) -> str:
     return ", ".join(parts)
 
 
+def _facsimile_sig(seller: dict) -> str:
+    """Факсимиле подписи руководителя над линией «подпись» — пусто, если не загружено."""
+    url = seller.get("signature_data_url")
+    return f'<img class="sig" src="{_esc(url)}" alt="подпись">' if url else ""
+
+
+def _facsimile_stamp(seller: dict) -> str:
+    """Полупрозрачный overlay печати возле блока подписей — пусто, если не загружено."""
+    url = seller.get("stamp_data_url")
+    return f'<img class="stamp" src="{_esc(url)}" alt="печать">' if url else ""
+
+
 def _render_invoice(
     doc: DealDocument, deal: Deal | None, seller: dict, buyer: dict, items: list[dict]
 ) -> str:
@@ -2758,12 +2833,14 @@ def _render_invoice(
   .sums{{margin:8px 0 4px;font-size:12.5px}}
   .sums .row{{margin:3px 0}}
   .order{{margin:12px 0;font-size:12.5px}}
-  .sign{{display:flex;gap:50px;margin-top:26px;font-size:12px}}
+  .sign{{display:flex;gap:50px;margin-top:26px;font-size:12px;position:relative}}
   .sign .role{{font-weight:700;width:110px}}
   .sign .line{{flex:1;max-width:230px}}
   .sign .ln{{border-bottom:1px solid var(--ink);height:20px;position:relative}}
   .sign .ln .nm{{position:absolute;right:6px;bottom:2px;font-weight:700}}
+  .sign .ln .sig{{position:absolute;left:8px;bottom:1px;max-height:42px;max-width:150px}}
   .sign .cap{{font-size:9.5px;color:var(--soft);text-align:center;margin-top:2px}}
+  .stamp{{position:absolute;left:150px;top:-18px;opacity:.85;max-width:150px;max-height:150px;pointer-events:none}}
   .terms{{margin-top:20px;font-size:11px;line-height:1.5}}
   .terms .b{{font-weight:700}}
   .logo{{margin-bottom:14px}}
@@ -2793,8 +2870,9 @@ def _render_invoice(
   <div class="order">Оплата по заказу клиента № {_esc(order_no)}</div>
   <div class="sign">
     <div class="role">Руководитель</div>
-    <div class="line"><div class="ln"></div><div class="cap">подпись</div></div>
+    <div class="line"><div class="ln">{_facsimile_sig(seller)}</div><div class="cap">подпись</div></div>
     <div class="line"><div class="ln"><span class="nm">{_esc(seller.get("director", ""))}</span></div><div class="cap">расшифровка подписи</div></div>
+    {_facsimile_stamp(seller)}
   </div>
   <div class="sign">
     <div class="role">Бухгалтер</div>
@@ -2941,6 +3019,72 @@ async def prepare_contract(
     return doc
 
 
+async def _invoice_html(session: AsyncSession, doc: DealDocument, seller: dict) -> str:
+    """HTML счёта-протокола (реквизиты продавца + факсимиле уже в ``seller``)."""
+    deal = await DealRepository(session).get(doc.deal_id)
+    buyer = (doc.terms_json or {}).get("buyer") or {"name": deal.counterparty if deal else ""}
+    items = await _invoice_items(session, doc.deal_id)
+    return _render_invoice(doc, deal, seller, buyer, items)
+
+
+async def _contract_html(session: AsyncSession, core: Core, doc: DealDocument, seller: dict) -> str:
+    """HTML договора: по шаблону + хвостовой блок факсимиле, либо честная обложка «по форме
+    клиента», если шаблон не задан (issueClientContract) — чтобы «открыть»/пакет не падали 409."""
+    items = "; ".join(await _contract_items(session, doc.deal_id))
+    buyer = (doc.terms_json or {}).get("buyer", {})
+    tpl = await session.get(ContractTemplate, doc.template_id) if doc.template_id else None
+    if tpl is None:
+        return _contract_cover_html(doc, seller, buyer, items)
+    deal = await DealRepository(session).get(doc.deal_id)
+    ctx = {
+        "number": doc.number,
+        "items": items,
+        "total": f"{float(doc.amount):.2f} BYN",
+        "payment_terms": doc.payment_terms or "",
+        "delivery_terms": doc.delivery_terms or "",
+        "valid_until": doc.valid_until.isoformat() if doc.valid_until else "",
+        "deal": deal.number if deal else "",
+    }
+    ctx.update({f"seller.{k}": v for k, v in _seller_requisites(core).items()})
+    ctx.update({f"buyer.{k}": str(v) for k, v in buyer.items()})
+    return _render_contract(tpl.body, ctx, _contract_facsimile_block(seller))
+
+
+def _contract_cover_html(doc: DealDocument, seller: dict, buyer: dict, items: str) -> str:
+    """Обложка договора «по форме клиента» (шаблон не задан): реквизиты + предмет + сумма +
+    факсимиле продавца. Сам договор — бумага клиента; это подписанная обложка поставщика."""
+    logo = seller.get("logo_data_url")
+    rows = [
+        ("Поставщик:", _req_line(seller)),
+        ("Покупатель:", _req_line(buyer)),
+        ("Предмет:", _esc(items)),
+        ("Сумма:", f"{float(doc.amount):.2f} BYN"),
+    ]
+    if doc.payment_terms:
+        rows.append(("Оплата:", _esc(doc.payment_terms)))
+    if doc.delivery_terms:
+        rows.append(("Поставка:", _esc(doc.delivery_terms)))
+    body = "".join(
+        f'<div style="margin:6px 0"><b>{lbl}</b> {val}</div>' for lbl, val in rows
+    )
+    return (
+        f'<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">'
+        f"<title>Договор № {_esc(doc.number)}</title></head>"
+        '<body style="font-family:Arial,sans-serif;font-size:13px;color:#0f172a">'
+        '<div style="max-width:820px;margin:0 auto;padding:34px 40px">'
+        + (
+            f'<div style="margin-bottom:14px"><img src="{_esc(logo)}" style="max-height:60px"></div>'
+            if logo
+            else ""
+        )
+        + f'<h1 style="text-align:center;font-size:16px;margin:6px 0 2px">Договор № {_esc(doc.number)}</h1>'
+        '<div style="text-align:center;color:#64748b;margin-bottom:16px">Оформлен по форме клиента</div>'
+        + body
+        + _contract_facsimile_block(seller)
+        + "</div></body></html>"
+    )
+
+
 @router.get("/documents/{doc_id}/render", response_class=HTMLResponse)
 async def render_document(
     doc_id: int,
@@ -2957,35 +3101,64 @@ async def render_document(
     if doc is None:
         raise HTTPException(status_code=404, detail="Документ не найден")
 
+    seller = _seller_with_facsimile(core, await _current_branding(session))
     if doc.kind == "invoice":
-        deal = await DealRepository(session).get(doc.deal_id)
-        seller = _seller_requisites(core)
-        seller["logo_data_url"] = await _current_logo(session) or ""
-        buyer = (doc.terms_json or {}).get("buyer") or {"name": deal.counterparty if deal else ""}
-        items = await _invoice_items(session, doc.deal_id)
-        return HTMLResponse(_render_invoice(doc, deal, seller, buyer, items))
-
+        return HTMLResponse(await _invoice_html(session, doc, seller))
     if doc.kind != "contract":
         raise HTTPException(
             status_code=400, detail="Рендер по шаблону — только для договора/счёта"
         )
-    tpl = await session.get(ContractTemplate, doc.template_id) if doc.template_id else None
-    if tpl is None:
-        raise HTTPException(status_code=409, detail="У договора не задан шаблон")
-    deal = await DealRepository(session).get(doc.deal_id)
-    buyer = (doc.terms_json or {}).get("buyer", {})
-    ctx = {
-        "number": doc.number,
-        "items": "; ".join(await _contract_items(session, doc.deal_id)),
-        "total": f"{float(doc.amount):.2f} BYN",
-        "payment_terms": doc.payment_terms or "",
-        "delivery_terms": doc.delivery_terms or "",
-        "valid_until": doc.valid_until.isoformat() if doc.valid_until else "",
-        "deal": deal.number if deal else "",
-    }
-    ctx.update({f"seller.{k}": v for k, v in _seller_requisites(core).items()})
-    ctx.update({f"buyer.{k}": str(v) for k, v in buyer.items()})
-    return HTMLResponse(_render_contract(tpl.body, ctx))
+    return HTMLResponse(await _contract_html(session, core, doc, seller))
+
+
+async def _package_docs(
+    session: AsyncSession, deal_id: int
+) -> tuple[DealDocument | None, DealDocument | None]:
+    """Документы пакета: последний проведённый/оплаченный счёт + последний договор.
+
+    Единый выбор для ``send_package`` и рендера пакета — чтобы состав пакета не разъехался.
+    """
+    docs = (
+        await session.execute(
+            select(DealDocument)
+            .where(
+                DealDocument.deal_id == deal_id,
+                DealDocument.status.in_(("posted", "paid")),
+            )
+            .order_by(DealDocument.id.desc())
+        )
+    ).scalars().all()
+    invoice = next((d for d in docs if d.kind == "invoice"), None)
+    contract = next((d for d in docs if d.kind == "contract"), None)
+    return invoice, contract
+
+
+@router.get("/deals/{deal_id}/package/render", response_class=HTMLResponse)
+async def render_package(
+    deal_id: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: object = Depends(require_permission("sales.deal.read")),
+):
+    """Печатный пакет «счёт + договор» на одном листе (Ctrl+P → PDF).
+
+    Тот же выбор документов, что и в ``send_package``. Счёт, затем разрыв страницы,
+    затем договор — с наложенным факсимиле (печать/подпись) продавца.
+    """
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    invoice, contract = await _package_docs(session, deal_id)
+    if invoice is None or contract is None:
+        raise HTTPException(
+            status_code=409, detail="Нужны проведённый счёт и согласованный договор"
+        )
+    seller = _seller_with_facsimile(core, await _current_branding(session))
+    invoice_html = await _invoice_html(session, invoice, seller)
+    contract_html = await _contract_html(session, core, contract, seller)
+    return HTMLResponse(
+        f'{invoice_html}<div style="page-break-before:always"></div>{contract_html}'
+    )
 
 
 @router.post("/deals/{deal_id}/send-package", response_model=PackageSentOut)
@@ -3005,19 +3178,7 @@ async def send_package(
     deal = await DealRepository(session).get(deal_id)
     if deal is None:
         raise HTTPException(status_code=404, detail="Сделка не найдена")
-    docs = (
-        await session.execute(
-            select(DealDocument)
-            .where(
-                DealDocument.deal_id == deal_id,
-                DealDocument.status.in_(("posted", "paid")),
-            )
-            .order_by(DealDocument.id.desc())
-        )
-    ).scalars().all()
-    # счёт — проведённый/оплаченный; договор — проведённый (после согласования)
-    invoice = next((d for d in docs if d.kind == "invoice"), None)
-    contract = next((d for d in docs if d.kind == "contract"), None)
+    invoice, contract = await _package_docs(session, deal_id)
     if invoice is None or contract is None:
         raise HTTPException(
             status_code=409, detail="Нужны проведённый счёт и согласованный договор"

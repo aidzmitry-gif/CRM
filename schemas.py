@@ -4,7 +4,7 @@ from __future__ import annotations
 import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class DealCreate(BaseModel):
@@ -874,13 +874,27 @@ class TelephonyEventIn(BaseModel):
 
 
 class BrandingOut(BaseModel):
-    """Текущее лого продавца для печатных форм (счёт/договор). ``None`` — не загружено."""
+    """Факсимиле продавца для печатных форм (счёт/договор). ``None`` — не загружено.
+
+    ``stamp`` — печать (штамп), ``signature`` — подпись руководителя.
+    """
 
     logo_data_url: str | None = None
+    stamp_data_url: str | None = None
+    signature_data_url: str | None = None
 
 
 class BrandingIn(BaseModel):
-    """Загрузка/замена лого. ``logo_data_url`` — data-URI (``data:image/...;base64,...``),
-    формируется на клиенте через FileReader — сервер файлы не парсит (нет multipart)."""
+    """Частичное обновление факсимиле. Каждое поле — data-URI (``data:image/...;base64,...``),
+    формируется на клиенте через FileReader — сервер файлы не парсит (нет multipart).
+    Обновляются ТОЛЬКО переданные (не ``None``) ключи; нужно хотя бы одно изображение."""
 
-    logo_data_url: str = Field(min_length=1)
+    logo_data_url: str | None = None
+    stamp_data_url: str | None = None
+    signature_data_url: str | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one(self) -> "BrandingIn":
+        if self.logo_data_url is None and self.stamp_data_url is None and self.signature_data_url is None:
+            raise ValueError("Нужно хотя бы одно изображение")
+        return self

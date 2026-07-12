@@ -386,4 +386,6 @@ class CompanyBranding(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     logo_data_url: Mapped[str | None] = mapped_column(Text)
+    stamp_data_url: Mapped[str | None] = mapped_column(Text)  # печать (штамп) — факсимиле
+    signature_data_url: Mapped[str | None] = mapped_column(Text)  # подпись руководителя — факсимиле
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
