@@ -1538,6 +1538,15 @@ async def deal_margin_reconcile(
     — наш расчёт (landed snapshot фасада, как карточка); ``finance_actual_gross`` — та же выручка
     минус landed из аудита событий (БЕЗ импорта finance/procurement). Нет landed-событий по
     позициям → ``no_finance`` (никогда не 500). ``delta`` = sales − finance.
+
+    ⚠ BLOCKED-office (PC3): сегодня ``price_cost`` не подключён → ``ln.cogs`` = landed, сверка
+    landed-vs-landed (как задумано). Когда подключат 1С, себес карточки может прийти из 1С и
+    перекрыть landed (приоритет источников в ``_deal_margin``); тогда ``sales_forecast_gross``
+    будет по 1С-себесу, а ``finance_actual_gross`` — по landed из аудита, и ``delta`` покажет
+    РАЗНИЦУ ИСТОЧНИКОВ, а не расхождение прогноза с фактом (ложный ``diverged``). Что именно
+    сверять при живой 1С (landed-vs-landed строго ∨ 1С-vs-landed как самостоятельную сверку) —
+    решение оператора на реальных данных (память cost-price-from-1c-decision, офисный чек-лист
+    п.4). Не гадаем здесь; правим вместе с наполнением 1С в integrations.
     """
     deal = await DealRepository(session).get(deal_id)
     if deal is None:
