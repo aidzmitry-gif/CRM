@@ -404,6 +404,7 @@ class PlanTargetOut(BaseModel):
     status: PlanStatus
     approved_by: str | None = None
     approved_at: datetime.datetime | None = None
+    rop_comment: str | None = None
 
 
 class PlanTargetIn(BaseModel):
@@ -417,10 +418,20 @@ class PlanTargetIn(BaseModel):
 
 
 class PlanDecisionIn(BaseModel):
-    """Решение РОП по плану: approve/reject + опц. комментарий."""
+    """Решение РОП по плану: approve/reject + опц. комментарий (→ ``rop_comment``)."""
 
     approved: bool
     comment: str | None = None
+
+
+class PlanReopenIn(BaseModel):
+    """Возврат согласованного плана в работу (``approved`` → ``draft``): опц. причина.
+
+    Один путь и для «↻ Пересмотр» (продавец переигрывает своё число), и для «Вернуть на
+    доработку» (РОП). ``reason`` — если задан, пишется в ``rop_comment``.
+    """
+
+    reason: str | None = None
 
 
 class StageAnalytics(BaseModel):

@@ -112,6 +112,7 @@ from modules.sales.schemas import (
     PlanDecisionIn,
     PlanItemIn,
     PlanItemOut,
+    PlanReopenIn,
     PlanSourcesOut,
     PlanTargetIn,
     PlanTargetOut,
@@ -781,8 +782,88 @@ async def delete_stage(
 MONTH_PERIOD_RE = re.compile(r"^(\d{4})-(\d{2})$")
 
 
+async def _month_facts(session: AsyncSession, year: int, month: int) -> dict[str, float]:
+    """Факт метрик за календарный месяц (Activity-агрегат + операционные факты).
+
+    Зеркалит месячную ветку ``/kpis``: ручные ``Activity`` за месяц, поверх — операционные
+    факты (звонки/выручка/сделки) для ключей, где они важнее ручной отметки. Нужен для
+    кумулятивного добора: факт прошлых месяцев года.
+    """
+    _, days_in_month = calendar.monthrange(year, month)
+    start, end = date(year, month, 1), date(year, month, days_in_month)
+    rows = await session.execute(
+        select(Activity.kpi_key, func.coalesce(func.sum(Activity.value), 0))
+        .where(Activity.date >= start, Activity.date <= end)
+        .group_by(Activity.kpi_key)
+    )
+    facts = {key: float(total) for key, total in rows.all()}
+    ops = await compute_operational_kpi_facts(session, start, end)
+    for key, value in ops.items():
+        if key in OPERATIONAL_KPI_KEYS or key in BOARD_EXTRA_TARGETS:
+            facts[key] = value
+    return facts
+
+
+# gross_profit факт структурно = 0 (compute_operational_kpi_facts) → кумулятивный добор был бы
+# = полному плану прошлых месяцев (цель раздувается монотонно). Исключаем из добора, пока нет
+# реального факта прибыли. # ponytail: включить, когда появится landed-cost факт.
+_NO_CARRYOVER = {"gross_profit"}
+
+
+async def _owner_plan_overrides(
+    session: AsyncSession, owner_id: int, plan_month_key: str
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Согласованный план продавца как «План» метрик + кумулятивный добор до годовой цели.
+
+    Возвращает ``(current, carryover)``: ``current[metric]`` — target одобренного плана
+    (``period_type='month'``) на ``plan_month_key``; ``carryover[metric]`` — Σ(план прошлых
+    месяцев года) − Σ(факт тех месяцев). Знак любой: недобор поднимает цель, перевыполнение
+    её симметрично снижает (банкуется). Добор применяет вызывающий код ТОЛЬКО к деньги-метрикам.
+
+    # ponytail: помесячный пересчёт факта (по одному агрегату на каждый прошлый месяц с планом);
+    # если планов много — материализовать факт периода/кэш.
+    """
+    year = plan_month_key[:4]
+    rows = (
+        await session.execute(
+            select(PlanTarget).where(
+                PlanTarget.owner_id == owner_id,
+                PlanTarget.status == "approved",
+                PlanTarget.period_type == "month",
+                PlanTarget.period_key.like(f"{year}-%"),
+            )
+        )
+    ).scalars().all()
+    current: dict[str, float] = {}
+    past: dict[str, list[str]] = defaultdict(list)  # metric -> [period_key, …]
+    past_target: dict[tuple[str, str], float] = {}   # (metric, period_key) -> target
+    for p in rows:
+        if p.period_key == plan_month_key:
+            current[p.metric] = float(p.target)
+        elif p.period_key < plan_month_key:
+            past[p.metric].append(p.period_key)
+            past_target[(p.metric, p.period_key)] = float(p.target)
+    carryover: dict[str, float] = {}
+    if past:
+        past_keys = {pk for keys in past.values() for pk in keys}
+        month_facts = {
+            pk: await _month_facts(session, int(pk[:4]), int(pk[5:7])) for pk in past_keys
+        }
+        for metric, keys in past.items():
+            if metric in _NO_CARRYOVER:
+                continue
+            plan_sum = sum(past_target[(metric, pk)] for pk in keys)
+            fact_sum = sum(month_facts[pk].get(metric, 0.0) for pk in keys)
+            carryover[metric] = plan_sum - fact_sum
+    return current, carryover
+
+
 @router.get("/kpis", response_model=list[KpiOut])
-async def kpis(period: str = "day", session: AsyncSession = Depends(get_session)):
+async def kpis(
+    period: str = "day",
+    owner_id: int | None = None,
+    session: AsyncSession = Depends(get_session),
+):
     """Показатели «План/Факт» за период (день/неделя/месяц/квартал/год, sales-34).
 
     Факт — сумма активностей за окно периода (от последней даты назад); план —
@@ -790,6 +871,11 @@ async def kpis(period: str = "day", session: AsyncSession = Depends(get_session)
     принимает конкретный месяц вида ``"YYYY-MM"`` (напр. ``"2026-05"``) — тогда
     окно факта фиксировано на этот календарный месяц (а не «от последней даты
     назад»), а план масштабируется на число рабочих дней (пн-пт) этого месяца.
+
+    ``owner_id`` (опц.): если у продавца есть согласованный (``approved``) месячный план
+    по метрике, «План» = его target ВМЕСТО дневной цели × mult; для деньги-метрик к нему
+    добавляется кумулятивный добор до годовой цели (недобор прошлых месяцев года поднимает
+    цель, перевыполнение — снижает). Без ``owner_id`` — прежнее поведение (доска не меняется).
     """
     targets = (
         await session.execute(select(KpiTarget).order_by(KpiTarget.sort_order))
@@ -833,19 +919,39 @@ async def kpis(period: str = "day", session: AsyncSession = Depends(get_session)
             for key, value in facts.items():
                 if key in OPERATIONAL_KPI_KEYS or key in BOARD_EXTRA_TARGETS:
                     actuals[key] = value
+
+    # Согласованный план продавца как «План» метрики + кумулятивный добор (только деньги).
+    plan_current: dict[str, float] = {}
+    plan_carry: dict[str, float] = {}
+    # Оверрайд согласованным месячным планом — ТОЛЬКО для месячного периода: месячный target
+    # когерентен лишь с месячным окном факта (иначе цель месяца против факта дня/недели даёт
+    # бессмысленный процент). День/неделя/квартал/год — прежнее поведение доски без оверрайда.
+    if owner_id is not None and month_match:
+        plan_current, plan_carry = await _owner_plan_overrides(session, owner_id, period)
+
+    def _pct(actual: float, target: float, overridden: bool) -> int:
+        if target > 0:
+            return round(min(100.0, actual / target * 100))
+        # добор ушёл в минус (перевыполнение банкуется) → план перекрыт; иначе цели нет
+        return 100 if overridden else 0
+
     result: list[KpiOut] = []
     seen: set[str] = set()
     for t in targets:
         actual = actuals.get(t.key, 0.0)
         target = float(t.target) * mult
-        percent = round(min(100.0, actual / target * 100)) if target else 0
+        overridden = owner_id is not None and t.key in plan_current
+        if overridden:
+            target = plan_current[t.key]
+            if t.unit == "money":
+                target += plan_carry.get(t.key, 0.0)
         result.append(
             KpiOut(
                 key=t.key,
                 title=t.title,
                 target=target,
                 actual=actual,
-                percent=percent,
+                percent=_pct(actual, target, overridden),
                 unit=t.unit,
                 icon=t.icon,
                 tone=t.tone,
@@ -858,14 +964,18 @@ async def kpis(period: str = "day", session: AsyncSession = Depends(get_session)
             continue
         actual = actuals.get(key, 0.0)
         target = daily * mult
-        percent = round(min(100.0, actual / target * 100)) if target else 0
+        overridden = owner_id is not None and key in plan_current
+        if overridden:
+            target = plan_current[key]
+            if unit == "money":
+                target += plan_carry.get(key, 0.0)
         result.append(
             KpiOut(
                 key=key,
                 title=title,
                 target=target,
                 actual=actual,
-                percent=percent,
+                percent=_pct(actual, target, overridden),
                 unit=unit,
                 icon=icon,
                 tone=tone,
@@ -1934,6 +2044,8 @@ async def decide_plan(
     plan.status = "approved" if payload.approved else "rejected"
     plan.approved_by = user.username
     plan.approved_at = _utcnow()
+    # Комментарий РОПа пишем и при approve, и при reject (обратная связь по метрике).
+    plan.rop_comment = payload.comment  # пусто → чистит устаревшую причину/комментарий
     core.event_bus.emit(
         session,
         "sales.plan.approved" if payload.approved else "sales.plan.rejected",
@@ -1947,6 +2059,50 @@ async def decide_plan(
             "by": user.username,
             "comment": payload.comment,
             "actor": "РОП",
+            "entity_ref": f"plan:{plan.id}",
+        },
+    )
+    await session.commit()
+    return plan
+
+
+@router.post("/plans/{plan_id}/reopen", response_model=PlanTargetOut)
+async def reopen_plan(
+    plan_id: int,
+    payload: PlanReopenIn,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.approve")),
+):
+    """Вернуть согласованный план в работу (``approved`` → ``draft``) — действие РОПа.
+
+    Снятие одобрения требует ТОГО ЖЕ права, что и само согласование (``sales.deal.approve``),
+    иначе продавец мог бы в обход отменить решение РОПа над любым (в т.ч. чужим) планом.
+    Сбрасывает согласование (``approved_by``/``approved_at`` = None), ``reason`` кладёт в
+    ``rop_comment`` (пусто — чистит прежний), эмитит ``sales.plan.reopened``. 409, если не ``approved``.
+    Продавец запрашивает пересмотр через РОПа (комментарий/чат) — он и возвращает в работу.
+    """
+    plan = await session.get(PlanTarget, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="План не найден")
+    if plan.status != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail=f"План в статусе {plan.status} — вернуть в работу нельзя (нужен approved)",
+        )
+    plan.status = "draft"
+    plan.approved_by = None
+    plan.approved_at = None
+    plan.rop_comment = payload.reason  # пусто → чистит устаревшую причину
+    core.event_bus.emit(
+        session,
+        "sales.plan.reopened",
+        {
+            "plan_id": plan.id,
+            "owner_id": plan.owner_id,
+            "metric": plan.metric,
+            "period_key": plan.period_key,
+            "by": user.username,
             "entity_ref": f"plan:{plan.id}",
         },
     )

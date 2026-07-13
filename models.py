@@ -342,6 +342,9 @@ class PlanTarget(Base):
     status: Mapped[str] = mapped_column(String(16), default="draft", server_default="draft")
     approved_by: Mapped[str | None] = mapped_column(String(128))
     approved_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # Комментарий РОПа по метрике (при approve/reject) и причина возврата плана «на доработку»
+    # (reopen). Один текст-канал обратной связи РОП↔продавец — видно в конструкторе (единый экран).
+    rop_comment: Mapped[str | None] = mapped_column(Text)
 
 
 class PlanItem(Base):
