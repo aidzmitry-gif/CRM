@@ -651,10 +651,16 @@ class RegularRowOut(BaseModel):
 
 
 class CalcDefaultsOut(BaseModel):
-    """Дефолты калькулятора активности по новым — источник «новые» конструктора плана."""
+    """Дефолты калькулятора активности по новым — источник «новые» конструктора плана.
+
+    ``margin_pct_source`` — провенанс маржи-дефолта: ``history`` (по won-сделкам продавца),
+    ``onec``/``demo`` (средняя маржа каталога из прайса 1С — фолбэк, когда истории ещё нет),
+    ``None`` (нет дефолта). Продавец всегда может переопределить (PC5).
+    """
 
     avg_check: float | None = None
     margin_pct: int | None = None
+    margin_pct_source: str | None = None
 
 
 class PlanSourcesOut(BaseModel):

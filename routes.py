@@ -1759,6 +1759,35 @@ async def deal_handoff(
     return None
 
 
+async def _catalog_avg_margin_pct(
+    session: AsyncSession, core: Core
+) -> tuple[int, str] | None:
+    """Средняя маржинальность каталога из прайса 1С (фасад ``price_cost``) — фолбэк-дефолт маржи
+    для конструктора плана, когда у продавца нет истории won. Считаем avg (цена−себес)/цена по SKU,
+    у которых фасад дал и цену, и себес. Возврат ``(margin_pct, source)`` или ``None`` (фасад не
+    подключён / нет данных). ``source`` — провенанс из фасада (``onec``/``demo``).
+
+    ponytail: полный проход по каталогу + вызов фасада на все коды — приемлемо для экрана настройки
+    плана (не hot path, дёргается лишь при пустой истории); при большом каталоге — семпл/кэш.
+    """
+    pc_facade = getattr(core.services, "price_cost", None)
+    if pc_facade is None:
+        return None
+    codes = (await session.execute(select(Sku.code))).scalars().all()
+    if not codes:
+        return None
+    pc_map = await pc_facade.get_item_price_cost(session, list(codes))
+    ratios: list[float] = []
+    source: str | None = None
+    for item in pc_map.values():
+        if item.price_byn and item.cost_byn is not None and item.price_byn > 0:
+            ratios.append((item.price_byn - item.cost_byn) / item.price_byn)
+            source = source or item.source
+    if not ratios:
+        return None
+    return round(sum(ratios) / len(ratios) * 100), (source or "onec")
+
+
 # ── Конструктор месячного плана продавца (источники + снапшот строк) ──────────────
 @router.get("/plan-sources", response_model=PlanSourcesOut)
 async def plan_sources(
@@ -1873,7 +1902,17 @@ async def plan_sources(
     margin_pct_default = (
         round(total_gross / total_revenue * 100) if has_priced and total_revenue > 0 else None
     )
-    defaults = CalcDefaultsOut(avg_check=avg_check_default, margin_pct=margin_pct_default)
+    margin_pct_source = "history" if margin_pct_default is not None else None
+    # Фолбэк для нового продавца (нет истории won): средняя маржа каталога из прайса 1С
+    # (price_cost), если фасад подключён. Продавец переопределит; источник помечаем для UI.
+    if margin_pct_default is None:
+        catalog = await _catalog_avg_margin_pct(session, core)
+        if catalog is not None:
+            margin_pct_default, margin_pct_source = catalog
+    defaults = CalcDefaultsOut(
+        avg_check=avg_check_default, margin_pct=margin_pct_default,
+        margin_pct_source=margin_pct_source,
+    )
 
     # regulars: won-сделки, сгруппированные по контрагенту; цикл перезаказа из closed_on.
     by_counterparty: dict[str, list[Deal]] = defaultdict(list)
