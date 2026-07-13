@@ -27,6 +27,7 @@ from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
 from core.services.auth import CurrentUser, get_current_user, require_permission
+from core.services.price_cost import ItemPriceCost
 from modules.sales._money_words import money_words
 from modules.sales.ai import (
     call_script_hint,
@@ -1241,21 +1242,30 @@ async def update_deal(
 async def _deal_margin(
     session: AsyncSession, core: Core, deal: Deal
 ) -> tuple[list[MarginLine], bool]:
-    """Маржа позиций сделки: список ``MarginLine`` + признак отсутствия landed-фасада.
+    """Маржа позиций сделки: список ``MarginLine`` + признак отсутствия ЛЮБОГО источника себеса.
 
     Единый расчёт для карточки (``GET /deals/{id}/margin``) и прогноза воронки
-    (``GET /pipeline/margin-forecast``) — DRY, обе считают одинаково. Каждая строка несёт
-    цену клиенту (``revenue = price×qty`` при наличии котировки, НЕ зависит от landed) и
-    landed-себес (``cogs`` при возврате партии фасадом). Агрегаты считает вызывающий:
-    карточка — по ``priced``-позициям, прогноз — выручку по цене, прибыль по ``priced``.
-    Пустой список = у сделки нет позиций.
+    (``GET /pipeline/margin-forecast``) — DRY, обе считают одинаково. Приоритет источников (PC3):
+    себестоимость — 1С через фасад ``price_cost`` (``onec``/``demo``), иначе landed из закупок
+    (фолбэк/сверка), иначе нет. Цена клиенту — котировка КП (``quote``) перекрывает всё, иначе
+    дефолт из прайса 1С (``price_cost.price_byn``), иначе нет; ``revenue = price×qty`` не зависит
+    от себеса. Каждая строка несёт провенанс ``cost_source``/``price_source``.
+
+    Второй элемент кортежа — ``True``, когда НЕ подключён ни один источник себеса (оба фасада
+    ``None``). Когда ``price_cost`` не подключён (дефолт/прод/тесты) — равен «landed is None»,
+    т.е. прежнее поведение (только landed + КП) сохраняется байт-в-байт. Пустой список =
+    у сделки нет позиций.
     """
     rows = (
         await session.execute(select(DealItem).where(DealItem.deal_id == deal.id))
     ).scalars().all()
-    facade_missing = getattr(core.services, "landed_cost", None) is None
+    landed_facade = getattr(core.services, "landed_cost", None)
+    pc_facade = getattr(core.services, "price_cost", None)
+    # Деградация себеса для вызывающих: нет НИ landed, НИ 1С-источника. Без price_cost равно
+    # «landed is None» → прежнее поведение и reason у эндпоинтов.
+    cost_facade_missing = landed_facade is None and pc_facade is None
     if not rows:
-        return [], facade_missing
+        return [], cost_facade_missing
 
     skus = {
         s.id: s for s in (
@@ -1264,7 +1274,7 @@ async def _deal_margin(
     }
     codes = sorted({skus[r.sku_id].code for r in rows if r.sku_id in skus})
 
-    # Последняя цена клиенту по (sku_code, counterparty) — как ``_price_summary``.
+    # Последняя цена клиенту (КП) по (sku_code, counterparty) — как ``_price_summary``.
     last_price: dict[str, float] = {}
     if codes:
         quotes = (
@@ -1277,10 +1287,14 @@ async def _deal_margin(
         for q in quotes:
             last_price[q.sku_code] = float(q.price)  # перезаписываем — побеждает последняя
 
-    # Landed себестоимость через фасад ядра (None → procurement не подключён → честная деградация).
-    landed_facade = getattr(core.services, "landed_cost", None)
+    # Цена/себес из 1С через фасад ядра (приоритетный источник). None → фасад не подключён.
+    pc_map: dict[str, ItemPriceCost] = {}
+    if pc_facade is not None and codes:
+        pc_map = await pc_facade.get_item_price_cost(session, codes)
+
+    # Landed себестоимость через фасад ядра (фолбэк/сверка). None → procurement не подключён.
     landed_map: dict[str, dict | None] = {}
-    if not facade_missing and codes:
+    if landed_facade is not None and codes:
         landed_map = await landed_facade.last_landed_cost_batch(session, codes)
 
     lines: list[MarginLine] = []
@@ -1289,9 +1303,28 @@ async def _deal_margin(
         code = sku.code if sku else ""
         title = sku.title if sku else ""
         qty = float(r.qty)
-        price = last_price.get(code)
-        cost_row = landed_map.get(code) if not facade_missing else None
-        unit_cost = float(cost_row["unit_landed_cost_byn"]) if cost_row else None
+        pc = pc_map.get(code)
+
+        # Цена клиенту: КП перекрывает всё; иначе дефолт из прайса 1С (с пометкой источника).
+        quote_price = last_price.get(code)
+        if quote_price is not None:
+            price, price_source = quote_price, "quote"
+        elif pc is not None and pc.price_byn is not None:
+            price, price_source = pc.price_byn, pc.source  # onec / demo
+        else:
+            price, price_source = None, None
+
+        # Себестоимость: 1С (onec/demo) приоритетнее landed; landed — фолбэк/сверка.
+        cost_row = landed_map.get(code)
+        if pc is not None and pc.cost_byn is not None:
+            unit_cost, cost_source = pc.cost_byn, pc.source  # onec / demo
+        elif cost_row:
+            unit_cost, cost_source = float(cost_row["unit_landed_cost_byn"]), "landed"
+        else:
+            unit_cost, cost_source = None, None
+
+        # landed-провенанс (партия/курс) осмыслен ТОЛЬКО когда себес взят из landed.
+        from_landed = cost_source == "landed" and cost_row is not None
         lines.append(
             MarginLine(
                 sku_code=code, title=title, qty=qty,
@@ -1307,15 +1340,17 @@ async def _deal_margin(
                     "priced" if price is not None and unit_cost is not None
                     else ("no_cost" if price is not None else "no_price")
                 ),
-                cost_shipment_id=cost_row.get("shipment_id") if cost_row else None,
-                cost_fixed_at=cost_row.get("fixed_at") if cost_row else None,
+                cost_shipment_id=cost_row.get("shipment_id") if from_landed else None,
+                cost_fixed_at=cost_row.get("fixed_at") if from_landed else None,
                 cost_fx_rate=(
                     float(cost_row["fx_rate"])
-                    if cost_row and cost_row.get("fx_rate") is not None else None
+                    if from_landed and cost_row.get("fx_rate") is not None else None
                 ),
+                cost_source=cost_source,
+                price_source=price_source,
             )
         )
-    return lines, facade_missing
+    return lines, cost_facade_missing
 
 
 async def _audit_landed_unit_by_sku(
@@ -1443,7 +1478,12 @@ async def pipeline_margin_forecast(
     if owner:
         deals = [d for d in deals if d.owner == owner]
 
-    facade_missing = getattr(core.services, "landed_cost", None) is None
+    # Деградация вал.прибыли: нет НИ landed, НИ 1С-источника себеса (PC3) — согласовано с карточкой
+    # (``_deal_margin``). Без price_cost равно «landed is None» → прежнее поведение прогноза.
+    facade_missing = (
+        getattr(core.services, "landed_cost", None) is None
+        and getattr(core.services, "price_cost", None) is None
+    )
     revenue_weighted = 0.0
     gross_weighted: float | None = None if facade_missing else 0.0
     deals_priced = 0

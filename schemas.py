@@ -503,10 +503,14 @@ class MarginLine(BaseModel):
     cogs: float | None = None
     margin_pct: float | None = None
     status: MarginLineStatus
-    # Провенанс себестоимости из landed: shipment_id/fixed_at/fx_rate (None если нет landed).
+    # Провенанс себестоимости из landed: shipment_id/fixed_at/fx_rate (None если себес не из landed).
     cost_shipment_id: int | None = None
     cost_fixed_at: datetime.datetime | None = None
     cost_fx_rate: float | None = None
+    # Провенанс источника (PC3) — для честной пометки в UI, «откуда цифра».
+    # cost_source: "onec"|"demo"|"landed"|None; price_source: "quote" (КП клиента)|"onec"|"demo"|None.
+    cost_source: str | None = None
+    price_source: str | None = None
 
 
 class DealMarginOut(BaseModel):
