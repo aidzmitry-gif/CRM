@@ -2800,6 +2800,8 @@ def _seller_requisites(core: Core) -> dict[str, str]:
     return {
         "name": c.seller_name, "unp": c.seller_unp, "address": c.seller_address,
         "director": c.seller_director, "phone": c.seller_phone, "email": c.seller_email,
+        # банковские реквизиты продавца → строка «р/с … в банке …» в счёте (_req_line)
+        "account": c.seller_account, "bank": c.seller_bank, "bik": c.seller_bik,
     }
 
 
