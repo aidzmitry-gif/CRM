@@ -29,6 +29,7 @@ from modules.sales.events import (
 )
 from modules.sales.permissions import PERMISSIONS, ROLES
 from modules.sales.reserve import tick_invoice_reserve
+from modules.sales.touch_history import SalesTouchHistory
 from modules.sales.workflows import DealApprovalWorkflow
 
 logger = logging.getLogger("aios.sales")
@@ -70,6 +71,10 @@ class SalesModule(ModuleContract):
         for command in telegram.COMMANDS:
             core.register_telegram(command)
         core.register_widget(Widget("sales_pipeline", "Воронка продаж", source="sales.deals"))
+        # M5: наполняем фасад истории касаний для 360°-карточки контрагента в ядре
+        # (звонки/сообщения/сделки). Без этого core.services.touch_history=None → карточка
+        # без истории (graceful). Реализация не лезет в схему ядра — только читает свою.
+        core.services.touch_history = SalesTouchHistory()
         core.on_startup(self._on_startup)
         # SALES-51: периодический шаг — срок/напоминание/аннулирование резерва под счёт
         core.on_tick(tick_invoice_reserve)
