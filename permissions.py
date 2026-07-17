@@ -25,5 +25,7 @@ PERMISSIONS = [
 ROLES = [
     Role("sales_head", ("sales.deal.read", "sales.deal.write", "sales.deal.approve")),
     Role("sales", ("sales.deal.read", "sales.deal.write")),
+    # Keycloak realm role (go-live): те же права, что у sales — иначе 403 на доске.
+    Role("sales_manager", ("sales.deal.read", "sales.deal.write")),
     Role("sales_cli", ("sales.deal.read", "sales.deal.write")),
 ]

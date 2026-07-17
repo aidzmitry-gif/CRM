@@ -23,13 +23,18 @@ async def on_lead_converted(payload: dict, ctx) -> None:
     ``Deal`` (стадия ``new``, ответственный и приоритет из payload) и отвечает
     ``sales.deal.created`` с ``lead_id``/``deal_id``, по которому лид получает
     обратную ссылку на сделку.
+
+    Позиции КП из ``payload.items`` переносятся в ``DealItem`` + сумма сделки —
+    иначе конвертация теряет коммерческое предложение (денежный путь L4).
     """
     if ctx is None:
         return
+    from decimal import Decimal, InvalidOperation
+
     lead_id = payload.get("lead_id")
     if not lead_id:
         return
-    from modules.sales.models import Deal
+    from modules.sales.models import Deal, DealItem
 
     deal = Deal(
         number=f"CRM-LEAD-{lead_id}",
@@ -41,6 +46,24 @@ async def on_lead_converted(payload: dict, ctx) -> None:
     )
     ctx.session.add(deal)
     await ctx.session.flush()
+
+    total = Decimal("0")
+    for raw in payload.get("items") or []:
+        try:
+            sku_id = int(raw["sku_id"])
+            qty = Decimal(str(raw.get("qty") or 1))
+            price = Decimal(str(raw.get("price") or 0))
+            disc = Decimal(str(raw.get("discount_pct") or 0))
+        except (KeyError, TypeError, ValueError, InvalidOperation):
+            continue
+        if qty <= 0:
+            continue
+        ctx.session.add(DealItem(deal_id=deal.id, sku_id=sku_id, qty=qty))
+        # линия = price×qty×(1−скидка%); деньги Decimal, не float
+        line = (price * qty * (Decimal("1") - disc / Decimal("100"))).quantize(Decimal("0.01"))
+        total += line
+    deal.amount = total
+
     ctx.services.event_bus.emit(
         ctx.session,
         "sales.deal.created",
@@ -52,26 +75,43 @@ async def on_lead_converted(payload: dict, ctx) -> None:
             "entity_ref": f"deal:{deal.id}",
         },
     )
-    logger.info("Sales: из лида %s создана сделка %s", lead_id, deal.number)
+    logger.info("Sales: из лида %s создана сделка %s (%d поз.)", lead_id, deal.number, len(payload.get("items") or []))
 
 
 async def on_payment_paid(payload: dict, ctx) -> None:
-    """Платёж проведён → документ-счёт помечается оплаченным (finance → sales)."""
+    """Платёж проведён → документ-счёт помечается оплаченным (finance → sales).
+
+    Сначала по ``ref`` (= номер счёта). Если не нашли — по ``deal_id`` (шов 0105 /
+    finance.payment.*), чтобы оплата не терялась при расхождении номеров.
+    """
     if ctx is None:
         return
     from modules.sales.models import DealDocument
 
+    doc = None
     ref = payload.get("ref")
-    if not ref:
-        return
-    doc = (
-        await ctx.session.execute(select(DealDocument).where(DealDocument.number == ref))
-    ).scalars().first()
+    if ref:
+        doc = (
+            await ctx.session.execute(select(DealDocument).where(DealDocument.number == ref))
+        ).scalars().first()
+    if doc is None and payload.get("deal_id") is not None:
+        try:
+            deal_id = int(payload["deal_id"])
+        except (TypeError, ValueError):
+            deal_id = None
+        if deal_id is not None:
+            doc = (
+                await ctx.session.execute(
+                    select(DealDocument)
+                    .where(DealDocument.deal_id == deal_id, DealDocument.kind == "invoice")
+                    .order_by(DealDocument.id.desc())
+                )
+            ).scalars().first()
     if doc is not None:
         doc.status = "paid"
         if doc.reserve_status == "reserved":
             doc.reserve_status = "consumed"  # SALES-51: оплачен → резерв израсходован
-        logger.info("Sales: документ %s помечен оплаченным", ref)
+        logger.info("Sales: документ %s помечен оплаченным", doc.number)
 
 
 async def on_shipment_delivered(payload: dict, ctx) -> None:

@@ -410,6 +410,7 @@ async def board(
     owner: str = "",
     funnel: str = DEFAULT_FUNNEL,
     session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
 ) -> BoardOut:
     """Доска сделок воронки ``funnel``: сделки по стадиям с агрегатами. ``owner`` —
     фильтр по ответственному (видимость «по менеджеру», SALES-42). Сделки фильтруются
@@ -1192,7 +1193,7 @@ async def update_deal(
     payload: DealUpdate,
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(require_permission("sales.deal.write")),
 ):
     """Частично обновить сделку. Смена стадии (drag&drop) пишется в историю и
     обновляет ``stage_changed_at`` через единый хелпер ``record_stage`` (SALES-43)."""
@@ -2378,6 +2379,7 @@ async def create_deal(
     payload: DealCreate,
     session: AsyncSession = Depends(get_session),
     core: Core = Depends(get_core),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
 ):
     """Создать сделку и опубликовать доменное событие через шину ядра."""
     try:
@@ -2418,6 +2420,7 @@ async def request_approval(
 async def list_skus(
     for_picker: bool = False,
     session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
 ):
     """Справочник номенклатуры (для подбора позиций в сделку, sales-12).
 
