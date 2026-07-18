@@ -1,77 +1,251 @@
 """HTTP-API модуля Sales. Монтируется ядром под префиксом ``/sales``."""
 from __future__ import annotations
 
+import calendar
+import html
+import os
+import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, select
+from fastapi.responses import HTMLResponse
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.domain.models import Approval, Contact, Counterparty, Sku
+from core.domain.models import (
+    Approval,
+    Contact,
+    Counterparty,
+    CounterpartyAlias,
+    OutboxEvent,
+    Sku,
+)
 from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
-from core.services.auth import require_permission
-from modules.sales.ai import draft_reply, next_step, summarize
+from core.services.auth import CurrentUser, get_current_user, require_permission
+from core.services.price_cost import ItemPriceCost
+from modules.sales._money_words import money_words
+from modules.sales.ai import (
+    call_script_hint,
+    classify_objection,
+    draft_reply,
+    next_step,
+    objection_hint,
+    static_call_script,
+    summarize,
+)
+from modules.sales.kpi_facts import (
+    BOARD_EXTRA_TARGETS,
+    OPERATIONAL_KPI_KEYS,
+    compute_operational_kpi_facts,
+)
 from modules.sales.models import (
     Activity,
+    CompanyBranding,
+    ContractTemplate,
     Deal,
     DealDocument,
     DealItem,
+    DealStageEvent,
+    DealTask,
     KpiTarget,
+    LossReason,
     Message,
+    PlanItem,
+    PlanTarget,
     PriceQuote,
+    Stage,
 )
-from modules.sales.repository import DealRepository
+from modules.sales.repository import DealRepository, record_stage
 from modules.sales.schemas import (
     ActivityCreate,
     AiAssistRequest,
     AiDraftOut,
     AiTextOut,
     BoardOut,
+    BrandingIn,
+    BrandingOut,
+    CalcDefaultsOut,
+    CallCommentIn,
+    CallLinkDealIn,
+    CallOut,
+    CallResultIn,
+    CallScriptOut,
     ChatOut,
+    CommittedRowOut,
     ContactCreate,
     ContactOut,
+    ContractPrepareIn,
+    ContractTemplateCreate,
+    ContractTemplateOut,
+    CounterpartyRef,
     DealCreate,
     DealDetailOut,
+    DealHandoffOut,
     DealItemCreate,
     DealItemOut,
     DealItemUpdate,
+    DealMarginOut,
     DealRead,
     DealUpdate,
     DocumentCreate,
     DocumentDecision,
     DocumentOut,
+    FunnelOut,
+    HandoffItem,
+    JournalRowOut,
     KpiOut,
+    LoseRequest,
+    LossReasonOut,
+    MarginForecastOut,
+    MarginLine,
+    MarginReconcileOut,
     MessageCreate,
     MessageOut,
+    ObjectionReplyIn,
+    ObjectionReplyOut,
+    PackageSentOut,
+    PipelineAnalyticsOut,
+    PlanDecisionIn,
+    PlanItemIn,
+    PlanItemOut,
+    PlanReopenIn,
+    PlanSourcesOut,
+    PlanTargetIn,
+    PlanTargetOut,
     PriceInfo,
     PriceQuoteCreate,
+    RegularRowOut,
     SkuOut,
+    StageAnalytics,
     StageBoard,
+    StageCreate,
+    StageEventOut,
+    StageMetric,
+    StageMetricsOut,
+    StageOut,
+    StageUpdate,
+    TaskCreate,
+    TaskOut,
+    TaskUpdate,
+    TelephonyEventIn,
 )
-from modules.sales.stages import STAGES
+from modules.sales.stages import (
+    DEFAULT_FUNNEL,
+    FUNNELS,
+    PROBABILITY_BY_STAGE,
+    STAGES,
+    TERMINAL_STAGES,
+    canonical_stages,
+)
 
 router = APIRouter(tags=["sales"])
+# Лиды (вход воронки) — отдельный роутер. Монтируется и на /leads (фронт бьёт туда), и на
+# /sales/leads (back-compat). Полный вынос в modules/leads — Шаг 2 ТЗ принятия выноса лидов.
+leads_router = APIRouter(tags=["leads"])
 
 # Префикс номера и человекочитаемое название документа по типу.
 DOC_NUMBER_PREFIX = {"invoice": "СЧ", "contract": "ДГ", "order": "ЗК"}
 DOC_TITLES = {"invoice": "Счёт", "contract": "Договор", "order": "Заказ"}
 # Типы документов, требующие согласования до записи в 1С (договор → юрист, ч.4).
 REQUIRES_APPROVAL = {"contract"}
-# Типы документов, резервирующие складские остатки при проведении (заказ).
-RESERVES_STOCK = {"order"}
+# Типы документов, резервирующие складские остатки при проведении (счёт и заказ, SALES-51).
+RESERVES_STOCK = {"invoice", "order"}
 # План/факт по периодам (sales-34): окно факта (дней) и множитель плана (рабочих дней).
 PERIOD_DAYS = {"day": 1, "week": 7, "month": 30, "quarter": 90, "year": 365}
 PERIOD_MULT = {"day": 1, "week": 5, "month": 22, "quarter": 65, "year": 250}
+# Конструктор месячного плана продавца: месяц — строго "YYYY-MM" (plan-sources/plan-items).
+MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
+def _deal_weight(deal: Deal, prob_by_stage: dict[str, int] | None = None) -> float:
+    """Взвешенная сумма сделки: amount × вероятность (своя или дефолт стадии).
+
+    ``prob_by_stage`` — карта стадия→вероятность из редактируемой таблицы стадий; нет →
+    канон ``PROBABILITY_BY_STAGE`` (фолбэк до материализации таблицы).
+    """
+    defaults = prob_by_stage if prob_by_stage is not None else PROBABILITY_BY_STAGE
+    p = deal.probability if deal.probability is not None else defaults.get(deal.stage, 0)
+    return float(deal.amount) * p / 100
+
+
+async def _board_stages(session: AsyncSession, funnel: str = DEFAULT_FUNNEL) -> list[dict]:
+    """Активные стадии воронки ``funnel`` (порядок=колонки) из таблицы ``sales.stage``.
+
+    Таблица — редактируемый источник истины (редактор стадий); пусто → канон ``stages.py``
+    (значения идентичны сиду миграции). Пустая воронка (таблица заполнена, но в этой
+    воронке стадий нет) → пустой список — UI решает, как показать пустую доску.
+    """
+    rows = (
+        await session.execute(
+            select(Stage)
+            .where(Stage.is_active, Stage.funnel == funnel)
+            .order_by(Stage.sort_order)
+        )
+    ).scalars().all()
+    if rows:
+        return [
+            {"id": r.code, "title": r.title, "color": r.color, "probability": r.probability}
+            for r in rows
+        ]
+    # Таблица пуста ВООБЩЕ (до материализации канона) → fallback для дефолтной воронки.
+    any_row = (await session.execute(select(Stage).limit(1))).scalars().first()
+    if any_row is not None:
+        return []  # таблица заполнена, но конкретная воронка без стадий — honest-empty
+    if funnel != DEFAULT_FUNNEL:
+        return []
+    return [
+        {"id": s["id"], "title": s["title"], "color": s["color"],
+         "probability": PROBABILITY_BY_STAGE.get(s["id"], 0)}
+        for s in STAGES
+    ]
 
 
 def _utcnow() -> datetime:
     # наивный UTC — единообразно для SQLite и PostgreSQL
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _month_bounds(month: str) -> tuple[date, date]:
+    """Валидировать ``month`` ("YYYY-MM") и вернуть (первый, последний день месяца).
+
+    422 на кривом формате — используется и ``GET /plan-sources``, и ``PUT /plan-items``
+    (конструктор месячного плана продавца).
+    """
+    if not MONTH_RE.match(month):
+        raise HTTPException(status_code=422, detail="month должен быть в формате YYYY-MM")
+    year, mon = (int(p) for p in month.split("-"))
+    return date(year, mon, 1), date(year, mon, calendar.monthrange(year, mon)[1])
+
+
+def _parse_ddmmyyyy(value: str | None) -> date | None:
+    """Безопасный парсинг даты сделки ("dd.mm.yyyy") — None на пустом/мусорном значении."""
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%d.%m.%Y").date()
+    except ValueError:
+        return None
+
+
+def _task_out(task: DealTask) -> TaskOut:
+    """Представление задачи с вычисляемым флагом просрочки (SALES-41)."""
+    overdue = task.status == "open" and task.due_at is not None and task.due_at < _utcnow()
+    return TaskOut(
+        id=task.id,
+        deal_id=task.deal_id,
+        title=task.title,
+        kind=task.kind,
+        assignee_id=task.assignee_id,
+        due_at=task.due_at,
+        status=task.status,
+        result=task.result,
+        overdue=overdue,
+    )
 
 
 async def _deal_stock_items(session: AsyncSession, deal_id: int) -> list[dict]:
@@ -133,6 +307,26 @@ async def _counterparty_for_deal(
     return cp
 
 
+async def _counterparty_ref(session: AsyncSession, deal: Deal) -> CounterpartyRef | None:
+    """Резолв контрагента сделки в MDM для карточки (id/УНП/источники). None — нет в витрине."""
+    cp = await _counterparty_for_deal(session, deal)
+    if cp is None:
+        return None
+    sources = (
+        await session.execute(
+            select(CounterpartyAlias.source).where(CounterpartyAlias.counterparty_id == cp.id)
+        )
+    ).scalars().all()
+    return CounterpartyRef(
+        id=cp.id,
+        name=cp.name,
+        unp=cp.unp,
+        sources=sorted(set(sources)),
+        is_active=cp.is_active,
+        merged_into_id=cp.merged_into_id,
+    )
+
+
 async def _clear_primary(session: AsyncSession, counterparty_id: int) -> None:
     """Снять признак основного со всех контактов контрагента."""
     rows = (
@@ -181,14 +375,58 @@ async def ping() -> dict:
     return {"module": "sales", "status": "ok"}
 
 
+async def _supply_arrivals(
+    session: AsyncSession, deal_ids: list[int], window_days: int = 7
+) -> dict[int, dict]:
+    """Бейдж «🚚 под приход» (П6 UI ТЗ) — читаем живьём из аудита событий
+    ``sales.supply.arrived`` (эмитит ``on_procurement_received``, БЕЗ новой колонки/миграции —
+    паттерн как в ``_audit_landed_unit_by_sku``). Берём события за последние ``window_days``
+    (иначе бейдж висел бы вечно); на сделку — самое свежее.
+    """
+    if not deal_ids:
+        return {}
+    idset = set(deal_ids)
+    cutoff = _utcnow() - timedelta(days=window_days)
+    events = (
+        await session.execute(
+            select(OutboxEvent)
+            .where(OutboxEvent.event_type == "sales.supply.arrived")
+            .where(OutboxEvent.created_at >= cutoff)
+            .order_by(OutboxEvent.id)
+        )
+    ).scalars().all()
+    out: dict[int, dict] = {}
+    for ev in events:  # id по возрастанию → самое свежее для сделки побеждает
+        payload = ev.payload or {}
+        sku = payload.get("sku_code")
+        for deal_id in payload.get("deal_ids") or []:
+            if deal_id in idset:
+                out[deal_id] = {"supply_arrived_at": ev.created_at, "supply_arrived_sku": sku}
+    return out
+
+
 @router.get("/board", response_model=BoardOut)
-async def board(session: AsyncSession = Depends(get_session)) -> BoardOut:
-    """Доска сделок: сделки сгруппированы по стадиям воронки с агрегатами."""
+async def board(
+    owner: str = "",
+    funnel: str = DEFAULT_FUNNEL,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+) -> BoardOut:
+    """Доска сделок воронки ``funnel``: сделки по стадиям с агрегатами. ``owner`` —
+    фильтр по ответственному (видимость «по менеджеру», SALES-42). Сделки фильтруются
+    по ``Deal.funnel == funnel`` (дефолт ``new_clients``); колонки — стадии этой воронки.
+    """
     deals = await DealRepository(session).list()
+    deals = [d for d in deals if d.funnel == funnel]
+    if owner:
+        deals = [d for d in deals if d.owner == owner]
     by_stage: dict[str, list[Deal]] = defaultdict(list)
     for deal in deals:
         by_stage[deal.stage].append(deal)
 
+    board_stages = await _board_stages(session, funnel)
+    prob_by_stage = {s["id"]: s["probability"] for s in board_stages}
+    arrivals = await _supply_arrivals(session, [d.id for d in deals])
     stages = [
         StageBoard(
             id=s["id"],
@@ -196,51 +434,553 @@ async def board(session: AsyncSession = Depends(get_session)) -> BoardOut:
             color=s["color"],
             count=len(by_stage.get(s["id"], [])),
             sum=float(sum(d.amount for d in by_stage.get(s["id"], []))),
-            deals=[DealRead.model_validate(d) for d in by_stage.get(s["id"], [])],
+            weighted=float(sum(_deal_weight(d, prob_by_stage) for d in by_stage.get(s["id"], []))),
+            deals=[
+                DealRead.model_validate(d).model_copy(update=arrivals.get(d.id, {}))
+                for d in by_stage.get(s["id"], [])
+            ],
         )
-        for s in STAGES
+        for s in board_stages
     ]
     return BoardOut(stages=stages)
 
 
+@router.get("/pipeline/analytics", response_model=PipelineAnalyticsOut)
+async def pipeline_analytics(
+    funnel: str = DEFAULT_FUNNEL,
+    owner: str = "",
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Pipeline-аналитика воронки (П6 ТЗ): по каждой стадии — count/sum/weighted/avg_age/
+    conv→следующая; по воронке — взвеш.прогноз + средняя длина цикла won-сделок.
+
+    Конверсия стадия→next: доля сделок, чья история имеет переход (from=stage, to=next_stage)
+    среди тех, кто хотя бы был в этой стадии. honest-empty: пусто, если истории нет.
+    """
+    stage_rows = await _board_stages(session, funnel)
+    deals = await DealRepository(session).list()
+    deals = [d for d in deals if d.funnel == funnel]
+    if owner:
+        deals = [d for d in deals if d.owner == owner]
+    prob_by_stage = {s["id"]: s["probability"] for s in stage_rows}
+    by_stage: dict[str, list[Deal]] = defaultdict(list)
+    for d in deals:
+        by_stage[d.stage].append(d)
+
+    # История стадий: события для всех сделок этой воронки.
+    deal_ids = [d.id for d in deals]
+    events: list[DealStageEvent] = []
+    if deal_ids:
+        events = (
+            await session.execute(
+                select(DealStageEvent).where(DealStageEvent.deal_id.in_(deal_ids))
+            )
+        ).scalars().all()
+    # Кто вообще был в стадии (был as `to_stage` хоть раз) и кто ушёл из неё (был as
+    # `from_stage` хоть раз, переход в неконечную/следующую стадию).
+    been_in: dict[str, set[int]] = defaultdict(set)
+    moved_to_next: dict[tuple[str, str], set[int]] = defaultdict(set)
+    for ev in events:
+        if ev.to_stage:
+            been_in[ev.to_stage].add(ev.deal_id)
+        if ev.from_stage and ev.to_stage:
+            moved_to_next[(ev.from_stage, ev.to_stage)].add(ev.deal_id)
+    # Текущие сделки тоже учитываем как «были в стадии» (на случай создания без события).
+    for d in deals:
+        been_in[d.stage].add(d.id)
+
+    stage_codes = [s["id"] for s in stage_rows]
+    now = _utcnow()
+    out_stages: list[StageAnalytics] = []
+    for idx, s in enumerate(stage_rows):
+        sid = s["id"]
+        bucket = by_stage.get(sid, [])
+        # средний возраст в стадии — из stage_changed_at
+        ages = [
+            (now - d.stage_changed_at).total_seconds() / 86400.0
+            for d in bucket
+            if d.stage_changed_at is not None
+        ]
+        avg_age = round(sum(ages) / len(ages), 1) if ages else None
+
+        next_sid = stage_codes[idx + 1] if idx + 1 < len(stage_codes) else None
+        conv: int | None = None
+        if next_sid is not None:
+            denom = len(been_in.get(sid, set()))
+            if denom > 0:
+                gone_next = len(moved_to_next.get((sid, next_sid), set()))
+                conv = round(gone_next / denom * 100)
+
+        out_stages.append(
+            StageAnalytics(
+                id=sid,
+                title=s["title"],
+                color=s["color"],
+                count=len(bucket),
+                sum=float(sum(d.amount for d in bucket)),
+                weighted=float(sum(_deal_weight(d, prob_by_stage) for d in bucket)),
+                avg_age_days=avg_age,
+                next_conv_pct=conv,
+            )
+        )
+
+    # Сводно: взвеш. прогноз = сумма по всем нетерминальным стадиям; средняя длина цикла
+    # won-сделок (created_at → closed_date/stage_changed_at).
+    forecast = sum(
+        s.weighted for s in out_stages if s.id not in TERMINAL_STAGES and s.id != "cond_lost"
+    )
+    won_deals = [d for d in deals if d.stage == "won"]
+    cycles: list[float] = []
+    for d in won_deals:
+        end = d.stage_changed_at  # переход в won зафиксирован тут
+        if d.created_at is not None and end is not None:
+            cycles.append((end - d.created_at).total_seconds() / 86400.0)
+    avg_cycle = round(sum(cycles) / len(cycles), 1) if cycles else None
+
+    return PipelineAnalyticsOut(
+        funnel=funnel,
+        stages=out_stages,
+        forecast_weighted=float(forecast),
+        avg_cycle_days=avg_cycle,
+        won_count=len(won_deals),
+    )
+
+
+STAGE_METRICS_PERIOD_DAYS = {"week": 7, "month": 30, "quarter": 90}
+
+
+@router.get("/pipeline/stage-metrics", response_model=StageMetricsOut)
+async def pipeline_stage_metrics(
+    funnel: str = DEFAULT_FUNNEL,
+    owner: str = "",
+    period: str = "month",
+    date_from: date | None = None,
+    date_to: date | None = None,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Период-срез конверсии стадия→след.стадия и среднего времени на стадии.
+
+    В отличие от ``/pipeline/analytics`` (снимок текущей доски), тут — ИСТОРИЯ по
+    ``DealStageEvent`` внутри окна ``[date_from, date_to]``: для каждой сделки строим
+    сегменты пребывания в стадии (первый сегмент — от ``Deal.created_at``, т.к. запись
+    смены стадии пишется только на переходах, см. ``record_stage``), затем считаем на
+    сколько сегментов ВОШЛИ и сколько ЗАВЕРШИЛИСЬ (закрытым концом) внутри окна.
+    ``date_from``/``date_to`` — явный диапазон (приоритет); иначе ``period`` (week/
+    month/quarter) от сегодняшней даты. honest-empty: без истории — ``None``, не 0.
+    """
+    today = _utcnow().date()
+    if date_from is not None and date_to is not None:
+        start, end = date_from, date_to
+    else:
+        span = STAGE_METRICS_PERIOD_DAYS.get(period, 30)
+        start, end = today - timedelta(days=span - 1), today
+
+    stage_rows = await _board_stages(session, funnel)
+    stage_codes = [s["id"] for s in stage_rows]
+    deals = await DealRepository(session).list()
+    deals = [d for d in deals if d.funnel == funnel]
+    if owner:
+        deals = [d for d in deals if d.owner == owner]
+
+    deal_ids = [d.id for d in deals]
+    events_by_deal: dict[int, list[DealStageEvent]] = defaultdict(list)
+    if deal_ids:
+        rows = (
+            await session.execute(
+                select(DealStageEvent)
+                .where(DealStageEvent.deal_id.in_(deal_ids))
+                .order_by(DealStageEvent.changed_at)
+            )
+        ).scalars().all()
+        for ev in rows:
+            events_by_deal[ev.deal_id].append(ev)
+
+    # Сегмент = (стадия, начало, конец|None-открыт). Начало первого сегмента — created_at
+    # (синтетический «вход», т.к. record_stage не пишет событие на создание сделки).
+    entered_in_window: dict[str, int] = defaultdict(int)
+    moved_to_next_in_window: dict[tuple[str, str], int] = defaultdict(int)
+    completed_durations: dict[str, list[float]] = defaultdict(list)
+    window_start = datetime.combine(start, datetime.min.time())
+    window_end = datetime.combine(end, datetime.max.time())
+    for d in deals:
+        events = events_by_deal.get(d.id, [])
+        first_stage = events[0].from_stage if events else d.stage
+        prev_stage, prev_time = first_stage, d.created_at
+        segments: list[tuple[str, datetime, datetime | None]] = []
+        for ev in events:
+            segments.append((prev_stage, prev_time, ev.changed_at))
+            prev_stage, prev_time = ev.to_stage, ev.changed_at
+        segments.append((prev_stage, prev_time, None))  # текущий, открытый сегмент
+
+        for idx, (stage, seg_start, seg_end) in enumerate(segments):
+            if seg_start is not None and window_start <= seg_start <= window_end:
+                entered_in_window[stage] += 1
+            if seg_end is not None and window_start <= seg_end <= window_end:
+                completed_durations[stage].append((seg_end - seg_start).total_seconds() / 86400.0)
+                next_stage = segments[idx + 1][0] if idx + 1 < len(segments) else None
+                if next_stage is not None:
+                    moved_to_next_in_window[(stage, next_stage)] += 1
+
+    out_stages: list[StageMetric] = []
+    for idx, s in enumerate(stage_rows):
+        sid = s["id"]
+        next_sid = stage_codes[idx + 1] if idx + 1 < len(stage_codes) else None
+        entered = entered_in_window.get(sid, 0)
+        conv: int | None = None
+        if next_sid is not None and entered > 0:
+            conv = round(moved_to_next_in_window.get((sid, next_sid), 0) / entered * 100)
+        durations = completed_durations.get(sid, [])
+        avg_time = round(sum(durations) / len(durations), 1) if durations else None
+        out_stages.append(
+            StageMetric(
+                id=sid,
+                title=s["title"],
+                color=s["color"],
+                entered_count=entered,
+                conv_next_pct=conv,
+                avg_time_days=avg_time,
+                completed_count=len(durations),
+            )
+        )
+
+    return StageMetricsOut(funnel=funnel, date_from=start, date_to=end, stages=out_stages)
+
+
+# ── Редактор стадий воронки (Сделки 2.0): CRUD справочника sales.stage ─────────────
+@router.get("/funnels", response_model=list[FunnelOut])
+async def list_funnels(
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Воронки sales: код + титул + сколько активных сделок. Имена — из ``FUNNELS``
+    (справочник в коде), порядок — как там; неизвестные коды (созданы через редактор
+    стадий, но не описаны в справочнике) добавляются в конец с code как title.
+
+    Graceful fallback: если колонки ``Deal.funnel``/``Stage.funnel`` нет (старая dev.db
+    создана до миграции 0062), считаем все сделки относящимися к дефолтной воронке
+    и возвращаем только ``FUNNELS``-справочник — без падения 500 и без ремонта схемы.
+    """
+    from sqlalchemy.exc import OperationalError, ProgrammingError
+
+    # код → активных сделок (исключаем терминальные стадии)
+    try:
+        stage_counts = (
+            await session.execute(
+                select(Deal.funnel, func.count())
+                .where(Deal.stage.notin_(TERMINAL_STAGES))
+                .group_by(Deal.funnel)
+            )
+        ).all()
+    except (OperationalError, ProgrammingError):
+        # старый dev.db без колонки funnel — отдаём только справочник, без счётчиков
+        await session.rollback()
+        return [FunnelOut(code=f["code"], title=f["title"], active_deals=0) for f in FUNNELS]
+    counts = {code: n for code, n in stage_counts}
+    seen: set[str] = set()
+    rows: list[FunnelOut] = []
+    for f in FUNNELS:
+        rows.append(FunnelOut(code=f["code"], title=f["title"], active_deals=counts.get(f["code"], 0)))
+        seen.add(f["code"])
+    # Воронки из таблицы stage, не описанные в FUNNELS — показываем как есть.
+    try:
+        extras = (
+            await session.execute(select(Stage.funnel).distinct())
+        ).scalars().all()
+    except (OperationalError, ProgrammingError):
+        await session.rollback()
+        extras = []
+    for code in extras:
+        if code not in seen:
+            rows.append(FunnelOut(code=code, title=code, active_deals=counts.get(code, 0)))
+    return rows
+
+
+@router.get("/stages", response_model=list[StageOut])
+async def list_stages(
+    funnel: str | None = None,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Стадии воронки для доски/редактора. Без ``funnel`` — все стадии всех воронок.
+    Первый вызов лениво материализует канон (``stages.py``) в таблицу — дальше источник
+    истины редактируемый."""
+    stmt = select(Stage).order_by(Stage.funnel, Stage.sort_order)
+    rows = (await session.execute(stmt)).scalars().all()
+    if not rows:
+        session.add_all([Stage(**row) for row in canonical_stages()])
+        try:
+            await session.commit()
+        except IntegrityError:  # гонка параллельного первого GET — сид уже сделан рядом
+            await session.rollback()
+        rows = (await session.execute(stmt)).scalars().all()
+    if funnel is not None:
+        rows = [r for r in rows if r.funnel == funnel]
+    return rows
+
+
+@router.post("/stages", response_model=StageOut, status_code=201)
+async def create_stage(
+    payload: StageCreate,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Добавить стадию воронки (редактор стадий)."""
+    exists = (
+        await session.execute(select(Stage).where(Stage.code == payload.code))
+    ).scalars().first()
+    if exists is not None:
+        raise HTTPException(status_code=409, detail="Стадия с таким кодом уже есть")
+    stage = Stage(**payload.model_dump())
+    session.add(stage)
+    await session.commit()
+    return stage
+
+
+@router.patch("/stages/{code}", response_model=StageOut)
+async def update_stage(
+    code: str,
+    payload: StageUpdate,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Изменить стадию (имя/порядок/вероятность/тип/цвет/активность)."""
+    stage = (
+        await session.execute(select(Stage).where(Stage.code == code))
+    ).scalars().first()
+    if stage is None:
+        raise HTTPException(status_code=404, detail="Стадия не найдена")
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(stage, field, value)
+    await session.commit()
+    return stage
+
+
+@router.delete("/stages/{code}", status_code=204)
+async def delete_stage(
+    code: str,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Удалить стадию. 409, если в стадии есть сделки (целостность ``Deal.stage``)."""
+    stage = (
+        await session.execute(select(Stage).where(Stage.code == code))
+    ).scalars().first()
+    if stage is None:
+        raise HTTPException(status_code=404, detail="Стадия не найдена")
+    in_use = (
+        await session.execute(select(func.count()).select_from(Deal).where(Deal.stage == code))
+    ).scalar()
+    if in_use:
+        raise HTTPException(
+            status_code=409,
+            detail=f"В стадии есть сделки ({in_use}) — перенесите их или деактивируйте стадию",
+        )
+    await session.delete(stage)
+    await session.commit()
+
+
+MONTH_PERIOD_RE = re.compile(r"^(\d{4})-(\d{2})$")
+
+
+async def _month_facts(session: AsyncSession, year: int, month: int) -> dict[str, float]:
+    """Факт метрик за календарный месяц (Activity-агрегат + операционные факты).
+
+    Зеркалит месячную ветку ``/kpis``: ручные ``Activity`` за месяц, поверх — операционные
+    факты (звонки/выручка/сделки) для ключей, где они важнее ручной отметки. Нужен для
+    кумулятивного добора: факт прошлых месяцев года.
+    """
+    _, days_in_month = calendar.monthrange(year, month)
+    start, end = date(year, month, 1), date(year, month, days_in_month)
+    rows = await session.execute(
+        select(Activity.kpi_key, func.coalesce(func.sum(Activity.value), 0))
+        .where(Activity.date >= start, Activity.date <= end)
+        .group_by(Activity.kpi_key)
+    )
+    facts = {key: float(total) for key, total in rows.all()}
+    ops = await compute_operational_kpi_facts(session, start, end)
+    for key, value in ops.items():
+        if key in OPERATIONAL_KPI_KEYS or key in BOARD_EXTRA_TARGETS:
+            facts[key] = value
+    return facts
+
+
+# gross_profit факт структурно = 0 (compute_operational_kpi_facts) → кумулятивный добор был бы
+# = полному плану прошлых месяцев (цель раздувается монотонно). Исключаем из добора, пока нет
+# реального факта прибыли. # ponytail: включить, когда появится landed-cost факт.
+_NO_CARRYOVER = {"gross_profit"}
+
+
+async def _owner_plan_overrides(
+    session: AsyncSession, owner_id: int, plan_month_key: str
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Согласованный план продавца как «План» метрик + кумулятивный добор до годовой цели.
+
+    Возвращает ``(current, carryover)``: ``current[metric]`` — target одобренного плана
+    (``period_type='month'``) на ``plan_month_key``; ``carryover[metric]`` — Σ(план прошлых
+    месяцев года) − Σ(факт тех месяцев). Знак любой: недобор поднимает цель, перевыполнение
+    её симметрично снижает (банкуется). Добор применяет вызывающий код ТОЛЬКО к деньги-метрикам.
+
+    # ponytail: помесячный пересчёт факта (по одному агрегату на каждый прошлый месяц с планом);
+    # если планов много — материализовать факт периода/кэш.
+    """
+    year = plan_month_key[:4]
+    rows = (
+        await session.execute(
+            select(PlanTarget).where(
+                PlanTarget.owner_id == owner_id,
+                PlanTarget.status == "approved",
+                PlanTarget.period_type == "month",
+                PlanTarget.period_key.like(f"{year}-%"),
+            )
+        )
+    ).scalars().all()
+    current: dict[str, float] = {}
+    past: dict[str, list[str]] = defaultdict(list)  # metric -> [period_key, …]
+    past_target: dict[tuple[str, str], float] = {}   # (metric, period_key) -> target
+    for p in rows:
+        if p.period_key == plan_month_key:
+            current[p.metric] = float(p.target)
+        elif p.period_key < plan_month_key:
+            past[p.metric].append(p.period_key)
+            past_target[(p.metric, p.period_key)] = float(p.target)
+    carryover: dict[str, float] = {}
+    if past:
+        past_keys = {pk for keys in past.values() for pk in keys}
+        month_facts = {
+            pk: await _month_facts(session, int(pk[:4]), int(pk[5:7])) for pk in past_keys
+        }
+        for metric, keys in past.items():
+            if metric in _NO_CARRYOVER:
+                continue
+            plan_sum = sum(past_target[(metric, pk)] for pk in keys)
+            fact_sum = sum(month_facts[pk].get(metric, 0.0) for pk in keys)
+            carryover[metric] = plan_sum - fact_sum
+    return current, carryover
+
+
 @router.get("/kpis", response_model=list[KpiOut])
-async def kpis(period: str = "day", session: AsyncSession = Depends(get_session)):
+async def kpis(
+    period: str = "day",
+    owner_id: int | None = None,
+    session: AsyncSession = Depends(get_session),
+):
     """Показатели «План/Факт» за период (день/неделя/месяц/квартал/год, sales-34).
 
     Факт — сумма активностей за окно периода (от последней даты назад); план —
-    дневная цель, масштабированная на число рабочих дней периода.
+    дневная цель, масштабированная на число рабочих дней периода. Период также
+    принимает конкретный месяц вида ``"YYYY-MM"`` (напр. ``"2026-05"``) — тогда
+    окно факта фиксировано на этот календарный месяц (а не «от последней даты
+    назад»), а план масштабируется на число рабочих дней (пн-пт) этого месяца.
+
+    ``owner_id`` (опц.): если у продавца есть согласованный (``approved``) месячный план
+    по метрике, «План» = его target ВМЕСТО дневной цели × mult; для деньги-метрик к нему
+    добавляется кумулятивный добор до годовой цели (недобор прошлых месяцев года поднимает
+    цель, перевыполнение — снижает). Без ``owner_id`` — прежнее поведение (доска не меняется).
     """
     targets = (
         await session.execute(select(KpiTarget).order_by(KpiTarget.sort_order))
     ).scalars().all()
 
-    latest = (await session.execute(select(func.max(Activity.date)))).scalar()
+    month_match = MONTH_PERIOD_RE.match(period)
+    if month_match and not (
+        1 <= int(month_match.group(1)) and 1 <= int(month_match.group(2)) <= 12
+    ):
+        month_match = None
+
+    # Обе ветки вычисляют окно факта [start, end] и множитель плана mult; сам агрегат
+    # по Activity выполняется ОДИН раз ниже (не дублируем запрос — иначе правки логики
+    # факта разъезжаются между «месяцем» и relative-периодом).
+    if month_match:
+        year, month = int(month_match.group(1)), int(month_match.group(2))
+        _, days_in_month = calendar.monthrange(year, month)
+        start: date | None = date(year, month, 1)
+        end = date(year, month, days_in_month)
+        mult = sum(
+            1
+            for day in range(1, days_in_month + 1)
+            if date(year, month, day).weekday() < 5
+        )
+    else:
+        latest = (await session.execute(select(func.max(Activity.date)))).scalar()
+        start = None if latest is None else latest - timedelta(days=PERIOD_DAYS.get(period, 1) - 1)
+        end = latest
+        mult = PERIOD_MULT.get(period, 1)
+
     actuals: dict[str, float] = {}
-    if latest is not None:
-        start = latest - timedelta(days=PERIOD_DAYS.get(period, 1) - 1)
+    if start is not None:
         rows = await session.execute(
             select(Activity.kpi_key, func.coalesce(func.sum(Activity.value), 0))
-            .where(Activity.date >= start, Activity.date <= latest)
+            .where(Activity.date >= start, Activity.date <= end)
             .group_by(Activity.kpi_key)
         )
         actuals = {key: float(total) for key, total in rows.all()}
+        if month_match and end is not None:
+            facts = await compute_operational_kpi_facts(session, start, end)
+            for key, value in facts.items():
+                if key in OPERATIONAL_KPI_KEYS or key in BOARD_EXTRA_TARGETS:
+                    actuals[key] = value
 
-    mult = PERIOD_MULT.get(period, 1)
+    # Согласованный план продавца как «План» метрики + кумулятивный добор (только деньги).
+    plan_current: dict[str, float] = {}
+    plan_carry: dict[str, float] = {}
+    # Оверрайд согласованным месячным планом — ТОЛЬКО для месячного периода: месячный target
+    # когерентен лишь с месячным окном факта (иначе цель месяца против факта дня/недели даёт
+    # бессмысленный процент). День/неделя/квартал/год — прежнее поведение доски без оверрайда.
+    if owner_id is not None and month_match:
+        plan_current, plan_carry = await _owner_plan_overrides(session, owner_id, period)
+
+    def _pct(actual: float, target: float, overridden: bool) -> int:
+        if target > 0:
+            return round(min(100.0, actual / target * 100))
+        # добор ушёл в минус (перевыполнение банкуется) → план перекрыт; иначе цели нет
+        return 100 if overridden else 0
+
     result: list[KpiOut] = []
+    seen: set[str] = set()
     for t in targets:
         actual = actuals.get(t.key, 0.0)
         target = float(t.target) * mult
-        percent = round(min(100.0, actual / target * 100)) if target else 0
+        overridden = owner_id is not None and t.key in plan_current
+        if overridden:
+            target = plan_current[t.key]
+            if t.unit == "money":
+                target += plan_carry.get(t.key, 0.0)
         result.append(
             KpiOut(
                 key=t.key,
                 title=t.title,
                 target=target,
                 actual=actual,
-                percent=percent,
+                percent=_pct(actual, target, overridden),
                 unit=t.unit,
                 icon=t.icon,
                 tone=t.tone,
+            )
+        )
+        seen.add(t.key)
+    # Метрики первичного ряда доски, отсутствующие в kpi_target.
+    for key, (title, unit, icon, tone, daily) in BOARD_EXTRA_TARGETS.items():
+        if key in seen:
+            continue
+        actual = actuals.get(key, 0.0)
+        target = daily * mult
+        overridden = owner_id is not None and key in plan_current
+        if overridden:
+            target = plan_current[key]
+            if unit == "money":
+                target += plan_carry.get(key, 0.0)
+        result.append(
+            KpiOut(
+                key=key,
+                title=title,
+                target=target,
+                actual=actual,
+                percent=_pct(actual, target, overridden),
+                unit=unit,
+                icon=icon,
+                tone=tone,
             )
         )
     return result
@@ -265,8 +1005,34 @@ async def create_activity(payload: ActivityCreate, session: AsyncSession = Depen
 
 
 @router.get("/deals", response_model=list[DealRead])
-async def list_deals(session: AsyncSession = Depends(get_session)):
-    """Плоский список сделок."""
+async def list_deals(
+    stuck_days: int = 0,
+    has_open_task: bool | None = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """Плоский список сделок. ``stuck_days>0`` — только «висяки» (SALES-43): открытые
+    сделки без смены стадии дольше N дней. ``has_open_task=false`` — открытые сделки
+    без единой открытой задачи (отчёт «брошенные», SALES-41)."""
+    if stuck_days > 0:
+        cutoff = _utcnow() - timedelta(days=stuck_days)
+        return (
+            await session.execute(
+                select(Deal)
+                .where(Deal.stage.notin_(TERMINAL_STAGES), Deal.stage_changed_at < cutoff)
+                .order_by(Deal.id)
+            )
+        ).scalars().all()
+    if has_open_task is False:
+        open_deal_ids = (
+            select(DealTask.deal_id).where(DealTask.status == "open").distinct()
+        )
+        return (
+            await session.execute(
+                select(Deal)
+                .where(Deal.stage.notin_(TERMINAL_STAGES), Deal.id.notin_(open_deal_ids))
+                .order_by(Deal.id)
+            )
+        ).scalars().all()
     return await DealRepository(session).list()
 
 
@@ -334,24 +1100,1280 @@ async def get_deal(deal_id: int, session: AsyncSession = Depends(get_session)):
     documents = [DocumentOut.model_validate(d) for d in docs]
 
     return DealDetailOut(
-        **DealRead.model_validate(deal).model_dump(), items=items, documents=documents
+        **DealRead.model_validate(deal).model_dump(),
+        items=items,
+        documents=documents,
+        counterparty_ref=await _counterparty_ref(session, deal),
     )
+
+
+async def _emit_ship_deadline(session: AsyncSession, core: Core, deal: Deal) -> None:
+    """Сигнал в закупки о крайней дате отгрузки сделки (``sales.deal.ship_deadline.set``).
+
+    Несёт дату + сводку штрафа за опоздание + позиции (sku/qty) — чтобы закупки видели риск
+    срыва и что закупать к сроку. Новое ребро sales→procurement (потребитель подключится позже).
+    """
+    items_rows = (
+        await session.execute(select(DealItem).where(DealItem.deal_id == deal.id))
+    ).scalars().all()
+    sku_ids = [r.sku_id for r in items_rows]
+    sku_map: dict[int, Sku] = {}
+    if sku_ids:
+        sku_map = {
+            s.id: s for s in (
+                await session.execute(select(Sku).where(Sku.id.in_(sku_ids)))
+            ).scalars().all()
+        }
+    items = [
+        {
+            "sku_code": sku_map[r.sku_id].code if r.sku_id in sku_map else "",
+            "title": sku_map[r.sku_id].title if r.sku_id in sku_map else "",
+            "qty": float(r.qty),
+        }
+        for r in items_rows
+    ]
+    core.event_bus.emit(
+        session,
+        "sales.deal.ship_deadline.set",
+        {
+            "deal_id": deal.id,
+            "number": deal.number,
+            "counterparty": deal.counterparty,
+            "ship_deadline": deal.ship_deadline,
+            "penalty_rate_pct": (
+                float(deal.penalty_rate_pct) if deal.penalty_rate_pct is not None else None
+            ),
+            "penalty_cap_pct": (
+                float(deal.penalty_cap_pct) if deal.penalty_cap_pct is not None else None
+            ),
+            "penalty_terms": deal.penalty_terms,
+            "items": items,
+            "actor": "sales",
+            "entity_ref": f"deal:{deal.id}",
+        },
+    )
+
+
+async def _stage_kind_map(session: AsyncSession, funnel: str) -> dict[str, str]:
+    """code → kind (won|lost|cond_lost|normal) для активных стадий воронки.
+
+    Источник — таблица ``Stage``; если для воронки она не материализована (пусто),
+    фолбэк на канон ``stages.py``. Общий резолвер для win_deal (won-код воронки) и
+    update_deal (терминальность стадии при реверсе) — цикл 18 верификации.
+    """
+    rows = (
+        await session.execute(
+            select(Stage.code, Stage.kind)
+            .where(Stage.funnel == funnel, Stage.is_active)
+            .order_by(Stage.sort_order)
+        )
+    ).all()
+    if rows:
+        return {code: kind for code, kind in rows}
+    return {s["code"]: s["kind"] for s in canonical_stages() if s["funnel"] == funnel}
+
+
+async def _won_pairs(session: AsyncSession) -> set[tuple[str, str]]:
+    """(funnel, код_стадии) c kind == "won" по ВСЕМ известным воронкам (канон ``FUNNELS`` +
+    материализованные в ``sales.stage``) — won-код стадии свой у каждой воронки
+    (``won``/``rp_won``/``tn_won``). Общий резолвер для ``/journal`` и ``/plan-sources``.
+    """
+    funnel_codes = {f["code"] for f in FUNNELS}
+    funnel_codes |= set((await session.execute(select(Stage.funnel).distinct())).scalars().all())
+    pairs: set[tuple[str, str]] = set()
+    for funnel in funnel_codes:
+        kind_map = await _stage_kind_map(session, funnel)
+        pairs |= {(funnel, code) for code, kind in kind_map.items() if kind == "won"}
+    return pairs
 
 
 @router.patch("/deals/{deal_id}", response_model=DealRead)
 async def update_deal(
     deal_id: int,
     payload: DealUpdate,
+    core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.write")),
 ):
-    """Частично обновить сделку (например, сменить стадию при drag&drop)."""
+    """Частично обновить сделку. Смена стадии (drag&drop) пишется в историю и
+    обновляет ``stage_changed_at`` через единый хелпер ``record_stage`` (SALES-43)."""
     repo = DealRepository(session)
     deal = await repo.get(deal_id)
     if deal is None:
         raise HTTPException(status_code=404, detail="Сделка не найдена")
-    await repo.update(deal, payload.model_dump(exclude_unset=True))
+    data = payload.model_dump(exclude_unset=True)
+    new_stage = data.pop("stage", None)
+    new_funnel = data.pop("funnel", None)
+    # R5-3: нельзя двинуть сделку в стадию ЧУЖОЙ воронки — иначе сделка выпадает с обеих досок
+    # (funnel=new_clients + stage=rp_won не существует ни в одной колонке). Валидируем против
+    # стадий целевой воронки (новой, если меняем; иначе текущей).
+    target_funnel = new_funnel if new_funnel is not None else deal.funnel
+    if new_stage is not None and new_stage != deal.stage:
+        kind_by_code = await _stage_kind_map(session, target_funnel)
+        if new_stage not in kind_by_code:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Стадия {new_stage!r} не принадлежит воронке {target_funnel!r}",
+            )
+        # Фикс 2 (цикл 18 верификации): реверс в НЕтерминальную стадию (normal/cond_lost) —
+        # сбросить closed_date, иначе сделка, возвращённая в работу, числится закрытой в отчётах.
+        if kind_by_code.get(new_stage, "normal") not in ("won", "lost") and deal.closed_date:
+            deal.closed_date = None
+    # Смена воронки фиксируется в истории как смена стадии (источник → стадия первой стадии
+    # новой воронки), чтобы фронт-таймлайн не терял этот шаг; реальный новый стадия-код может
+    # прилететь следующим PATCH (drag&drop на доске уже другой воронки).
+    if new_funnel is not None and new_funnel != deal.funnel:
+        from_stage = deal.stage
+        deal.funnel = new_funnel
+        record_stage(session, deal, deal.stage, by=user.username)
+        # ponytail: stage остаётся прежним кодом; если код несуществует в новой воронке,
+        # доска покажет сделку «вне колонок» — UI должен сменить стадию следующим действием.
+        deal.next_step = f"Воронка: {from_stage} → {new_funnel}"
+    if new_stage is not None and new_stage != deal.stage:
+        record_stage(session, deal, new_stage, by=user.username)
+    old_deadline = deal.ship_deadline
+    await repo.update(deal, data)
+    # Крайняя дата отгрузки выставлена/изменена → сигнал в закупки (ребро sales→procurement).
+    if "ship_deadline" in data and deal.ship_deadline and deal.ship_deadline != old_deadline:
+        await _emit_ship_deadline(session, core, deal)
     await session.commit()
     return deal
+
+
+async def _deal_margin(
+    session: AsyncSession, core: Core, deal: Deal
+) -> tuple[list[MarginLine], bool]:
+    """Маржа позиций сделки: список ``MarginLine`` + признак отсутствия ЛЮБОГО источника себеса.
+
+    Единый расчёт для карточки (``GET /deals/{id}/margin``) и прогноза воронки
+    (``GET /pipeline/margin-forecast``) — DRY, обе считают одинаково. Приоритет источников (PC3):
+    себестоимость — 1С через фасад ``price_cost`` (``onec``/``demo``), иначе landed из закупок
+    (фолбэк/сверка), иначе нет. Цена клиенту — котировка КП (``quote``) перекрывает всё, иначе
+    дефолт из прайса 1С (``price_cost.price_byn``), иначе нет; ``revenue = price×qty`` не зависит
+    от себеса. Каждая строка несёт провенанс ``cost_source``/``price_source``.
+
+    Второй элемент кортежа — ``True``, когда НЕ подключён ни один источник себеса (оба фасада
+    ``None``). Когда ``price_cost`` не подключён (дефолт/прод/тесты) — равен «landed is None»,
+    т.е. прежнее поведение (только landed + КП) сохраняется байт-в-байт. Пустой список =
+    у сделки нет позиций.
+    """
+    rows = (
+        await session.execute(select(DealItem).where(DealItem.deal_id == deal.id))
+    ).scalars().all()
+    landed_facade = getattr(core.services, "landed_cost", None)
+    pc_facade = getattr(core.services, "price_cost", None)
+    # Деградация себеса для вызывающих: нет НИ landed, НИ 1С-источника. Без price_cost равно
+    # «landed is None» → прежнее поведение и reason у эндпоинтов.
+    cost_facade_missing = landed_facade is None and pc_facade is None
+    if not rows:
+        return [], cost_facade_missing
+
+    skus = {
+        s.id: s for s in (
+            await session.execute(select(Sku).where(Sku.id.in_([r.sku_id for r in rows])))
+        ).scalars().all()
+    }
+    codes = sorted({skus[r.sku_id].code for r in rows if r.sku_id in skus})
+
+    # Последняя цена клиенту (КП) по (sku_code, counterparty) — как ``_price_summary``.
+    last_price: dict[str, float] = {}
+    if codes:
+        quotes = (
+            await session.execute(
+                select(PriceQuote)
+                .where(PriceQuote.counterparty == deal.counterparty, PriceQuote.sku_code.in_(codes))
+                .order_by(PriceQuote.id)
+            )
+        ).scalars().all()
+        for q in quotes:
+            last_price[q.sku_code] = float(q.price)  # перезаписываем — побеждает последняя
+
+    # Цена/себес из 1С через фасад ядра (приоритетный источник). None → фасад не подключён.
+    pc_map: dict[str, ItemPriceCost] = {}
+    if pc_facade is not None and codes:
+        pc_map = await pc_facade.get_item_price_cost(session, codes)
+
+    # Landed себестоимость через фасад ядра (фолбэк/сверка). None → procurement не подключён.
+    landed_map: dict[str, dict | None] = {}
+    if landed_facade is not None and codes:
+        landed_map = await landed_facade.last_landed_cost_batch(session, codes)
+
+    lines: list[MarginLine] = []
+    for r in rows:
+        sku = skus.get(r.sku_id)
+        code = sku.code if sku else ""
+        title = sku.title if sku else ""
+        qty = float(r.qty)
+        pc = pc_map.get(code)
+
+        # Цена клиенту: КП перекрывает всё; иначе дефолт из прайса 1С (с пометкой источника).
+        quote_price = last_price.get(code)
+        if quote_price is not None:
+            price, price_source = quote_price, "quote"
+        elif pc is not None and pc.price_byn is not None:
+            price, price_source = pc.price_byn, pc.source  # onec / demo
+        else:
+            price, price_source = None, None
+
+        # Себестоимость: 1С (onec/demo) приоритетнее landed; landed — фолбэк/сверка.
+        cost_row = landed_map.get(code)
+        if pc is not None and pc.cost_byn is not None:
+            unit_cost, cost_source = pc.cost_byn, pc.source  # onec / demo
+        elif cost_row:
+            unit_cost, cost_source = float(cost_row["unit_landed_cost_byn"]), "landed"
+        else:
+            unit_cost, cost_source = None, None
+
+        # landed-провенанс (партия/курс) осмыслен ТОЛЬКО когда себес взят из landed.
+        from_landed = cost_source == "landed" and cost_row is not None
+        lines.append(
+            MarginLine(
+                sku_code=code, title=title, qty=qty,
+                unit_price=price,
+                revenue=price * qty if price is not None else None,
+                unit_landed_cost=unit_cost,
+                cogs=unit_cost * qty if unit_cost is not None else None,
+                margin_pct=(
+                    round((price - unit_cost) / price * 100)
+                    if price and unit_cost is not None and price > 0 else None
+                ),
+                status=(
+                    "priced" if price is not None and unit_cost is not None
+                    else ("no_cost" if price is not None else "no_price")
+                ),
+                cost_shipment_id=cost_row.get("shipment_id") if from_landed else None,
+                cost_fixed_at=cost_row.get("fixed_at") if from_landed else None,
+                cost_fx_rate=(
+                    float(cost_row["fx_rate"])
+                    if from_landed and cost_row.get("fx_rate") is not None else None
+                ),
+                cost_source=cost_source,
+                price_source=price_source,
+            )
+        )
+    return lines, cost_facade_missing
+
+
+async def _audit_landed_unit_by_sku(
+    session: AsyncSession, codes: list[str]
+) -> dict[str, Decimal]:
+    """Актуальная landed-себестоимость по ``sku_code`` из аудита событий
+    ``procurement.landed_cost.calculated`` (через outbox/шину, БЕЗ импорта procurement/finance).
+
+    Берём ПОСЛЕДНЕЕ событие на sku_code (по ``id`` — позже зафиксированный ``actual`` бьёт
+    ранний ``estimated``). Возвращаем ``{sku_code: unit_landed_cost_byn}``; пусто = нет фактов.
+
+    ponytail: full-scan по event_type без БД-фильтра по sku и без LIMIT — приемлемо для dev/MVP;
+    при росте append-only outbox_event сузить (JSON-фильтр payload->>'sku_code' IN codes на PG /
+    последнее событие на sku через подзапрос). На event_type индекса пока нет.
+    """
+    if not codes:
+        return {}
+    codeset = set(codes)
+    events = (
+        await session.execute(
+            select(OutboxEvent)
+            .where(OutboxEvent.event_type == "procurement.landed_cost.calculated")
+            .order_by(OutboxEvent.id)
+        )
+    ).scalars().all()
+    out: dict[str, Decimal] = {}
+    for ev in events:  # id по возрастанию → последнее (actual) побеждает estimated
+        payload = ev.payload or {}
+        sku = payload.get("sku_code")
+        if sku not in codeset:
+            continue
+        val = payload.get("unit_landed_cost_byn")
+        if val is None:
+            continue
+        try:
+            out[sku] = Decimal(str(val))
+        except (InvalidOperation, ValueError):
+            continue
+    return out
+
+
+@router.get("/deals/{deal_id}/margin", response_model=DealMarginOut)
+async def deal_margin(
+    deal_id: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Факт-маржа сделки: цена из ``PriceQuote`` × qty минус landed × qty (по позициям).
+
+    Цена — последняя котировка клиенту (``PriceQuote(sku_code, counterparty)``); себес —
+    через фасад ``core.services.landed_cost.last_landed_cost_batch`` (модуль procurement,
+    результат закрытой партии). Деградация honest: фасад ``None`` → ``cogs_landed=None`` +
+    причина; позиции без цены/себеса в gross НЕ попадают (``no_price``/``no_cost``).
+    Методику установки цены НЕ изобретаем — отдаём ФАКТ-маржу где данные уже есть.
+    """
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+
+    lines, facade_missing = await _deal_margin(session, core, deal)
+    if not lines:
+        return DealMarginOut(
+            deal_id=deal_id, revenue=0.0, cogs_landed=0.0, gross_profit=0.0,
+            margin_pct=None, priced_count=0, total_count=0,
+            reason="Позиций нет — маржа не рассчитывается",
+        )
+
+    revenue = sum((ln.revenue or 0.0) for ln in lines if ln.status == "priced")
+    cogs = sum((ln.cogs or 0.0) for ln in lines if ln.status == "priced")
+    priced = sum(1 for ln in lines if ln.status == "priced")
+    total = len(lines)
+
+    if facade_missing:
+        return DealMarginOut(
+            deal_id=deal_id, revenue=revenue, cogs_landed=None, gross_profit=None,
+            margin_pct=None, priced_count=priced, total_count=total,
+            reason="Себестоимость закупок не подключена (procurement не реализовал фасад landed_cost)",
+            lines=lines,
+        )
+    if priced == 0:
+        # R5-4: фасад есть, но ни одна позиция не оценена → маржа НЕИЗВЕСТНА (None), а не 0.
+        # 0 ≠ «неизвестно»: продавец не должен принять «нулевую маржу» вместо «нет данных».
+        return DealMarginOut(
+            deal_id=deal_id, revenue=revenue, cogs_landed=None, gross_profit=None,
+            margin_pct=None, priced_count=0, total_count=total,
+            reason="Ни по одной позиции нет одновременно цены клиенту и landed cost",
+            lines=lines,
+        )
+    gross = revenue - cogs
+    margin_pct = round(gross / revenue * 100) if revenue > 0 else None
+    return DealMarginOut(
+        deal_id=deal_id, revenue=revenue, cogs_landed=cogs, gross_profit=gross,
+        margin_pct=margin_pct, priced_count=priced, total_count=total, lines=lines,
+    )
+
+
+@router.get("/pipeline/margin-forecast", response_model=MarginForecastOut)
+async def pipeline_margin_forecast(
+    funnel: str = DEFAULT_FUNNEL,
+    owner: str = "",
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Взвешенный прогноз ВАЛОВОЙ МАРЖИ воронки (S3-1) — маржа из карточки на уровень воронки.
+
+    По активным (нетерминальным) сделкам считаем factual-маржу тем же путём, что
+    ``/deals/{id}/margin`` (общий хелпер ``_deal_margin``), и взвешиваем на вероятность стадии:
+    ``revenue_weighted`` — по позициям с ценой клиенту (не зависит от landed, всегда число),
+    ``gross_weighted`` — по ``priced``-позициям (есть и цена, и landed). Нет фасада landed_cost
+    → ``gross_weighted=null`` + причина (честная деградация, НЕ 0), выручка остаётся числом.
+
+    ponytail: O(сделок) вызовов фасада (по сделке) — допустимо для десятков активных сделок;
+    батч-расчёт по всей воронке за один проход — если вырастет.
+    """
+    stage_rows = await _board_stages(session, funnel)
+    prob_by_stage = {s["id"]: s["probability"] for s in stage_rows}
+
+    deals = await DealRepository(session).list()
+    deals = [
+        d for d in deals
+        if d.funnel == funnel and d.stage not in TERMINAL_STAGES and d.stage != "cond_lost"
+    ]
+    if owner:
+        deals = [d for d in deals if d.owner == owner]
+
+    # Деградация вал.прибыли: нет НИ landed, НИ 1С-источника себеса (PC3) — согласовано с карточкой
+    # (``_deal_margin``). Без price_cost равно «landed is None» → прежнее поведение прогноза.
+    facade_missing = (
+        getattr(core.services, "landed_cost", None) is None
+        and getattr(core.services, "price_cost", None) is None
+    )
+    revenue_weighted = 0.0
+    gross_weighted: float | None = None if facade_missing else 0.0
+    deals_priced = 0
+    for d in deals:
+        lines, _fm = await _deal_margin(session, core, d)
+        prob = d.probability if d.probability is not None else prob_by_stage.get(d.stage, 0)
+        w = prob / 100
+        revenue_weighted += sum((ln.revenue or 0.0) for ln in lines if ln.revenue is not None) * w
+        if not facade_missing and any(ln.status == "priced" for ln in lines):
+            deal_gross = sum(
+                (ln.revenue or 0.0) - (ln.cogs or 0.0) for ln in lines if ln.status == "priced"
+            )
+            gross_weighted = (gross_weighted or 0.0) + deal_gross * w
+            deals_priced += 1
+
+    # R5-4: фасад есть, но ни одна активная сделка не оценена → вал.прибыль НЕИЗВЕСТНА (null), не 0.
+    if not facade_missing and deals_priced == 0:
+        gross_weighted = None
+    margin_pct_blended: int | None = None
+    if gross_weighted is not None and revenue_weighted > 0:
+        margin_pct_blended = round(gross_weighted / revenue_weighted * 100)
+
+    reason: str | None = None
+    if facade_missing:
+        reason = "Себестоимость закупок не подключена (procurement не реализовал фасад landed_cost)"
+    elif deals_priced == 0:
+        reason = "Ни по одной активной сделке нет одновременно цены клиенту и landed cost"
+
+    return MarginForecastOut(
+        funnel=funnel,
+        owner=owner or None,
+        revenue_weighted=round(revenue_weighted, 2),
+        gross_weighted=round(gross_weighted, 2) if gross_weighted is not None else None,
+        margin_pct_blended=margin_pct_blended,
+        deals_priced=deals_priced,
+        deals_total=len(deals),
+        reason=reason,
+    )
+
+
+@router.get("/deals/{deal_id}/margin/reconcile", response_model=MarginReconcileOut)
+async def deal_margin_reconcile(
+    deal_id: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Сверка прогнозной маржи sales с фактической себестоимостью из аудита шины (S3-4, ось A).
+
+    Уровень — sku/агрегат сделки: ``procurement.landed_cost.calculated`` НЕ несёт deal_id
+    (PO обслуживает много сделок), поэтому сверяем по ``sku_code`` позиций. ``sales_forecast_gross``
+    — наш расчёт (landed snapshot фасада, как карточка); ``finance_actual_gross`` — та же выручка
+    минус landed из аудита событий (БЕЗ импорта finance/procurement). Нет landed-событий по
+    позициям → ``no_finance`` (никогда не 500). ``delta`` = sales − finance.
+
+    ⚠ BLOCKED-office (PC3): сегодня ``price_cost`` не подключён → ``ln.cogs`` = landed, сверка
+    landed-vs-landed (как задумано). Когда подключат 1С, себес карточки может прийти из 1С и
+    перекрыть landed (приоритет источников в ``_deal_margin``); тогда ``sales_forecast_gross``
+    будет по 1С-себесу, а ``finance_actual_gross`` — по landed из аудита, и ``delta`` покажет
+    РАЗНИЦУ ИСТОЧНИКОВ, а не расхождение прогноза с фактом (ложный ``diverged``). Что именно
+    сверять при живой 1С (landed-vs-landed строго ∨ 1С-vs-landed как самостоятельную сверку) —
+    решение оператора на реальных данных (память cost-price-from-1c-decision, офисный чек-лист
+    п.4). Не гадаем здесь; правим вместе с наполнением 1С в integrations.
+    """
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+
+    lines, facade_missing = await _deal_margin(session, core, deal)
+    priced_lines = [ln for ln in lines if ln.status == "priced"]
+    sales_forecast_gross: float | None = None
+    if not facade_missing and priced_lines:
+        sales_forecast_gross = round(
+            sum((ln.revenue or 0.0) - (ln.cogs or 0.0) for ln in priced_lines), 2
+        )
+
+    # Факт себестоимости из аудита шины по тем же sku (агрегат, не по сделке).
+    audit_unit = await _audit_landed_unit_by_sku(
+        session, sorted({ln.sku_code for ln in priced_lines if ln.sku_code})
+    )
+    finance_actual_gross: float | None = None
+    if audit_unit:
+        total = 0.0
+        matched = False
+        for ln in priced_lines:
+            unit_actual = audit_unit.get(ln.sku_code)
+            if unit_actual is not None and ln.unit_price is not None:
+                matched = True
+                total += (ln.unit_price - float(unit_actual)) * ln.qty
+        if matched:
+            finance_actual_gross = round(total, 2)
+
+    delta: float | None = None
+    if sales_forecast_gross is not None and finance_actual_gross is not None:
+        delta = round(sales_forecast_gross - finance_actual_gross, 2)
+    if finance_actual_gross is None:
+        status = "no_finance"
+    elif delta is None:
+        status = "diverged"  # факт есть, но sales-сторона недоступна (нет фасада/priced)
+    else:
+        status = "converged" if abs(delta) < 0.01 else "diverged"
+
+    return MarginReconcileOut(
+        deal_id=deal_id,
+        sales_forecast_gross=sales_forecast_gross,
+        finance_actual_gross=finance_actual_gross,
+        delta=delta,
+        level="sku_aggregate",
+        status=status,
+    )
+
+
+def _journal_closed_on(deal: Deal) -> date | None:
+    """Дата закрытия won-сделки для журнала: ``closed_date`` ("dd.mm.yyyy"), а если пуст/не
+    парсится (legacy-won/мусор) — фолбэк на дату ``stage_changed_at`` (переход в won зафиксирован
+    там же — тот же приём, что средний цикл в ``pipeline_analytics``)."""
+    if deal.closed_date:
+        try:
+            return datetime.strptime(deal.closed_date, "%d.%m.%Y").date()
+        except ValueError:
+            pass
+    return deal.stage_changed_at.date() if deal.stage_changed_at is not None else None
+
+
+@router.get("/journal", response_model=list[JournalRowOut])
+async def sales_journal(
+    owner: str = "",
+    # ponytail: срез по last-N без keyset-курсора — реестр won-сделок за всё время может
+    # вырасти в тысячи; курсорная пагинация — если понадобится глубокая история.
+    limit: int = 200,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """«Журнал продаж» — реестр ЗАКРЫТЫХ WON-сделок по всем воронкам (факт закрытия, маржа,
+    оплата, отгрузка) для экрана ``/crm/sales`` (лента как журнал документов 1С).
+
+    Funnel-aware: won-код стадии свой у каждой воронки (``won``/``rp_won``/``tn_won``) —
+    резолвим общим хелпером ``_won_pairs`` (канон ``FUNNELS`` + материализованные в
+    ``sales.stage``), затем фильтруем по точной паре (funnel, stage) — коды воронок
+    уникальны, но пара надёжнее на случай будущего пересечения кодов.
+    Маржа — тем же хелпером ``_deal_margin``, что и карточка/прогноз (DRY); честная
+    деградация (``None`` + ``margin_reason``), НЕ 0.
+    """
+    won_pairs = await _won_pairs(session)
+    if not won_pairs:
+        return []
+    won_codes = {code for _, code in won_pairs}
+
+    deals = (
+        await session.execute(select(Deal).where(Deal.stage.in_(won_codes)))
+    ).scalars().all()
+    deals = [d for d in deals if (d.funnel, d.stage) in won_pairs]
+    if owner:
+        deals = [d for d in deals if d.owner == owner]
+
+    closed_by_deal = {d.id: _journal_closed_on(d) for d in deals}
+    deals.sort(key=lambda d: (closed_by_deal[d.id] or date.min, d.id), reverse=True)
+    deals = deals[: max(limit, 0)]
+    deal_ids = [d.id for d in deals]
+
+    # Оплата: один запрос по всем сделкам разом — счета (kind=invoice), paid побеждает
+    # posted; posted ("записан в 1С") — НЕ оплата, это уже ловили на ревью.
+    paid_number: dict[int, str] = {}
+    posted_number: dict[int, str] = {}
+    if deal_ids:
+        docs = (
+            await session.execute(
+                select(DealDocument)
+                .where(DealDocument.deal_id.in_(deal_ids), DealDocument.kind == "invoice")
+                .order_by(DealDocument.id)
+            )
+        ).scalars().all()
+        for doc in docs:  # id по возрастанию
+            if doc.status == "paid":
+                paid_number.setdefault(doc.deal_id, doc.number)
+            elif doc.status == "posted":
+                posted_number[doc.deal_id] = doc.number  # перезаписываем — последний побеждает
+
+    # Отгрузка: full-scan outbox по event_type (образец — ``_audit_landed_unit_by_sku``,
+    # тот же ponytail: без БД-фильтра по deal_id и без индекса на event_type — приемлемо
+    # для dev/MVP; сузить при росте append-only outbox_event).
+    delivered_ids: set[int] = set()
+    if deal_ids:
+        idset = set(deal_ids)
+        events = (
+            await session.execute(
+                select(OutboxEvent).where(OutboxEvent.event_type == "logistics.shipment.delivered")
+            )
+        ).scalars().all()
+        for ev in events:
+            did = (ev.payload or {}).get("deal_id")
+            if did in idset:
+                delivered_ids.add(did)
+
+    rows: list[JournalRowOut] = []
+    for d in deals:
+        # ponytail: O(сделок) вызовов _deal_margin (по сделке) — как в margin-forecast;
+        # приемлемо для среза last-N, батч-расчёт — если вырастет.
+        lines, facade_missing = await _deal_margin(session, core, d)
+        priced = [ln for ln in lines if ln.status == "priced"]
+        revenue: float | None = None
+        gross_profit: float | None = None
+        margin_pct: int | None = None
+        margin_reason: str | None = None
+        if not lines:
+            margin_reason = "Позиций нет — маржа не рассчитывается"
+        elif facade_missing:
+            margin_reason = (
+                "Себестоимость закупок не подключена (procurement не реализовал фасад landed_cost)"
+            )
+        elif not priced:
+            margin_reason = "Ни по одной позиции нет одновременно цены клиенту и landed cost"
+        else:
+            revenue = sum((ln.revenue or 0.0) for ln in priced)
+            cogs = sum((ln.cogs or 0.0) for ln in priced)
+            gross_profit = revenue - cogs
+            margin_pct = round(gross_profit / revenue * 100) if revenue > 0 else None
+
+        if d.id in paid_number:
+            payment, invoice_number = "paid", paid_number[d.id]
+        elif d.id in posted_number:
+            payment, invoice_number = "invoiced", posted_number[d.id]
+        else:
+            payment, invoice_number = "none", None
+
+        closed_on = closed_by_deal[d.id]
+        rows.append(
+            JournalRowOut(
+                deal_id=d.id,
+                number=d.number,
+                title=d.title,
+                counterparty=d.counterparty,
+                owner=d.owner,
+                funnel=d.funnel,
+                amount=float(d.amount),
+                closed_on=closed_on.isoformat() if closed_on else None,
+                revenue=revenue,
+                gross_profit=gross_profit,
+                margin_pct=margin_pct,
+                margin_reason=margin_reason,
+                payment=payment,
+                invoice_number=invoice_number,
+                shipment="delivered" if d.id in delivered_ids else "none",
+            )
+        )
+    return rows
+
+
+@router.get("/deals/{deal_id}/handoff", response_model=DealHandoffOut | None)
+async def deal_handoff(
+    deal_id: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Передача выигранной сделки в исполнение (П10 ТЗ): последний эмитнутый
+    ``sales.deal.handoff`` по этой сделке. None — события ещё нет (сделка не won
+    или handoff не эмитнут / событие в outbox без processed_at)."""
+    from core.domain.models import OutboxEvent
+
+    rows = (
+        await session.execute(
+            select(OutboxEvent)
+            .where(OutboxEvent.event_type == "sales.deal.handoff")
+            .order_by(OutboxEvent.id.desc())
+        )
+    ).scalars().all()
+    for ev in rows:
+        if ev.payload.get("deal_id") == deal_id:
+            payload = ev.payload
+            return DealHandoffOut(
+                deal_id=deal_id,
+                number=payload.get("number") or "",
+                counterparty=payload.get("counterparty") or "",
+                amount=float(payload.get("amount") or 0),
+                owner=payload.get("owner") or "",
+                funnel=payload.get("funnel") or "",
+                items=[HandoffItem(**it) for it in payload.get("items") or []],
+                gross_profit=payload.get("gross_profit"),
+                handed_off_at=ev.created_at,
+            )
+    return None
+
+
+async def _catalog_avg_margin_pct(
+    session: AsyncSession, core: Core
+) -> tuple[int, str] | None:
+    """Средняя маржинальность каталога из прайса 1С (фасад ``price_cost``) — фолбэк-дефолт маржи
+    для конструктора плана, когда у продавца нет истории won. Считаем avg (цена−себес)/цена по SKU,
+    у которых фасад дал и цену, и себес. Возврат ``(margin_pct, source)`` или ``None`` (фасад не
+    подключён / нет данных). ``source`` — провенанс из фасада (``onec``/``demo``).
+
+    ponytail: полный проход по каталогу + вызов фасада на все коды — приемлемо для экрана настройки
+    плана (не hot path, дёргается лишь при пустой истории); при большом каталоге — семпл/кэш.
+    """
+    pc_facade = getattr(core.services, "price_cost", None)
+    if pc_facade is None:
+        return None
+    codes = (await session.execute(select(Sku.code))).scalars().all()
+    if not codes:
+        return None
+    pc_map = await pc_facade.get_item_price_cost(session, list(codes))
+    ratios: list[float] = []
+    source: str | None = None
+    for item in pc_map.values():
+        if item.price_byn and item.cost_byn is not None and item.price_byn > 0:
+            ratios.append((item.price_byn - item.cost_byn) / item.price_byn)
+            source = source or item.source
+    if not ratios:
+        return None
+    return round(sum(ratios) / len(ratios) * 100), (source or "onec")
+
+
+# ── Конструктор месячного плана продавца (источники + снапшот строк) ──────────────
+@router.get("/plan-sources", response_model=PlanSourcesOut)
+async def plan_sources(
+    month: str,
+    owner: str = "",
+    owner_id: int | None = None,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Источники месячного плана продавца — конструктор собирает план из трёх источников:
+    открытые сделки месяца (``committed``, по ``expected_close_date``/``ship_deadline``),
+    постоянные клиенты по циклу перезаказа (``regulars``, из won-истории) и дефолты
+    калькулятора активности по новым (``defaults``). ``saved_items`` — уже сохранённый
+    снапшот строк (``PlanItem``, см. ``PUT /plan-items``); ``base_gross`` — согласованный
+    план ``gross_profit`` за месяц (существующий ``PlanTarget``), если он есть.
+    """
+    month_start, month_end = _month_bounds(month)
+
+    won_pairs = await _won_pairs(session)
+    deals = (await session.execute(select(Deal))).scalars().all()
+    if owner:
+        deals = [d for d in deals if d.owner == owner]
+    won_deals = [d for d in deals if (d.funnel, d.stage) in won_pairs]
+
+    # Открытые (normal) сделки — kind резолвим по СВОЕЙ воронке каждой сделки, с кэшем.
+    kind_cache: dict[str, dict[str, str]] = {}
+
+    async def _kind_map(funnel: str) -> dict[str, str]:
+        if funnel not in kind_cache:
+            kind_cache[funnel] = await _stage_kind_map(session, funnel)
+        return kind_cache[funnel]
+
+    open_deals = [d for d in deals if (await _kind_map(d.funnel)).get(d.stage, "normal") == "normal"]
+
+    # committed: expected_close_date ИЛИ ship_deadline попадают в месяц.
+    committed_rows: list[tuple[Deal, date | None, date | None, bool]] = []
+    for d in open_deals:
+        exp = _parse_ddmmyyyy(d.expected_close_date)
+        ship = _parse_ddmmyyyy(d.ship_deadline)
+        use_exp = exp is not None and month_start <= exp <= month_end
+        use_ship = ship is not None and month_start <= ship <= month_end
+        if use_exp or use_ship:
+            committed_rows.append((d, exp, ship, use_exp))
+
+    # Резерв склада — одним запросом по всем сделкам разом (не N+1).
+    reserved_deal_ids: set[int] = set()
+    committed_ids = [d.id for d, *_ in committed_rows]
+    if committed_ids:
+        reserved_deal_ids = set(
+            (
+                await session.execute(
+                    select(DealDocument.deal_id).where(
+                        DealDocument.deal_id.in_(committed_ids),
+                        DealDocument.reserve_status == "reserved",
+                    )
+                )
+            ).scalars().all()
+        )
+
+    stage_prob_cache: dict[str, dict[str, int]] = {}
+
+    async def _prob_by_stage(funnel: str) -> dict[str, int]:
+        if funnel not in stage_prob_cache:
+            stage_prob_cache[funnel] = {
+                r["id"]: r["probability"] for r in await _board_stages(session, funnel)
+            }
+        return stage_prob_cache[funnel]
+
+    committed: list[CommittedRowOut] = []
+    for d, exp, ship, use_exp in committed_rows:
+        when_label = (
+            f"закрытие ~{exp.strftime('%d.%m')}" if use_exp
+            else f"отгрузка до {ship.strftime('%d.%m')}"
+        )
+        if d.id in reserved_deal_ids:
+            when_label = f"🔒 резерв · {when_label}"
+        lines, _facade_missing = await _deal_margin(session, core, d)
+        priced = [ln for ln in lines if ln.status == "priced"]
+        gross = None
+        if priced:
+            revenue = sum((ln.revenue or 0.0) for ln in priced)
+            cogs = sum((ln.cogs or 0.0) for ln in priced)
+            gross = round(revenue - cogs, 2)
+        prob_by_stage = await _prob_by_stage(d.funnel)
+        probability = (
+            d.probability if d.probability is not None else prob_by_stage.get(d.stage, 50)
+        )
+        committed.append(
+            CommittedRowOut(
+                ref=f"deal:{d.id}", title=d.title, when_label=when_label,
+                revenue=float(d.amount), gross=gross, probability=probability,
+            )
+        )
+
+    # defaults: по won-сделкам владельца — средний чек и маржа (для regulars.gross ниже).
+    avg_check_default = (
+        round(sum(float(d.amount) for d in won_deals) / len(won_deals), 2) if won_deals else None
+    )
+    total_revenue = 0.0
+    total_gross = 0.0
+    has_priced = False
+    for d in won_deals:
+        lines, _facade_missing = await _deal_margin(session, core, d)
+        priced = [ln for ln in lines if ln.status == "priced"]
+        if priced:
+            has_priced = True
+            revenue = sum((ln.revenue or 0.0) for ln in priced)
+            cogs = sum((ln.cogs or 0.0) for ln in priced)
+            total_revenue += revenue
+            total_gross += revenue - cogs
+    margin_pct_default = (
+        round(total_gross / total_revenue * 100) if has_priced and total_revenue > 0 else None
+    )
+    margin_pct_source = "history" if margin_pct_default is not None else None
+    # Фолбэк для нового продавца (нет истории won): средняя маржа каталога из прайса 1С
+    # (price_cost), если фасад подключён. Продавец переопределит; источник помечаем для UI.
+    if margin_pct_default is None:
+        catalog = await _catalog_avg_margin_pct(session, core)
+        if catalog is not None:
+            margin_pct_default, margin_pct_source = catalog
+    defaults = CalcDefaultsOut(
+        avg_check=avg_check_default, margin_pct=margin_pct_default,
+        margin_pct_source=margin_pct_source,
+    )
+
+    # regulars: won-сделки, сгруппированные по контрагенту; цикл перезаказа из closed_on.
+    by_counterparty: dict[str, list[Deal]] = defaultdict(list)
+    for d in won_deals:
+        by_counterparty[d.counterparty].append(d)
+
+    regulars: list[RegularRowOut] = []
+    for cp, cp_deals in sorted(by_counterparty.items()):
+        closed_dates = sorted(
+            dt for dt in (_journal_closed_on(dl) for dl in cp_deals) if dt is not None
+        )
+        orders_count = len(cp_deals)
+        cycle_days: int | None = None
+        expected: date | None = None
+        in_month = False
+        if len(closed_dates) >= 2:
+            intervals = [
+                (closed_dates[i + 1] - closed_dates[i]).days for i in range(len(closed_dates) - 1)
+            ]
+            cycle_days = round(sum(intervals) / len(intervals))
+            expected = closed_dates[-1] + timedelta(days=cycle_days)
+            in_month = (month_start <= expected <= month_end) or (expected < month_start)
+        last_order = closed_dates[-1] if closed_dates else None
+        avg_check = round(sum(float(dl.amount) for dl in cp_deals) / len(cp_deals), 2)
+        probability = 80 if orders_count >= 3 else 60
+        gross = (
+            round(avg_check * margin_pct_default / 100, 2) if margin_pct_default is not None else None
+        )
+        regulars.append(
+            RegularRowOut(
+                counterparty=cp, orders_count=orders_count, cycle_days=cycle_days,
+                last_order=last_order.isoformat() if last_order else "",
+                expected=expected.isoformat() if expected else None,
+                in_month=in_month, avg_check=avg_check, probability=probability, gross=gross,
+            )
+        )
+
+    base_gross: float | None = None
+    if owner_id is not None:
+        plan = (
+            await session.execute(
+                select(PlanTarget).where(
+                    PlanTarget.owner_id == owner_id,
+                    PlanTarget.metric == "gross_profit",
+                    PlanTarget.period_type == "month",
+                    PlanTarget.period_key == month,
+                    PlanTarget.status == "approved",
+                )
+            )
+        ).scalars().first()
+        base_gross = float(plan.target) if plan is not None else None
+
+    saved_items: list[PlanItem] = []
+    if owner_id is not None:
+        saved_items = (
+            await session.execute(
+                select(PlanItem)
+                .where(PlanItem.owner_id == owner_id, PlanItem.period_key == month)
+                .order_by(PlanItem.id)
+            )
+        ).scalars().all()
+
+    return PlanSourcesOut(
+        month=month, owner=owner or None, base_gross=base_gross,
+        committed=committed, regulars=regulars, defaults=defaults, saved_items=saved_items,
+    )
+
+
+@router.put("/plan-items", response_model=list[PlanItemOut])
+async def put_plan_items(
+    owner_id: int,
+    period_key: str,
+    payload: list[PlanItemIn],
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Заменить целиком (replace-all) снапшот строк конструктора плана продавца за месяц.
+
+    Пустой ``payload`` — валидный способ очистить снапшот. Строки не участвуют в
+    approvals сами по себе — согласование идёт существующим ``PlanTarget``
+    (``POST /plans`` + ``/submit`` + ``/decide``), продавец сам суммирует строки в цель.
+    """
+    _month_bounds(period_key)  # 422 на кривом формате, границы месяца здесь не нужны
+    await session.execute(
+        delete(PlanItem).where(PlanItem.owner_id == owner_id, PlanItem.period_key == period_key)
+    )
+    items = [
+        PlanItem(owner_id=owner_id, period_key=period_key, **item.model_dump())
+        for item in payload
+    ]
+    session.add_all(items)
+    await session.commit()
+    for item in items:
+        await session.refresh(item)
+    return items
+
+
+# ── Встречное планирование РОП (PlanTarget): продавец предлагает, РОП согласует ────
+@router.get("/plans", response_model=list[PlanTargetOut])
+async def list_plans(
+    owner_id: int | None = None,
+    period_type: str | None = None,
+    period_key: str | None = None,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Список планов продавца по фильтрам. Пусто → []."""
+    stmt = select(PlanTarget)
+    if owner_id is not None:
+        stmt = stmt.where(PlanTarget.owner_id == owner_id)
+    if period_type is not None:
+        stmt = stmt.where(PlanTarget.period_type == period_type)
+    if period_key is not None:
+        stmt = stmt.where(PlanTarget.period_key == period_key)
+    return (await session.execute(stmt.order_by(PlanTarget.metric))).scalars().all()
+
+
+@router.post("/plans", response_model=PlanTargetOut)
+async def upsert_plan(
+    payload: PlanTargetIn,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Поставить/изменить ``draft`` цель по (owner_id, metric, period_type, period_key).
+
+    Upsert по UniqueConstraint; уже согласованный план (``approved``) трогать нельзя — 409.
+    """
+    existing = (
+        await session.execute(
+            select(PlanTarget).where(
+                PlanTarget.owner_id == payload.owner_id,
+                PlanTarget.metric == payload.metric,
+                PlanTarget.period_type == payload.period_type,
+                PlanTarget.period_key == payload.period_key,
+            )
+        )
+    ).scalars().first()
+    if existing is not None:
+        if existing.status == "approved":
+            raise HTTPException(status_code=409, detail="План уже согласован — изменить нельзя")
+        existing.target = payload.target
+        # сброс отказа на draft (продавец может пересогласовать новым значением)
+        if existing.status == "rejected":
+            existing.status = "draft"
+            existing.approved_by = None
+            existing.approved_at = None
+        await session.commit()
+        return existing
+    plan = PlanTarget(
+        owner_id=payload.owner_id,
+        metric=payload.metric,
+        period_type=payload.period_type,
+        period_key=payload.period_key,
+        target=payload.target,
+        status="draft",
+    )
+    session.add(plan)
+    await session.commit()
+    return plan
+
+
+@router.post("/plans/{plan_id}/submit", response_model=PlanTargetOut)
+async def submit_plan(
+    plan_id: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Продавец отправляет ``draft`` план на согласование РОПу (через approvals)."""
+    plan = await session.get(PlanTarget, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="План не найден")
+    if plan.status != "draft":
+        raise HTTPException(status_code=409, detail=f"Нельзя отправить план в статусе {plan.status}")
+    plan.status = "pending_approval"
+    await core.services.approvals.request(
+        session,
+        kind="sales_plan",
+        entity_ref=f"plan:{plan.id}",
+        subject=f"План {plan.metric} {plan.period_type} {plan.period_key} = {float(plan.target)}",
+        requested_by=user.username,
+    )
+    await session.commit()
+    return plan
+
+
+@router.post("/plans/{plan_id}/decide", response_model=PlanTargetOut)
+async def decide_plan(
+    plan_id: int,
+    payload: PlanDecisionIn,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.approve")),
+):
+    """РОП согласует или отклоняет план: approve → approved, иначе → rejected.
+
+    Эмитит ``sales.plan.approved`` / ``sales.plan.rejected`` (actor=РОП → audit). Право
+    ``sales.deal.approve`` уже есть только у роли «РОП».
+    """
+    plan = await session.get(PlanTarget, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="План не найден")
+    if plan.status != "pending_approval":
+        raise HTTPException(
+            status_code=409,
+            detail=f"План в статусе {plan.status} — согласовать нельзя (нужен pending_approval)",
+        )
+    plan.status = "approved" if payload.approved else "rejected"
+    plan.approved_by = user.username
+    plan.approved_at = _utcnow()
+    # Комментарий РОПа пишем и при approve, и при reject (обратная связь по метрике).
+    plan.rop_comment = payload.comment  # пусто → чистит устаревшую причину/комментарий
+    core.event_bus.emit(
+        session,
+        "sales.plan.approved" if payload.approved else "sales.plan.rejected",
+        {
+            "plan_id": plan.id,
+            "owner_id": plan.owner_id,
+            "metric": plan.metric,
+            "period_type": plan.period_type,
+            "period_key": plan.period_key,
+            "target": float(plan.target),
+            "by": user.username,
+            "comment": payload.comment,
+            "actor": "РОП",
+            "entity_ref": f"plan:{plan.id}",
+        },
+    )
+    await session.commit()
+    return plan
+
+
+@router.post("/plans/{plan_id}/reopen", response_model=PlanTargetOut)
+async def reopen_plan(
+    plan_id: int,
+    payload: PlanReopenIn,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.approve")),
+):
+    """Вернуть согласованный план в работу (``approved`` → ``draft``) — действие РОПа.
+
+    Снятие одобрения требует ТОГО ЖЕ права, что и само согласование (``sales.deal.approve``),
+    иначе продавец мог бы в обход отменить решение РОПа над любым (в т.ч. чужим) планом.
+    Сбрасывает согласование (``approved_by``/``approved_at`` = None), ``reason`` кладёт в
+    ``rop_comment`` (пусто — чистит прежний), эмитит ``sales.plan.reopened``. 409, если не ``approved``.
+    Продавец запрашивает пересмотр через РОПа (комментарий/чат) — он и возвращает в работу.
+    """
+    plan = await session.get(PlanTarget, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="План не найден")
+    if plan.status != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail=f"План в статусе {plan.status} — вернуть в работу нельзя (нужен approved)",
+        )
+    plan.status = "draft"
+    plan.approved_by = None
+    plan.approved_at = None
+    plan.rop_comment = payload.reason  # пусто → чистит устаревшую причину
+    core.event_bus.emit(
+        session,
+        "sales.plan.reopened",
+        {
+            "plan_id": plan.id,
+            "owner_id": plan.owner_id,
+            "metric": plan.metric,
+            "period_key": plan.period_key,
+            "by": user.username,
+            "entity_ref": f"plan:{plan.id}",
+        },
+    )
+    await session.commit()
+    return plan
+
+
+@router.get("/loss-reasons", response_model=list[LossReasonOut])
+async def loss_reasons(session: AsyncSession = Depends(get_session)):
+    """Справочник активных причин отказа (для выпадашки модалки «Отказ», SALES-40)."""
+    return (
+        await session.execute(
+            select(LossReason).where(LossReason.active).order_by(LossReason.sort_order)
+        )
+    ).scalars().all()
+
+
+@router.post("/deals/{deal_id}/lose", response_model=DealRead)
+async def lose_deal(
+    deal_id: int,
+    payload: LoseRequest,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(get_current_user),
+    _: object = Depends(require_permission("sales.deal.write")),
+):
+    """Закрыть сделку в отказ с обязательной причиной (SALES-40).
+
+    Причина обязательна; если справочник заполнен — должна быть активным кодом.
+    Ставит lost-стадию воронки сделки (через ``record_stage`` → история +
+    ``stage_changed_at``), дату закрытия и публикует ``sales.deal.lost`` (→ audit).
+
+    Как и в win_deal (Фикс 1, цикл 18): lost-код резолвится по воронке сделки, а не
+    литералом "lost" — для repeat_clients/tenders это rp_lost/tn_lost; литерал "lost"
+    не входит ни в одну их колонку и сделка пропадала бы с доски."""
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    kind_map = await _stage_kind_map(session, deal.funnel)
+    lost_code = next((code for code, kind in kind_map.items() if kind == "lost"), "lost")
+    if deal.stage == lost_code:
+        raise HTTPException(status_code=409, detail="Сделка уже закрыта в отказ")
+    code = (payload.reason_code or "").strip()
+    if not code:
+        raise HTTPException(status_code=422, detail="Нужна причина отказа")
+    active_codes = set(
+        (await session.execute(select(LossReason.code).where(LossReason.active))).scalars().all()
+    )
+    if active_codes and code not in active_codes:
+        raise HTTPException(status_code=422, detail="Неизвестная причина отказа")
+
+    deal.lost_reason_code = code
+    deal.lost_comment = payload.comment
+    deal.closed_date = date.today().strftime("%d.%m.%Y")
+    record_stage(session, deal, lost_code, by=user.username)
+    core.event_bus.emit(
+        session,
+        "sales.deal.lost",
+        {
+            "deal_id": deal.id, "number": deal.number, "reason_code": code,
+            "amount": float(deal.amount), "owner": deal.owner, "entity_ref": f"deal:{deal.id}",
+        },
+    )
+    await session.commit()
+    return deal
+
+
+@router.post("/deals/{deal_id}/win", response_model=DealRead)
+async def win_deal(
+    deal_id: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(get_current_user),
+    _: object = Depends(require_permission("sales.deal.write")),
+):
+    """Закрыть сделку успешно (SALES-40). Единый путь с логистикой (`record_stage`):
+    стадия ``won`` воронки сделки, дата закрытия, событие ``sales.deal.won`` (→ audit).
+
+    Фикс 1 (цикл 18 верификации): won-код резолвится по воронке сделки, а не литералом
+    "won" — для repeat_clients/tenders это rp_won/tn_won; литерал "won" не входит ни в одну
+    их колонку и после перезагрузки сделка пропадала с доски.
+    """
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    kind_map = await _stage_kind_map(session, deal.funnel)
+    won_code = next((code for code, kind in kind_map.items() if kind == "won"), "won")
+    if deal.stage == won_code:
+        raise HTTPException(status_code=409, detail="Сделка уже выиграна")
+    deal.closed_date = date.today().strftime("%d.%m.%Y")
+    record_stage(session, deal, won_code, by=user.username)
+    core.event_bus.emit(
+        session,
+        "sales.deal.won",
+        {
+            "deal_id": deal.id, "number": deal.number, "amount": float(deal.amount),
+            "owner": deal.owner, "entity_ref": f"deal:{deal.id}",
+        },
+    )
+    await session.commit()
+    return deal
+
+
+@router.get("/deals/{deal_id}/history", response_model=list[StageEventOut])
+async def deal_history(deal_id: int, session: AsyncSession = Depends(get_session)):
+    """Хронология смен стадий сделки (SALES-43)."""
+    return (
+        await session.execute(
+            select(DealStageEvent)
+            .where(DealStageEvent.deal_id == deal_id)
+            .order_by(DealStageEvent.id)
+        )
+    ).scalars().all()
+
+
+@router.get("/deals/{deal_id}/tasks", response_model=list[TaskOut])
+async def list_tasks(deal_id: int, session: AsyncSession = Depends(get_session)):
+    """Задачи по сделке (SALES-41): открытые — первыми, по сроку."""
+    rows = (
+        await session.execute(
+            select(DealTask)
+            .where(DealTask.deal_id == deal_id)
+            .order_by((DealTask.status == "open").desc(), DealTask.due_at, DealTask.id)
+        )
+    ).scalars().all()
+    return [_task_out(t) for t in rows]
+
+
+@router.post("/deals/{deal_id}/tasks", response_model=TaskOut, status_code=201)
+async def create_task(
+    deal_id: int,
+    payload: TaskCreate,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+):
+    """Поставить задачу по сделке (SALES-41) — событие ``sales.task.created`` (→ audit)."""
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    task = DealTask(
+        deal_id=deal_id,
+        title=payload.title,
+        kind=payload.kind,
+        assignee_id=payload.assignee_id,
+        due_at=payload.due_at,
+    )
+    session.add(task)
+    await session.flush()
+    core.event_bus.emit(
+        session,
+        "sales.task.created",
+        {"task_id": task.id, "deal_id": deal_id, "entity_ref": f"deal:{deal_id}"},
+    )
+    await session.commit()
+    return _task_out(task)
+
+
+@router.patch("/tasks/{task_id}", response_model=TaskOut)
+async def update_task(
+    task_id: int,
+    payload: TaskUpdate,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+):
+    """Изменить задачу: перенос срока / исполнение / отмена. При закрытии (``done``)
+    ставит ``done_at`` и публикует ``sales.task.completed`` (→ audit, SALES-41)."""
+    task = await session.get(DealTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    data = payload.model_dump(exclude_unset=True)
+    becoming_done = data.get("status") == "done" and task.status != "done"
+    for key, value in data.items():
+        setattr(task, key, value)
+    if becoming_done:
+        task.done_at = _utcnow()
+        core.event_bus.emit(
+            session,
+            "sales.task.completed",
+            {"task_id": task.id, "deal_id": task.deal_id, "entity_ref": f"deal:{task.deal_id}"},
+        )
+    await session.commit()
+    return _task_out(task)
 
 
 @router.post("/deals", response_model=DealRead, status_code=201)
@@ -359,11 +2381,14 @@ async def create_deal(
     payload: DealCreate,
     session: AsyncSession = Depends(get_session),
     core: Core = Depends(get_core),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
 ):
     """Создать сделку и опубликовать доменное событие через шину ядра."""
     try:
         deal = await DealRepository(session).create(payload)
         core.event_bus.emit(session, "sales.deal.created", {"number": deal.number, "title": deal.title})
+        if deal.ship_deadline:
+            await _emit_ship_deadline(session, core, deal)
         await session.commit()
     except IntegrityError:
         await session.rollback()
@@ -394,9 +2419,22 @@ async def request_approval(
 
 
 @router.get("/skus", response_model=list[SkuOut])
-async def list_skus(session: AsyncSession = Depends(get_session)):
-    """Справочник номенклатуры (для подбора позиций в сделку, sales-12)."""
-    return (await session.execute(select(Sku).order_by(Sku.code))).scalars().all()
+async def list_skus(
+    for_picker: bool = False,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Справочник номенклатуры (для подбора позиций в сделку, sales-12).
+
+    ``for_picker=1`` — без seed-позиций «(демо)»/«(тест)» (подбор в сделке/звонке).
+    """
+    stmt = select(Sku).order_by(Sku.code)
+    if for_picker:
+        stmt = stmt.where(
+            ~Sku.title.like("%(демо)%"),
+            ~Sku.title.like("%(тест)%"),
+        )
+    return (await session.execute(stmt)).scalars().all()
 
 
 @router.get("/deals/{deal_id}/items", response_model=list[DealItemOut])
@@ -410,6 +2448,38 @@ async def list_deal_items(deal_id: int, session: AsyncSession = Depends(get_sess
         )
     ).scalars().all()
     return [await _build_item_out(session, r, counterparty) for r in rows]
+
+
+@router.get("/deals/{deal_id}/repeat-last-order", response_model=list[DealItemOut])
+async def repeat_last_order(deal_id: int, session: AsyncSession = Depends(get_session)):
+    """Позиции из последней ПРЕДЫДУЩЕЙ сделки того же контрагента (повтор заказа).
+
+    «Предыдущая» = созданная раньше текущей (``Deal.id < deal_id`` — id монотонен по
+    вставке, null-безопасен), у которой есть позиции. Параллельная более новая сделка
+    (id больше) в повтор не попадёт. Пусто, если сделки нет или прошлых заказов нет.
+    """
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    # Одним запросом: последний (по дате, tie-break по id) предыдущий заказ С позициями —
+    # join к DealItem отсекает пустые сделки, limit 1 берёт самый свежий (без N+1-скана).
+    prior_id = (
+        await session.execute(
+            select(DealItem.deal_id)
+            .join(Deal, Deal.id == DealItem.deal_id)
+            .where(Deal.counterparty == deal.counterparty, Deal.id < deal_id)
+            .order_by(Deal.created_at.desc(), Deal.id.desc())
+            .limit(1)
+        )
+    ).scalar()
+    if prior_id is None:
+        return []
+    rows = (
+        await session.execute(
+            select(DealItem).where(DealItem.deal_id == prior_id).order_by(DealItem.id)
+        )
+    ).scalars().all()
+    return [await _build_item_out(session, r, deal.counterparty) for r in rows]
 
 
 @router.post("/deals/{deal_id}/items", response_model=DealItemOut, status_code=201)
@@ -508,11 +2578,35 @@ async def add_contact(
 
 @router.get("/chats", response_model=list[ChatOut])
 async def list_chats(session: AsyncSession = Depends(get_session)):
-    """Диалоги для панели «Чаты и дела»: сделки с последним сообщением переписки."""
-    msgs = (
-        await session.execute(select(Message).order_by(Message.id.desc()).limit(100))
-    ).scalars().all()
-    deals = {d.id: d for d in (await session.execute(select(Deal))).scalars().all()}
+    """Диалоги для панели «Чаты и дела»: сделки с последним сообщением переписки.
+
+    Graceful fallback: при ``OperationalError`` (колонка/таблица отсутствует — старый
+    dev.db до миграции 0062) возвращаем ``[]`` — фронт честно покажет «нет диалогов»
+    вместо 500.
+    """
+    from sqlalchemy.exc import OperationalError, ProgrammingError
+
+    try:
+        msgs = (
+            await session.execute(select(Message).order_by(Message.id.desc()).limit(100))
+        ).scalars().all()
+        deals = {d.id: d for d in (await session.execute(select(Deal))).scalars().all()}
+    except (OperationalError, ProgrammingError):
+        await session.rollback()
+        return []
+    # SALES-49: непрочитанные входящие по сделкам (для бейджа в панели чатов).
+    # Цикл 17: тем же агрегатом — created_at самого старого непрочитанного (waiting_since).
+    unread_map: dict[int, int] = {}
+    waiting_since_map: dict[int, datetime] = {}
+    for deal_id, n, oldest in (
+        await session.execute(
+            select(Message.deal_id, func.count(), func.min(Message.created_at))
+            .where(Message.direction == "in", Message.read_at.is_(None))
+            .group_by(Message.deal_id)
+        )
+    ).all():
+        unread_map[deal_id] = int(n)
+        waiting_since_map[deal_id] = oldest
     chats: list[ChatOut] = []
     seen: set[int] = set()
     for m in msgs:
@@ -528,10 +2622,40 @@ async def list_chats(session: AsyncSession = Depends(get_session)):
                 last_text=m.text,
                 channel=m.channel,
                 direction=m.direction,
+                unread=unread_map.get(m.deal_id, 0),
+                waiting_since=waiting_since_map.get(m.deal_id),
             )
         )
         if len(chats) >= 20:
             break
+    # Цикл 18 (фикс верификации): непрочитанные диалоги — first-class, не заложники окна
+    # топ-100/капа-20. Сделка с непрочитанным, чьё последнее сообщение старше окна 100,
+    # иначе вообще не попадала бы в ответ — доска не показала бы «клиент ждёт».
+    missing = [d for d in unread_map if d not in seen and d in deals]
+    if missing:
+        extra_msgs = (
+            await session.execute(
+                select(Message).where(Message.deal_id.in_(missing)).order_by(Message.id.desc())
+            )
+        ).scalars().all()
+        seen_missing: set[int] = set()
+        for m in extra_msgs:
+            if m.deal_id in seen_missing:
+                continue
+            seen_missing.add(m.deal_id)
+            deal = deals[m.deal_id]
+            chats.append(
+                ChatOut(
+                    deal_id=m.deal_id,
+                    number=deal.number,
+                    company=deal.counterparty,
+                    last_text=m.text,
+                    channel=m.channel,
+                    direction=m.direction,
+                    unread=unread_map.get(m.deal_id, 0),
+                    waiting_since=waiting_since_map.get(m.deal_id),
+                )
+            )
     return chats
 
 
@@ -586,32 +2710,19 @@ async def create_document(
 
     if payload.kind in REQUIRES_APPROVAL:
         # договор: на согласование юристу (ч.4); запись в 1С — после одобрения
-        doc.status = "pending_approval"
-        await core.services.approvals.request(
-            session,
-            "deal.contract",
-            f"document:{doc.id}",
-            f"{deal.number} — {DOC_TITLES.get(payload.kind, payload.kind)} ({deal.counterparty})",
-            payload.requested_by,
-        )
-        core.event_bus.emit(
-            session,
-            "sales.document.created",
-            {
-                "document_id": doc.id,
-                "deal_id": deal_id,
-                "kind": payload.kind,
-                "number": number,
-                "entity_ref": f"deal:{deal_id}",
-            },
-        )
+        await _submit_contract_for_approval(core, session, doc, deal, payload.requested_by)
     else:
-        # счёт/заказ: пишем в 1С сразу; заказ дополнительно резервирует остатки
+        # счёт/заказ: пишем в 1С сразу; счёт и заказ дополнительно резервируют остатки (SALES-51)
         if payload.kind in RESERVES_STOCK and core.services.stock is not None:
             reserved = await core.services.stock.reserve(
                 session, await _deal_stock_items(session, deal_id)
             )
             if reserved:
+                # фиксируем резерв на документе + срок действия счёта (5 дней по счёт-протоколу)
+                valid_days = int(os.getenv("AIOS_INVOICE_VALID_DAYS", "5"))
+                doc.reserve_status = "reserved"
+                doc.reserved_at = _utcnow()
+                doc.valid_until = _utcnow().date() + timedelta(days=valid_days)
                 core.event_bus.emit(
                     session,
                     "sales.stock.reserved",
@@ -619,6 +2730,7 @@ async def create_document(
                         "document_id": doc.id,
                         "deal_id": deal_id,
                         "items": reserved,
+                        "valid_until": doc.valid_until.isoformat(),
                         "entity_ref": f"deal:{deal_id}",
                     },
                 )
@@ -681,6 +2793,678 @@ async def decide_document(
     return doc
 
 
+# ──────────────────────── Договор по шаблону (SALES-53) ────────────────────────
+
+# Плейсхолдеры тела шаблона: {{seller.name}}, {{buyer.unp}}, {{items}}, {{total}}, …
+_PLACEHOLDER = re.compile(r"\{\{\s*([\w.]+)\s*\}\}")
+
+
+def _seller_requisites(core: Core) -> dict[str, str]:
+    """Реквизиты своей организации (продавца) из конфига (ТЗ C.5, не shared-схема)."""
+    c = core.config
+    return {
+        "name": c.seller_name, "unp": c.seller_unp, "address": c.seller_address,
+        "director": c.seller_director, "phone": c.seller_phone, "email": c.seller_email,
+        # банковские реквизиты продавца → строка «р/с … в банке …» в счёте (_req_line)
+        "account": c.seller_account, "bank": c.seller_bank, "bik": c.seller_bik,
+    }
+
+
+# Лого — предел размера data-URI (~1.4МБ base64 ≈ 1МБ исходного файла): печатная форма
+# должна оставаться лёгкой (лого встраивается в HTML целиком, без диска/CDN).
+_LOGO_MAX_LEN = 1_400_000
+
+
+async def _current_branding(session: AsyncSession) -> CompanyBranding | None:
+    """Текущий блок факсимиле продавца (лого/печать/подпись) — singleton-строка id=1."""
+    return await session.get(CompanyBranding, 1)
+
+
+def _branding_out(row: CompanyBranding | None) -> BrandingOut:
+    return BrandingOut(
+        logo_data_url=row.logo_data_url if row else None,
+        stamp_data_url=row.stamp_data_url if row else None,
+        signature_data_url=row.signature_data_url if row else None,
+    )
+
+
+def _seller_with_facsimile(core: Core, branding: CompanyBranding | None) -> dict:
+    """Реквизиты продавца + факсимиле (лого/печать/подпись) для печатных форм."""
+    seller = _seller_requisites(core)
+    seller["logo_data_url"] = (branding.logo_data_url if branding else None) or ""
+    seller["stamp_data_url"] = branding.stamp_data_url if branding else None
+    seller["signature_data_url"] = branding.signature_data_url if branding else None
+    return seller
+
+
+@router.get("/branding", response_model=BrandingOut)
+async def get_branding(
+    session: AsyncSession = Depends(get_session),
+    _: object = Depends(require_permission("sales.deal.read")),
+):
+    """Факсимиле продавца для печатных форм: лого/печать/подпись (honest-empty — None, не 404)."""
+    return _branding_out(await _current_branding(session))
+
+
+@router.put("/branding", response_model=BrandingOut)
+async def put_branding(
+    payload: BrandingIn,
+    session: AsyncSession = Depends(get_session),
+    _: object = Depends(require_permission("sales.deal.write")),
+):
+    """Загрузить/заменить факсимиле продавца (лого/печать/подпись) — частичное обновление.
+    Клиент кодирует файл в data-URI (FileReader) — сервер multipart не принимает (в проекте
+    нет паттерна загрузки бинарных файлов). Обновляются только переданные (не None) поля.
+    """
+    updates = {
+        k: v
+        for k, v in (
+            ("logo_data_url", payload.logo_data_url),
+            ("stamp_data_url", payload.stamp_data_url),
+            ("signature_data_url", payload.signature_data_url),
+        )
+        if v is not None
+    }
+    for value in updates.values():
+        if not value.startswith("data:image/"):
+            raise HTTPException(status_code=422, detail="Ожидается data-URI изображения (data:image/...)")
+        if len(value) > _LOGO_MAX_LEN:
+            raise HTTPException(status_code=422, detail="Файл слишком большой (лимит ~1 МБ)")
+    row = await session.get(CompanyBranding, 1)
+    if row is None:
+        row = CompanyBranding(id=1, **updates)
+        session.add(row)
+    else:
+        for k, v in updates.items():
+            setattr(row, k, v)
+    await session.commit()
+    return _branding_out(row)
+
+
+async def _buyer_requisites(
+    session: AsyncSession, core: Core, deal: Deal, unp: str
+) -> dict[str, str]:
+    """Реквизиты покупателя: из ЕГР по УНП (graceful) + обогащение Counterparty.unp.
+
+    Реестр выключен или УНП не найден → минимум из сделки (вводится вручную). Имя
+    контрагента в Counterparty не перезатираем (связь сделки — по имени). Внешний
+    вызов реестра делаем ДО создания контрагента, чтобы не держать открытую запись/блок
+    в БД на время сетевого запроса в ЕГР.
+    """
+    info = None
+    if unp and core.services.registry is not None:
+        info = await core.services.registry.lookup(unp)
+    cp = await _counterparty_for_deal(session, deal, create=True)
+    buyer = {"name": deal.counterparty, "unp": unp or (cp.unp if cp else "") or ""}
+    if info:
+        buyer.update({k: str(v) for k, v in info.items() if v})
+    if cp is not None and unp:
+        cp.unp = cp.unp or unp
+    return buyer
+
+
+async def _contract_items(session: AsyncSession, deal_id: int) -> list[str]:
+    """Строки спецификации договора из позиций сделки (title — qty unit)."""
+    rows = (
+        await session.execute(
+            select(DealItem, Sku)
+            .join(Sku, Sku.id == DealItem.sku_id, isouter=True)
+            .where(DealItem.deal_id == deal_id)
+            .order_by(DealItem.id)
+        )
+    ).all()
+    lines = []
+    for item, sku in rows:
+        title = sku.title if sku else f"позиция #{item.sku_id}"
+        unit = sku.unit if sku else "шт"
+        lines.append(f"{title} — {item.qty} {unit}")
+    return lines
+
+
+def _render_contract(body: str, ctx: dict[str, str], facsimile: str = "") -> str:
+    """Подставить плейсхолдеры {{key}} (плоские ключи seller.name/buyer.unp/…).
+
+    ``facsimile`` — хвостовой блок подписей/печати, добавляется ПОСЛЕ тела договора
+    (пусто, если факсимиле не загружено) — единый источник факсимиле на договоре.
+    """
+    return _PLACEHOLDER.sub(lambda m: ctx.get(m.group(1), ""), body) + facsimile
+
+
+def _contract_facsimile_block(seller: dict) -> str:
+    """Стандартный хвост договора «Поставщик [подпись][печать] / Покупатель [подпись]».
+
+    Рисуется только если у продавца есть подпись или печать — иначе честно пусто
+    (живые подписи ставят вручную). Стили инлайновые: тело договора — произвольный шаблон.
+    """
+    sig, stamp = seller.get("signature_data_url"), seller.get("stamp_data_url")
+    if not sig and not stamp:
+        return ""
+    sig_img = (
+        f'<img src="{_esc(sig)}" alt="подпись" style="max-height:44px;max-width:150px">' if sig else ""
+    )
+    stamp_img = (
+        f'<img src="{_esc(stamp)}" alt="печать" '
+        'style="max-height:120px;max-width:150px;opacity:.85;margin-left:8px">'
+        if stamp
+        else ""
+    )
+    director = _esc(seller.get("director", ""))
+    return (
+        '<div style="display:flex;gap:60px;margin-top:36px;font-family:Arial,sans-serif;font-size:13px">'
+        '<div><div style="font-weight:700;margin-bottom:4px">Поставщик</div>'
+        f'<div style="height:78px;display:flex;align-items:flex-end">{sig_img}{stamp_img}</div>'
+        f'<div style="border-top:1px solid #000;padding-top:3px;width:220px">{director}</div></div>'
+        '<div><div style="font-weight:700;margin-bottom:4px">Покупатель</div>'
+        '<div style="height:78px"></div>'
+        '<div style="border-top:1px solid #000;padding-top:3px;width:220px">&nbsp;</div></div>'
+        "</div>"
+    )
+
+
+# ──────────────────────── Счёт по шаблону (печатная форма sales-invoice-template.html) ────────────────────────
+
+_INVOICE_VAT_RATE = Decimal("20")  # % — как в шаблоне (vatRate=20)
+
+
+async def _invoice_items(session: AsyncSession, deal_id: int) -> list[dict]:
+    """Позиции счёта: наименование/кол-во/ед.изм. из сделки + цена — последняя котировка клиента.
+
+    Цена берётся по последней ``PriceQuote`` для пары (sku.code, deal.counterparty);
+    нет котировки — честный ноль (счёт без цены на позицию — сигнал менеджеру, не падение).
+    """
+    deal = await DealRepository(session).get(deal_id)
+    counterparty = deal.counterparty if deal else ""
+    rows = (
+        await session.execute(
+            select(DealItem, Sku)
+            .join(Sku, Sku.id == DealItem.sku_id, isouter=True)
+            .where(DealItem.deal_id == deal_id)
+            .order_by(DealItem.id)
+        )
+    ).all()
+    items = []
+    for item, sku in rows:
+        name = sku.title if sku else f"позиция #{item.sku_id}"
+        unit = sku.unit if sku else "шт"
+        price = Decimal("0")
+        if sku is not None:
+            quote = (
+                await session.execute(
+                    select(PriceQuote)
+                    .where(PriceQuote.sku_code == sku.code, PriceQuote.counterparty == counterparty)
+                    .order_by(PriceQuote.created_at.desc(), PriceQuote.id.desc())
+                )
+            ).scalars().first()
+            if quote is not None:
+                price = quote.price
+        items.append({"name": name, "qty": item.qty, "unit": unit, "price": price})
+    return items
+
+
+def _money(n: Decimal) -> str:
+    return f"{n:,.2f}".replace(",", " ")
+
+
+def _esc(v: object) -> str:
+    """HTML-экранирование значения для печатных форм (счёт/договор): наименования SKU,
+    реквизиты покупателя из ЕГР/terms_json, номер документа — недоверенные данные,
+    попадают в HTMLResponse под сессией → без escape это stored XSS."""
+    return html.escape(str(v))
+
+
+def _req_line(p: dict) -> str:
+    """Строка реквизитов «Наименование, УНП …, адрес, тел., р/с … в банке … БИК …» (честный минимум при пропусках)."""
+    parts = [f"<b>{_esc(p.get('name', ''))}</b>"]
+    if p.get("unp"):
+        parts.append(f"УНП {_esc(p['unp'])}")
+    if p.get("address"):
+        parts.append(_esc(p["address"]))
+    if p.get("phone"):
+        parts.append(f"тел.: {_esc(p['phone'])}")
+    if p.get("account"):
+        bank = f" в банке {_esc(p['bank'])}" if p.get("bank") else ""
+        bik = f" БИК {_esc(p['bik'])}" if p.get("bik") else ""
+        parts.append(f"р/с {_esc(p['account'])}{bank}{bik}")
+    return ", ".join(parts)
+
+
+def _facsimile_sig(seller: dict) -> str:
+    """Факсимиле подписи руководителя над линией «подпись» — пусто, если не загружено."""
+    url = seller.get("signature_data_url")
+    return f'<img class="sig" src="{_esc(url)}" alt="подпись">' if url else ""
+
+
+def _facsimile_stamp(seller: dict) -> str:
+    """Полупрозрачный overlay печати возле блока подписей — пусто, если не загружено."""
+    url = seller.get("stamp_data_url")
+    return f'<img class="stamp" src="{_esc(url)}" alt="печать">' if url else ""
+
+
+def _render_invoice(
+    doc: DealDocument, deal: Deal | None, seller: dict, buyer: dict, items: list[dict]
+) -> str:
+    """Печатная форма «Счёт-протокол на оплату» — вёрстка 1:1 с sales-invoice-template.html."""
+    date_str = doc.created_at.strftime("%d.%m.%Y") if doc.created_at else ""
+    rows_html, grand, vat_sum = [], Decimal("0"), Decimal("0")
+    for i, it in enumerate(items, start=1):
+        qty, price = Decimal(it["qty"]), Decimal(it["price"])
+        net = (qty * price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        vat = (net * _INVOICE_VAT_RATE / 100).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        total = (net + vat).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        grand += total
+        vat_sum += vat
+        rows_html.append(
+            "<tr>"
+            f'<td class="c">{i}</td><td>{_esc(it["name"])}</td><td class="c">{qty}</td>'
+            f'<td class="c">{_esc(it["unit"])}</td><td class="r">{_money(price)}</td><td class="r">{_money(net)}</td>'
+            f'<td class="c">{_INVOICE_VAT_RATE}%</td><td class="r">{_money(vat)}</td><td class="r">{_money(total)}</td>'
+            "</tr>"
+        )
+    valid_days = int(os.getenv("AIOS_INVOICE_VALID_DAYS", "5"))
+    order_no = deal.number if deal else ""
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Счёт-протокол на оплату № {_esc(doc.number)}</title>
+<style>
+  :root{{--ink:#0f172a;--muted:#475569;--line:#0f172a;--soft:#64748b;--paper:#fff;--font:"Arial","Segoe UI",system-ui,sans-serif;}}
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:var(--font);background:#fff;color:var(--ink);font-size:13px;line-height:1.35}}
+  .sheet{{background:var(--paper);max-width:820px;margin:0 auto;padding:34px 40px 40px}}
+  h1{{text-align:center;font-size:16px;font-weight:800;margin:6px 0 16px}}
+  .party{{display:flex;gap:10px;font-size:12px;margin-bottom:9px;line-height:1.4}}
+  .party .lbl{{font-weight:700;flex-shrink:0;width:78px}}
+  table.doc{{width:100%;border-collapse:collapse;margin:14px 0 4px;font-size:12px}}
+  table.doc th,table.doc td{{border:1px solid var(--line);padding:5px 7px;vertical-align:middle}}
+  table.doc th{{font-weight:700;text-align:center;font-size:11px;background:#f3f5f8}}
+  table.doc td.c{{text-align:center}}table.doc td.r{{text-align:right;white-space:nowrap}}
+  table.doc tfoot td{{font-weight:800;border:none;text-align:right;padding-top:7px}}
+  table.doc tfoot td.lbl{{text-align:right}}
+  .sums{{margin:8px 0 4px;font-size:12.5px}}
+  .sums .row{{margin:3px 0}}
+  .order{{margin:12px 0;font-size:12.5px}}
+  .sign{{display:flex;gap:50px;margin-top:26px;font-size:12px;position:relative}}
+  .sign .role{{font-weight:700;width:110px}}
+  .sign .line{{flex:1;max-width:230px}}
+  .sign .ln{{border-bottom:1px solid var(--ink);height:20px;position:relative}}
+  .sign .ln .nm{{position:absolute;right:6px;bottom:2px;font-weight:700}}
+  .sign .ln .sig{{position:absolute;left:8px;bottom:1px;max-height:42px;max-width:150px}}
+  .sign .cap{{font-size:9.5px;color:var(--soft);text-align:center;margin-top:2px}}
+  .stamp{{position:absolute;left:150px;top:-18px;opacity:.85;max-width:150px;max-height:150px;pointer-events:none}}
+  .terms{{margin-top:20px;font-size:11px;line-height:1.5}}
+  .terms .b{{font-weight:700}}
+  .logo{{margin-bottom:14px}}
+  .logo img{{max-height:60px;max-width:260px}}
+  @media print{{@page{{size:A4;margin:14mm}}}}
+</style>
+</head>
+<body>
+<div class="sheet">
+  {f'<div class="logo"><img src="{_esc(seller.get("logo_data_url"))}" alt="{_esc(seller.get("name", ""))}"></div>' if seller.get("logo_data_url") else ""}
+  <h1>Счёт-протокол на оплату № {_esc(doc.number)} от {date_str}</h1>
+  <div class="party"><div class="lbl">Поставщик:</div><div class="body">{_req_line(seller)}</div></div>
+  <div class="party"><div class="lbl">Покупатель:</div><div class="body">{_req_line(buyer)}</div></div>
+  <table class="doc">
+    <thead><tr>
+      <th style="width:26px">№</th><th>Товары (работы, услуги)</th><th style="width:62px">Кол-во</th>
+      <th style="width:52px">Ед. изм.</th><th style="width:70px">Цена</th><th style="width:80px">Стоимость</th>
+      <th style="width:54px">Ставка НДС</th><th style="width:74px">Сумма НДС</th><th style="width:84px">Всего с НДС</th>
+    </tr></thead>
+    <tbody>{"".join(rows_html)}</tbody>
+    <tfoot><tr><td colspan="8" class="lbl">Итого с НДС:</td><td class="r">{_money(grand)}</td></tr></tfoot>
+  </table>
+  <div class="sums">
+    <div class="row">Сумма НДС: <b>{money_words(vat_sum)}</b></div>
+    <div class="row">Всего к оплате сумма с НДС: <b>{money_words(grand)}</b></div>
+  </div>
+  <div class="order">Оплата по заказу клиента № {_esc(order_no)}</div>
+  <div class="sign">
+    <div class="role">Руководитель</div>
+    <div class="line"><div class="ln">{_facsimile_sig(seller)}</div><div class="cap">подпись</div></div>
+    <div class="line"><div class="ln"><span class="nm">{_esc(seller.get("director", ""))}</span></div><div class="cap">расшифровка подписи</div></div>
+    {_facsimile_stamp(seller)}
+  </div>
+  <div class="sign">
+    <div class="role">Бухгалтер</div>
+    <div class="line"><div class="ln"></div><div class="cap">подпись</div></div>
+    <div class="line"><div class="ln"></div><div class="cap">расшифровка подписи</div></div>
+  </div>
+  <div class="terms">
+    <div class="b">Счёт действителен в течение {valid_days} банковских дней.</div>
+    Отгрузка товара клиенту при самовывозе осуществляется только при наличии следующих документов:<br>
+    1. Подписанный Счёт-протокол с синей печатью<br>
+    2. — если товар получает ИП — копия свидетельства о регистрации<br>
+    &nbsp;&nbsp;&nbsp;— если товар получает Директор — копия приказа о назначении<br>
+    &nbsp;&nbsp;&nbsp;— если товар получает доверенное лицо — доверенность на получение ТМЦ и путевой лист (при необходимости).<br>
+    <span class="b">Без документов товар со склада не выдаётся!</span>
+  </div>
+</div>
+</body>
+</html>"""
+
+
+async def _submit_contract_for_approval(
+    core: Core,
+    session: AsyncSession,
+    doc: DealDocument,
+    deal: Deal,
+    requested_by: str,
+    extra_event: dict | None = None,
+) -> None:
+    """Договор → на согласование юристу (ч.4) + событие ``sales.document.created``.
+
+    Общий путь для обоих способов создания договора: универсального
+    ``POST /documents`` и ``POST /deals/{id}/contract`` (SALES-53) — чтобы маршрут
+    согласования и форма события не разъезжались.
+    """
+    doc.status = "pending_approval"
+    await core.services.approvals.request(
+        session,
+        "deal.contract",
+        f"document:{doc.id}",
+        f"{deal.number} — {DOC_TITLES['contract']} ({deal.counterparty})",
+        requested_by,
+    )
+    payload = {
+        "document_id": doc.id,
+        "deal_id": deal.id,
+        "kind": "contract",
+        "number": doc.number,
+        "entity_ref": f"deal:{deal.id}",
+    }
+    if extra_event:
+        payload.update(extra_event)
+    core.event_bus.emit(session, "sales.document.created", payload)
+
+
+@router.get("/contract-templates", response_model=list[ContractTemplateOut])
+async def list_contract_templates(session: AsyncSession = Depends(get_session)):
+    """Активные шаблоны договора для окна «Подготовить договор» (SALES-53)."""
+    return (
+        await session.execute(
+            select(ContractTemplate)
+            .where(ContractTemplate.is_active.is_(True))
+            .order_by(ContractTemplate.name)
+        )
+    ).scalars().all()
+
+
+@router.post("/contract-templates", response_model=ContractTemplateOut, status_code=201)
+async def create_contract_template(
+    payload: ContractTemplateCreate,
+    session: AsyncSession = Depends(get_session),
+    _: object = Depends(require_permission("sales.deal.write")),
+):
+    """Завести/сидировать шаблон договора (SALES-53)."""
+    tpl = ContractTemplate(code=payload.code, name=payload.name, body=payload.body)
+    session.add(tpl)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="Шаблон с таким кодом уже есть")
+    return tpl
+
+
+@router.post("/deals/{deal_id}/contract", response_model=DocumentOut, status_code=201)
+async def prepare_contract(
+    deal_id: int,
+    payload: ContractPrepareIn,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: object = Depends(require_permission("sales.deal.write")),
+):
+    """SALES-53: подготовить договор по шаблону + реквизиты покупателя по УНП.
+
+    Реквизиты покупателя подтягиваются из ЕГР по УНП (graceful при выкл реестра),
+    Counterparty обогащается УНП, условия частично предзаполнены из сделки. Договор
+    создаётся как DealDocument(kind=contract) и уходит на согласование; запись в 1С —
+    после одобрения (/documents/{id}/decide), поэтому шлюз 1С здесь не требуется.
+    """
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    tpl = (
+        await session.execute(
+            select(ContractTemplate).where(
+                ContractTemplate.code == payload.template_code,
+                ContractTemplate.is_active.is_(True),
+            )
+        )
+    ).scalars().first()
+    if tpl is None:
+        raise HTTPException(status_code=404, detail="Шаблон договора не найден")
+    # один активный договор на сделку: номер ДГ-{deal} не уникален в БД, дубль создал бы
+    # два договора с одинаковым номером (отклонённый можно перевыставить).
+    existing = (
+        await session.execute(
+            select(DealDocument).where(
+                DealDocument.deal_id == deal_id,
+                DealDocument.kind == "contract",
+                DealDocument.status != "rejected",
+            )
+        )
+    ).scalars().first()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="Договор по сделке уже подготовлен")
+
+    buyer = await _buyer_requisites(session, core, deal, payload.unp.strip())
+    doc = DealDocument(
+        deal_id=deal_id,
+        kind="contract",
+        number=f"{DOC_NUMBER_PREFIX['contract']}-{deal.number}",
+        amount=deal.amount,
+        template_id=tpl.id,
+        payment_terms=payload.payment_terms or None,
+        delivery_terms=payload.delivery_terms or None,
+        terms_json={"buyer": buyer, "custom": payload.terms or {}},
+    )
+    session.add(doc)
+    await session.flush()
+    await _submit_contract_for_approval(
+        core, session, doc, deal, payload.requested_by,
+        extra_event={"template": tpl.code, "buyer_unp": buyer.get("unp", "")},
+    )
+    await session.commit()
+    return doc
+
+
+async def _invoice_html(session: AsyncSession, doc: DealDocument, seller: dict) -> str:
+    """HTML счёта-протокола (реквизиты продавца + факсимиле уже в ``seller``)."""
+    deal = await DealRepository(session).get(doc.deal_id)
+    buyer = (doc.terms_json or {}).get("buyer") or {"name": deal.counterparty if deal else ""}
+    items = await _invoice_items(session, doc.deal_id)
+    return _render_invoice(doc, deal, seller, buyer, items)
+
+
+async def _contract_html(session: AsyncSession, core: Core, doc: DealDocument, seller: dict) -> str:
+    """HTML договора: по шаблону + хвостовой блок факсимиле, либо честная обложка «по форме
+    клиента», если шаблон не задан (issueClientContract) — чтобы «открыть»/пакет не падали 409."""
+    items = "; ".join(await _contract_items(session, doc.deal_id))
+    buyer = (doc.terms_json or {}).get("buyer", {})
+    tpl = await session.get(ContractTemplate, doc.template_id) if doc.template_id else None
+    if tpl is None:
+        return _contract_cover_html(doc, seller, buyer, items)
+    deal = await DealRepository(session).get(doc.deal_id)
+    ctx = {
+        "number": doc.number,
+        "items": items,
+        "total": f"{float(doc.amount):.2f} BYN",
+        "payment_terms": doc.payment_terms or "",
+        "delivery_terms": doc.delivery_terms or "",
+        "valid_until": doc.valid_until.isoformat() if doc.valid_until else "",
+        "deal": deal.number if deal else "",
+    }
+    ctx.update({f"seller.{k}": v for k, v in _seller_requisites(core).items()})
+    ctx.update({f"buyer.{k}": str(v) for k, v in buyer.items()})
+    return _render_contract(tpl.body, ctx, _contract_facsimile_block(seller))
+
+
+def _contract_cover_html(doc: DealDocument, seller: dict, buyer: dict, items: str) -> str:
+    """Обложка договора «по форме клиента» (шаблон не задан): реквизиты + предмет + сумма +
+    факсимиле продавца. Сам договор — бумага клиента; это подписанная обложка поставщика."""
+    logo = seller.get("logo_data_url")
+    rows = [
+        ("Поставщик:", _req_line(seller)),
+        ("Покупатель:", _req_line(buyer)),
+        ("Предмет:", _esc(items)),
+        ("Сумма:", f"{float(doc.amount):.2f} BYN"),
+    ]
+    if doc.payment_terms:
+        rows.append(("Оплата:", _esc(doc.payment_terms)))
+    if doc.delivery_terms:
+        rows.append(("Поставка:", _esc(doc.delivery_terms)))
+    body = "".join(
+        f'<div style="margin:6px 0"><b>{lbl}</b> {val}</div>' for lbl, val in rows
+    )
+    return (
+        f'<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">'
+        f"<title>Договор № {_esc(doc.number)}</title></head>"
+        '<body style="font-family:Arial,sans-serif;font-size:13px;color:#0f172a">'
+        '<div style="max-width:820px;margin:0 auto;padding:34px 40px">'
+        + (
+            f'<div style="margin-bottom:14px"><img src="{_esc(logo)}" style="max-height:60px"></div>'
+            if logo
+            else ""
+        )
+        + f'<h1 style="text-align:center;font-size:16px;margin:6px 0 2px">Договор № {_esc(doc.number)}</h1>'
+        '<div style="text-align:center;color:#64748b;margin-bottom:16px">Оформлен по форме клиента</div>'
+        + body
+        + _contract_facsimile_block(seller)
+        + "</div></body></html>"
+    )
+
+
+@router.get("/documents/{doc_id}/render", response_class=HTMLResponse)
+async def render_document(
+    doc_id: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: object = Depends(require_permission("sales.deal.read")),
+):
+    """Рендер документа в HTML: договор по шаблону (ТЗ C.2) или счёт-протокол (kind=invoice).
+
+    Гард ``sales.deal.read``: форма содержит реквизиты продавца и покупателя (ЕГР) —
+    не отдаём анонимно (прод публичен).
+    """
+    doc = await session.get(DealDocument, doc_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+
+    seller = _seller_with_facsimile(core, await _current_branding(session))
+    if doc.kind == "invoice":
+        return HTMLResponse(await _invoice_html(session, doc, seller))
+    if doc.kind != "contract":
+        raise HTTPException(
+            status_code=400, detail="Рендер по шаблону — только для договора/счёта"
+        )
+    return HTMLResponse(await _contract_html(session, core, doc, seller))
+
+
+async def _package_docs(
+    session: AsyncSession, deal_id: int
+) -> tuple[DealDocument | None, DealDocument | None]:
+    """Документы пакета: последний проведённый/оплаченный счёт + последний договор.
+
+    Единый выбор для ``send_package`` и рендера пакета — чтобы состав пакета не разъехался.
+    """
+    docs = (
+        await session.execute(
+            select(DealDocument)
+            .where(
+                DealDocument.deal_id == deal_id,
+                DealDocument.status.in_(("posted", "paid")),
+            )
+            .order_by(DealDocument.id.desc())
+        )
+    ).scalars().all()
+    invoice = next((d for d in docs if d.kind == "invoice"), None)
+    contract = next((d for d in docs if d.kind == "contract"), None)
+    return invoice, contract
+
+
+@router.get("/deals/{deal_id}/package/render", response_class=HTMLResponse)
+async def render_package(
+    deal_id: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: object = Depends(require_permission("sales.deal.read")),
+):
+    """Печатный пакет «счёт + договор» на одном листе (Ctrl+P → PDF).
+
+    Тот же выбор документов, что и в ``send_package``. Счёт, затем разрыв страницы,
+    затем договор — с наложенным факсимиле (печать/подпись) продавца.
+    """
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    invoice, contract = await _package_docs(session, deal_id)
+    if invoice is None or contract is None:
+        raise HTTPException(
+            status_code=409, detail="Нужны проведённый счёт и согласованный договор"
+        )
+    seller = _seller_with_facsimile(core, await _current_branding(session))
+    invoice_html = await _invoice_html(session, invoice, seller)
+    contract_html = await _contract_html(session, core, contract, seller)
+    return HTMLResponse(
+        f'{invoice_html}<div style="page-break-before:always"></div>{contract_html}'
+    )
+
+
+@router.post("/deals/{deal_id}/send-package", response_model=PackageSentOut)
+async def send_package(
+    deal_id: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: object = Depends(require_permission("sales.deal.write")),
+):
+    """SALES-53 C.4: отправить клиенту пакет «счёт + договор» одной записью.
+
+    Берём последний проведённый счёт и последний согласованный (проведённый) договор
+    сделки — по ТЗ пакет уходит ПОСЛЕ согласования договора. Эмитим ``sales.package.sent``
+    и пишем ОДНУ запись в историю переписки. Реальная доставка (email/Telegram, B.3) —
+    отдельный слой; здесь фиксируем факт отправки пакета.
+    """
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    invoice, contract = await _package_docs(session, deal_id)
+    if invoice is None or contract is None:
+        raise HTTPException(
+            status_code=409, detail="Нужны проведённый счёт и согласованный договор"
+        )
+
+    channel = "email"
+    session.add(
+        Message(
+            deal_id=deal_id,
+            channel=channel,
+            direction="out",
+            author="Система",
+            text=f"Отправлен пакет: счёт {invoice.number} + договор {contract.number}",
+        )
+    )
+    core.event_bus.emit(
+        session,
+        "sales.package.sent",
+        {
+            "deal_id": deal_id,
+            "invoice_number": invoice.number,
+            "contract_number": contract.number,
+            "channel": channel,
+            "entity_ref": f"deal:{deal_id}",
+        },
+    )
+    await session.commit()
+    return PackageSentOut(
+        deal_id=deal_id,
+        invoice_number=invoice.number,
+        contract_number=contract.number,
+        channel=channel,
+    )
+
+
 @router.get("/deals/{deal_id}/messages", response_model=list[MessageOut])
 async def list_messages(deal_id: int, session: AsyncSession = Depends(get_session)):
     """Омниканальная история переписки по сделке (часть 10)."""
@@ -724,6 +3508,28 @@ async def create_message(
     )
     await session.commit()
     return msg
+
+
+@router.post("/deals/{deal_id}/messages/read")
+async def mark_messages_read(deal_id: int, session: AsyncSession = Depends(get_session)):
+    """Пометить входящие сообщения сделки прочитанными (обнуляет счётчик, SALES-49)."""
+    deal = await DealRepository(session).get(deal_id)
+    if deal is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    rows = (
+        await session.execute(
+            select(Message).where(
+                Message.deal_id == deal_id,
+                Message.direction == "in",
+                Message.read_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    now = _utcnow()
+    for m in rows:
+        m.read_at = now
+    await session.commit()
+    return {"ok": True, "read": len(rows)}
 
 
 @router.get("/prices/{sku_code}", response_model=PriceInfo)
@@ -834,3 +3640,346 @@ async def ai_assist(
     )
     await session.commit()
     return AiTextOut(kind=kind, text=text, model=model)
+
+
+@router.post("/calls/{cid}/ai/script", response_model=CallScriptOut)
+async def call_ai_script(
+    cid: int,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """SALES-54: скрипт результативного звонка по стадии сделки (со-пилот продавца).
+
+    Каркас (цель/целевое действие/тезисы/вопросы) детерминирован по стадии — работает
+    и при ВЫКЛЮЧЕННОМ AI (не 503, продавцу всегда нужен скрипт). Включённый AI добавляет
+    контекстную подсказку ``ai_hint`` (событие ``ai.call_script.generated`` → audit).
+    Звонок не привязан к сделке → плейбук входа воронки.
+    """
+    from modules.sales.models import CallLog
+
+    call = await session.get(CallLog, cid)
+    if call is None:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    deal = await session.get(Deal, call.deal_id) if call.deal_id else None
+    stage = deal.stage if deal else None
+    play = static_call_script(stage)
+
+    llm = core.services.llm
+    ai_hint, model = None, "static"
+    if llm.enabled:
+        ai_hint = await call_script_hint(llm, deal, play)
+        model = llm.model or "mock"
+        core.event_bus.emit(
+            session,
+            "ai.call_script.generated",
+            {
+                "call_id": cid,
+                "deal_id": call.deal_id,
+                "stage": stage or "",
+                "model": model,
+                "actor": "AI",
+                "entity_ref": f"call:{cid}",
+            },
+        )
+        await session.commit()
+    return CallScriptOut(
+        stage=stage or "new",
+        goal=play["goal"],
+        target_action=play["target_action"],
+        talking_points=play["talking_points"],
+        questions=play["questions"],
+        ai_hint=ai_hint,
+        model=model,
+    )
+
+
+@router.post("/calls/{cid}/ai/objection", response_model=ObjectionReplyOut)
+async def call_ai_objection(
+    cid: int,
+    payload: ObjectionReplyIn,
+    core: Core = Depends(get_core),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """SALES-54: подсказка ответа на возражение клиента (со-пилот продавца).
+
+    Категория и базовый ответ — детерминированные (работают без AI); включённый AI
+    добавляет ``ai_hint`` (событие ``ai.objection.suggested`` → audit).
+    """
+    from modules.sales.models import CallLog
+
+    call = await session.get(CallLog, cid)
+    if call is None:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    if not payload.objection.strip():
+        raise HTTPException(status_code=422, detail="Пустое возражение")
+    category, reply = classify_objection(payload.objection)
+
+    llm = core.services.llm
+    ai_hint, model = None, "static"
+    if llm.enabled:
+        deal = await session.get(Deal, call.deal_id) if call.deal_id else None
+        ai_hint = await objection_hint(llm, payload.objection, deal)
+        model = llm.model or "mock"
+        core.event_bus.emit(
+            session,
+            "ai.objection.suggested",
+            {
+                "call_id": cid,
+                "category": category,
+                "model": model,
+                "actor": "AI",
+                "entity_ref": f"call:{cid}",
+            },
+        )
+        await session.commit()
+    return ObjectionReplyOut(category=category, reply=reply, ai_hint=ai_hint, model=model)
+
+
+# --- Окно входящего звонка (SALES-50): SSE-поток, журнал, действия --------------------
+@router.get("/calls/stream")
+async def calls_stream(
+    owner: str | None = None,
+    user: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """SSE-поток карточек звонков продавца (всплывающее окно входящего звонка).
+
+    Подписка по ``owner`` (= ``Deal.owner``, ФИО продавца); по умолчанию — текущий
+    пользователь. ponytail: маппинг username↔Deal.owner закроется реальной
+    аутентификацией (Keycloak, P1); сейчас фронт передаёт ``?owner=<ФИО>``.
+    """
+    import asyncio
+    import json
+
+    from fastapi.responses import StreamingResponse
+
+    from modules.sales import calls as calls_mod
+
+    # ponytail: остаточный IDOR (security-review HIGH) — ``owner`` самоназначаемый, любой
+    # с sales.deal.read подписывается на чужой поток (чужие звонки: номер/контрагент).
+    # Закрыть нечем, пока нет аутентифицированной идентичности продавца: в dev X-User не
+    # шлётся (user.username == "anonymous"), фича держится на ?owner=<ФИО>. Апгрейд —
+    # Keycloak P1 (username↔Deal.owner) → гейт «свой поток / sales.calls.read_all для РОП».
+    target = owner or user.username
+    queue = calls_mod.subscribe(target)
+
+    async def _gen():
+        try:
+            yield ": connected\n\n"
+            while True:
+                try:
+                    card = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"data: {json.dumps(card, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"  # heartbeat против обрыва простаивающего соединения
+        finally:
+            calls_mod.unsubscribe(target, queue)
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+@router.get("/calls", response_model=list[CallOut])
+async def list_calls(
+    status: str | None = None,
+    owner: str | None = None,
+    date: str | None = None,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Журнал звонков с фильтрами: статус / продавец / дата (``YYYY-MM-DD``)."""
+    from modules.sales.models import CallLog
+
+    stmt = select(CallLog).order_by(CallLog.started_at.desc())
+    if status:
+        stmt = stmt.where(CallLog.status == status)
+    if owner:
+        stmt = stmt.where(CallLog.owner == owner)
+    if date:
+        try:
+            day = datetime.fromisoformat(date)  # param `date` затеняет datetime.date — берём datetime
+        except ValueError:
+            raise HTTPException(status_code=400, detail="date: ожидается YYYY-MM-DD")
+        start = datetime(day.year, day.month, day.day)
+        stmt = stmt.where(CallLog.started_at >= start, CallLog.started_at < start + timedelta(days=1))
+    return (await session.execute(stmt)).scalars().all()
+
+
+@router.get("/calls/{cid}", response_model=CallOut)
+async def get_call(
+    cid: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Карточка одного звонка."""
+    from modules.sales.models import CallLog
+
+    call = await session.get(CallLog, cid)
+    if call is None:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    return call
+
+
+@router.post("/calls/{cid}/comment", response_model=CallOut)
+async def call_comment(
+    cid: int,
+    payload: CallCommentIn,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Заметка по звонку."""
+    from modules.sales.models import CallLog
+
+    call = await session.get(CallLog, cid)
+    if call is None:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    call.comment = payload.comment
+    await session.commit()
+    return call
+
+
+@router.post("/calls/{cid}/result", response_model=CallOut)
+async def call_result(
+    cid: int,
+    payload: CallResultIn,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Отметить итог/классификацию звонка."""
+    from modules.sales.models import CallLog
+
+    call = await session.get(CallLog, cid)
+    if call is None:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    call.result = payload.result
+    await session.commit()
+    return call
+
+
+@router.post("/calls/{cid}/link-deal", response_model=CallOut)
+async def call_link_deal(
+    cid: int,
+    payload: CallLinkDealIn,
+    session: AsyncSession = Depends(get_session),
+    core: Core = Depends(get_core),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Привязать звонок к существующей сделке (``deal_id``) или создать новую (``create``)."""
+    from modules.sales.models import CallLog
+
+    # ponytail: остаточный риск authz (security-review MED) — нет проверки call.owner ==
+    # вызывающий, любой с sales.deal.write привязывает/создаёт сделку по чужому звонку.
+    # Тот же блокер, что у /calls/stream: в dev нет идентичности (user.username ==
+    # "anonymous"), сверять не с чем. Апгрейд — Keycloak P1 → проверка владельца + set owner.
+    call = await session.get(CallLog, cid)
+    if call is None:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    if payload.deal_id is not None:
+        deal = await session.get(Deal, payload.deal_id)
+        if deal is None:
+            raise HTTPException(status_code=404, detail="Сделка не найдена")
+        call.deal_id = deal.id
+    elif payload.create:
+        cp_name = ""
+        if call.counterparty_id is not None:
+            cp = await session.get(Counterparty, call.counterparty_id)
+            cp_name = cp.name if cp is not None else ""
+        deal = Deal(
+            number=f"CRM-CALL-{call.id}",
+            title=f"Звонок {call.phone_e164 or call.call_id}",
+            counterparty=cp_name or (call.phone_e164 or "Неизвестный номер"),
+            owner=call.owner,
+            stage="new",
+        )
+        session.add(deal)
+        try:
+            await session.flush()
+        except IntegrityError:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail="Сделка по этому звонку уже создана")
+        call.deal_id = deal.id
+        core.event_bus.emit(session, "sales.deal.created", {"number": deal.number, "title": deal.title})
+    else:
+        raise HTTPException(status_code=400, detail="Укажите deal_id или create=true")
+    await session.commit()
+    return call
+
+
+@router.post("/telephony/incoming")
+async def telephony_incoming(
+    payload: TelephonyEventIn,
+    session: AsyncSession = Depends(get_session),
+    core: Core = Depends(get_core),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
+    """Прямой приём нормализованного события звонка (fallback/тест, если не через шину).
+
+    Обрабатывает синхронно (апсерт записи + push карточки), минуя задержку relay.
+    Тело строго валидируется (``TelephonyEventIn``: только известные поля, проверенные
+    типы) — недоверенный вызов не может фабриковать ``CallLog`` (security-review HIGH).
+    """
+    from core.services.eventbus import EventContext
+    from modules.sales import calls as calls_mod
+
+    event_type = payload.event_type
+    handler = calls_mod.EVENT_HANDLERS.get(event_type)
+    if handler is None:
+        raise HTTPException(status_code=400, detail=f"Неизвестный тип события: {event_type}")
+    data = payload.model_dump()
+    await handler(data, EventContext(session=session, services=core.services))
+    await session.commit()
+    return {"ok": True, "event_type": event_type, "call_id": payload.call_id}
+
+
+# ── ROP план/факт менеджеров ───────────────────────────────────────────────
+@router.get("/rop/plan-fact", tags=["sales"])
+async def rop_plan_fact(
+    period: str = "",
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Plan/Fact по менеджерам за месяц (YYYY-MM). Demo-план, если KpiTarget пуст."""
+    import calendar
+
+    from modules.sales.models import Deal, KpiTarget
+
+    if not period:
+        today = date.today()
+        period = today.strftime("%Y-%m")
+
+    try:
+        year, month = int(period[:4]), int(period[5:7])
+    except (ValueError, IndexError):
+        raise HTTPException(status_code=400, detail="period must be YYYY-MM")
+
+    first_day = date(year, month, 1)
+    last_day = date(year, month, calendar.monthrange(year, month)[1])
+
+    rows = (await session.execute(
+        select(Deal.owner, func.count(Deal.id), func.sum(Deal.amount))
+        .where(Deal.stage == "won")
+        .where(func.date(Deal.stage_changed_at) >= first_day)
+        .where(func.date(Deal.stage_changed_at) <= last_day)
+        .group_by(Deal.owner)
+    )).all()
+
+    # Попробуем взять планы из KpiTarget (поле revenue_plan на менеджера)
+    targets_row = (await session.execute(
+        select(KpiTarget).where(KpiTarget.key == "plan_revenue_per_manager")
+    )).scalars().first()
+    plan_revenue_default = float(targets_row.target) if targets_row else 5000000.0
+    plan_deals_default = 5
+
+    managers = [
+        {
+            "name": owner or "Менеджер",
+            "plan_deals": plan_deals_default,
+            "fact_deals": int(cnt),
+            "plan_revenue": plan_revenue_default,
+            "fact_revenue": float(total or 0),
+            "conversion_pct": round(int(cnt) / plan_deals_default * 100, 1),
+        }
+        for owner, cnt, total in rows
+    ]
+
+    return {"period": period, "managers": managers, "demo_plans": targets_row is None}
