@@ -34,10 +34,19 @@ async def on_lead_converted(payload: dict, ctx) -> None:
     lead_id = payload.get("lead_id")
     if not lead_id:
         return
-    from modules.sales.models import Deal, DealItem
+    from modules.sales.models import Deal, DealItem, PriceQuote
+
+    # Идемпотентность (B2): шина at-least-once + синхронный relay_once в convert_lead → событие
+    # может прийти дважды; Deal.number unique → повтор вставки = IntegrityError на commit ВНУТРИ
+    # relay_once = poison ВСЕЙ шины на тике. Гард по существующей сделке (как в on_deal_won_handoff).
+    number = f"CRM-LEAD-{lead_id}"
+    if (
+        await ctx.session.execute(select(Deal.id).where(Deal.number == number))
+    ).scalars().first() is not None:
+        return
 
     deal = Deal(
-        number=f"CRM-LEAD-{lead_id}",
+        number=number,
         title=payload.get("title") or "Лид",
         counterparty=payload.get("counterparty") or "Новый лид",
         owner=payload.get("owner", ""),
@@ -59,6 +68,17 @@ async def on_lead_converted(payload: dict, ctx) -> None:
         if qty <= 0:
             continue
         ctx.session.add(DealItem(deal_id=deal.id, sku_id=sku_id, qty=qty))
+        # Котировка клиенту (S3): печать счёта берёт цену из PriceQuote(sku_code, counterparty)
+        # (routes._invoice_items) — без записи счёт печатается с НУЛЯМИ при верной сумме сделки.
+        # Цена-за-единицу ПОСЛЕ скидки: unit×qty == сумма позиции == Deal.amount; счёт скидку
+        # повторно не применяет (net=qty×price), поэтому цена ДО скидки завысила бы счёт клиенту.
+        # Пишем только при непустом sku_code и цене >0 (disc=100 / price=0 → без котировки).
+        unit_price = (price * (Decimal("1") - disc / Decimal("100"))).quantize(Decimal("0.01"))
+        sku_code = (raw.get("sku_code") or "").strip()
+        if unit_price > 0 and sku_code:
+            ctx.session.add(
+                PriceQuote(sku_code=sku_code, counterparty=deal.counterparty, price=unit_price)
+            )
         # линия = price×qty×(1−скидка%); деньги Decimal, не float
         line = (price * qty * (Decimal("1") - disc / Decimal("100"))).quantize(Decimal("0.01"))
         total += line
@@ -100,11 +120,19 @@ async def on_payment_paid(payload: dict, ctx) -> None:
         except (TypeError, ValueError):
             deal_id = None
         if deal_id is not None:
+            # S4: среди счетов сделки берём СТАРЕЙШИЙ НЕОПЛАЧЕННЫЙ (FIFO), а не слепо
+            # новейший — иначе при нескольких счетах оплата пометит уже оплаченный/чужой,
+            # а реальный долг останется висеть (потеря учёта). amount в payload нет
+            # (finance.payment.paid несёт лишь ref/deal_id) → матч по сумме невозможен.
             doc = (
                 await ctx.session.execute(
                     select(DealDocument)
-                    .where(DealDocument.deal_id == deal_id, DealDocument.kind == "invoice")
-                    .order_by(DealDocument.id.desc())
+                    .where(
+                        DealDocument.deal_id == deal_id,
+                        DealDocument.kind == "invoice",
+                        DealDocument.status != "paid",
+                    )
+                    .order_by(DealDocument.id)
                 )
             ).scalars().first()
     if doc is not None:

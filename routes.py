@@ -2216,6 +2216,7 @@ async def lose_deal(
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
     user: CurrentUser = Depends(get_current_user),
+    _: object = Depends(require_permission("sales.deal.write")),
 ):
     """Закрыть сделку в отказ с обязательной причиной (SALES-40).
 
@@ -2264,6 +2265,7 @@ async def win_deal(
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
     user: CurrentUser = Depends(get_current_user),
+    _: object = Depends(require_permission("sales.deal.write")),
 ):
     """Закрыть сделку успешно (SALES-40). Единый путь с логистикой (`record_stage`):
     стадия ``won`` воронки сделки, дата закрытия, событие ``sales.deal.won`` (→ audit).
