@@ -2704,7 +2704,16 @@ async def create_document(
 
     prefix = DOC_NUMBER_PREFIX.get(payload.kind, "ДОК")
     number = f"{prefix}-{deal.number}"
-    doc = DealDocument(deal_id=deal_id, kind=payload.kind, number=number, amount=deal.amount)
+    # Счёт клиенту выставляется С НДС — сумма документа = грандтотал печатной формы (нетто+НДС),
+    # чтобы дебиторка/проводка в 1С/KPI «Оплаты с НДС» совпадали с тем, что реально платит клиент
+    # (PLATFORM #1; решение оператора «с НДС»). Заказ/договор — как есть (нетто). Нет позиций —
+    # fallback на deal.amount (не обнуляем документ).
+    if payload.kind == "invoice":
+        _inv_items = await _invoice_items(session, deal_id)
+        amount = _invoice_gross(_inv_items) if _inv_items else deal.amount
+    else:
+        amount = deal.amount
+    doc = DealDocument(deal_id=deal_id, kind=payload.kind, number=number, amount=amount)
     session.add(doc)
     await session.flush()
 
@@ -2966,6 +2975,26 @@ def _contract_facsimile_block(seller: dict) -> str:
 _INVOICE_VAT_RATE = Decimal("20")  # % — как в шаблоне (vatRate=20)
 
 
+def _invoice_line(qty: Decimal, price: Decimal) -> tuple[Decimal, Decimal, Decimal]:
+    """Построчный расчёт счёта → (нетто, НДС, всего-с-НДС), округление по копейке.
+
+    Единый источник истины для печатной формы (``_render_invoice``) и суммы документа
+    (``_invoice_gross``) — чтобы дебиторка/1С совпадали со счётом клиента до копейки.
+    """
+    net = (qty * price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    vat = (net * _INVOICE_VAT_RATE / 100).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    total = (net + vat).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return net, vat, total
+
+
+def _invoice_gross(items: list[dict]) -> Decimal:
+    """Сумма счёта С НДС (грандтотал) — построчно, идентично печатной форме."""
+    return sum(
+        (_invoice_line(Decimal(str(it["qty"])), Decimal(str(it["price"])))[2] for it in items),
+        Decimal("0"),
+    )
+
+
 async def _invoice_items(session: AsyncSession, deal_id: int) -> list[dict]:
     """Позиции счёта: наименование/кол-во/ед.изм. из сделки + цена — последняя котировка клиента.
 
@@ -3047,10 +3076,8 @@ def _render_invoice(
     date_str = doc.created_at.strftime("%d.%m.%Y") if doc.created_at else ""
     rows_html, grand, vat_sum = [], Decimal("0"), Decimal("0")
     for i, it in enumerate(items, start=1):
-        qty, price = Decimal(it["qty"]), Decimal(it["price"])
-        net = (qty * price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        vat = (net * _INVOICE_VAT_RATE / 100).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        total = (net + vat).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        qty, price = Decimal(str(it["qty"])), Decimal(str(it["price"]))
+        net, vat, total = _invoice_line(qty, price)
         grand += total
         vat_sum += vat
         rows_html.append(
