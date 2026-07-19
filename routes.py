@@ -2935,8 +2935,13 @@ def _render_contract(body: str, ctx: dict[str, str], facsimile: str = "") -> str
 
     ``facsimile`` — хвостовой блок подписей/печати, добавляется ПОСЛЕ тела договора
     (пусто, если факсимиле не загружено) — единый источник факсимиле на договоре.
+
+    Значения ctx (реквизиты покупателя, условия оплаты/доставки, наименования) —
+    недоверенный свободный текст → экранируем через _esc (как все прочие печатные формы),
+    иначе stored-XSS: `<script>` в payment_terms/counterparty исполнится в сессии
+    согласующего при открытии договора (PLATFORM #2). Тело шаблона (body) доверенное.
     """
-    return _PLACEHOLDER.sub(lambda m: ctx.get(m.group(1), ""), body) + facsimile
+    return _PLACEHOLDER.sub(lambda m: _esc(ctx.get(m.group(1), "")), body) + facsimile
 
 
 def _contract_facsimile_block(seller: dict) -> str:
