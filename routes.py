@@ -3816,10 +3816,11 @@ async def list_calls(
     status: str | None = None,
     owner: str | None = None,
     date: str | None = None,
+    deal_id: int | None = None,
     session: AsyncSession = Depends(get_session),
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
 ):
-    """Журнал звонков с фильтрами: статус / продавец / дата (``YYYY-MM-DD``)."""
+    """Журнал звонков: статус / продавец / дата / сделка (``deal_id`` — лента карточки)."""
     from modules.sales.models import CallLog
 
     stmt = select(CallLog).order_by(CallLog.started_at.desc())
@@ -3827,6 +3828,8 @@ async def list_calls(
         stmt = stmt.where(CallLog.status == status)
     if owner:
         stmt = stmt.where(CallLog.owner == owner)
+    if deal_id is not None:
+        stmt = stmt.where(CallLog.deal_id == deal_id)
     if date:
         try:
             day = datetime.fromisoformat(date)  # param `date` затеняет datetime.date — берём datetime
