@@ -95,8 +95,13 @@ def _digits_tail(phone: str | None, length: int = 9) -> str:
     return re.sub(r"\D", "", phone or "")[-length:]
 
 
-async def _owner_from_deals(session, cp_name: str) -> str:
-    """Owner по сделкам контрагента: активная (последняя) → закрытая (последняя)."""
+async def _deal_context(session, cp_name: str) -> tuple[str, int | None]:
+    """Owner и сделка по контрагенту.
+
+    Открытая (не терминальная) сделка → ``(owner, deal_id)`` — звонок вешаем на неё.
+    Только закрытые → ``(owner, None)``: история клиента остаётся через
+    ``counterparty_id``, в сделку не пишем.
+    """
     active = (
         await session.execute(
             select(Deal)
@@ -105,27 +110,33 @@ async def _owner_from_deals(session, cp_name: str) -> str:
         )
     ).scalars().first()
     if active is not None:
-        return active.owner
+        return active.owner, active.id
     closed = (
         await session.execute(
             select(Deal).where(Deal.counterparty == cp_name, Deal.owner != "").order_by(Deal.created_at.desc())
         )
     ).scalars().first()
-    return closed.owner if closed is not None else ""
+    return (closed.owner if closed is not None else ""), None
 
 
 async def resolve_owner(session, phone_e164: str | None) -> dict:
-    """Резолв продавца по номеру (A.2): сделки контрагента → пусто (дежурный пул).
+    """Резолв продавца/сделки по номеру (A.2): контакт → контрагент → сделки.
 
-    Возвращает ``{owner, owner_id, counterparty_id, contact_id}``. Матч номера — по
-    значащему хвосту (последние 9 цифр), т.к. контакты могут быть записаны без кода
-    страны. ponytail: при росте базы — нормализованная колонка + индекс вместо LIKE-скана.
+    Возвращает ``{owner, owner_id, counterparty_id, contact_id, deal_id}``.
+    ``deal_id`` — только открытая сделка в воронке; иначе ``None`` (звонок всё равно
+    в истории клиента через ``counterparty_id``). Матч номера — по хвосту 9 цифр.
+    ponytail: при росте базы — нормализованная колонка + индекс вместо LIKE-скана.
 
-    Лиды живут в отдельном репозитории: создание/резолв лида по звонку делает он сам,
-    подписавшись на ``sales.call.logged`` (там есть ``agent_ext`` — кто поднял трубку).
-    Поэтому здесь лид-fallback нет: неизвестный номер → owner пуст (дежурный пул).
+    Неизвестный номер → пустой owner / без deal (дежурный пул); лид создаёт модуль
+    leads по ``sales.call.logged``.
     """
-    result: dict = {"owner": "", "owner_id": None, "counterparty_id": None, "contact_id": None}
+    result: dict = {
+        "owner": "",
+        "owner_id": None,
+        "counterparty_id": None,
+        "contact_id": None,
+        "deal_id": None,
+    }
     tail = _digits_tail(phone_e164)
     if not tail:
         return result
@@ -143,10 +154,10 @@ async def resolve_owner(session, phone_e164: str | None) -> dict:
         if contact.counterparty_id is not None:
             cp = await session.get(Counterparty, contact.counterparty_id)
             if cp is not None:
-                owner = await _owner_from_deals(session, cp.name)
+                owner, deal_id = await _deal_context(session, cp.name)
+                result["deal_id"] = deal_id
                 if owner:
                     result["owner"] = owner
-                    return result
 
     return result
 
@@ -181,6 +192,7 @@ async def record_event(session, payload: dict, event_type: str) -> tuple[CallLog
         call.owner_id = owner["owner_id"]
         call.counterparty_id = owner["counterparty_id"]
         call.contact_id = owner["contact_id"]
+        call.deal_id = owner["deal_id"]  # только открытая сделка; иначе None
         session.add(call)
         await session.flush()
         created = True
