@@ -17,6 +17,7 @@ class DealCreate(BaseModel):
     priority: str = "Средний"
     stage: str = "new"
     owner: str = ""
+    owner_id: int | None = None
     next_step: str | None = None
     next_step_at: datetime.datetime | None = None
     deal_date: str | None = None
@@ -43,6 +44,7 @@ class DealUpdate(BaseModel):
     priority: str | None = None
     stage: str | None = None
     owner: str | None = None
+    owner_id: int | None = None
     next_step: str | None = None
     next_step_at: datetime.datetime | None = None
     deal_date: str | None = None
@@ -74,6 +76,7 @@ class DealRead(BaseModel):
     priority: str
     stage: str
     owner: str
+    owner_id: int | None = None
     next_step: str | None = None
     next_step_at: datetime.datetime | None = None
     deal_date: str | None = None

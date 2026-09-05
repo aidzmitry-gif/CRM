@@ -34,6 +34,9 @@ class Deal(Base):
     priority: Mapped[str] = mapped_column(String(32), default="Средний", server_default="Средний")
     stage: Mapped[str] = mapped_column(String(32), default="new", server_default="new")
     owner: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    # Soft reference to hr.employee.  It is the only trustworthy key for a
+    # per-employee visibility decision; ``owner`` remains legacy display text.
+    owner_id: Mapped[int | None] = mapped_column(index=True)
     next_step: Mapped[str | None] = mapped_column(String(128))
     # Дата+время следующего шага (открытый хвост с круга 2) — next_step остаётся текстом-описанием.
     next_step_at: Mapped[datetime | None] = mapped_column(DateTime)
