@@ -35,6 +35,7 @@ from modules.sales.access import (
     get_deal_access,
     resolve_owner_assignment,
     scope_deals,
+    visible_deal_or_none,
     visible_deal_or_404,
 )
 from modules.sales.ai import (
@@ -2491,7 +2492,13 @@ async def list_deal_items(
     access: DealAccess = Depends(get_deal_access),
 ):
     """Позиции номенклатуры сделки (с данными SKU и ценами клиенту)."""
-    deal = await visible_deal_or_404(session, deal_id, access)
+    deal = await visible_deal_or_none(session, deal_id, access)
+    if deal is None:
+        if access.own_only:
+            raise HTTPException(status_code=404, detail="Сделка не найдена")
+        # Preserve the established read-only collection contract for a
+        # non-existent deal while keeping own-scope foreign rows invisible.
+        return []
     counterparty = deal.counterparty
     rows = (
         await session.execute(
@@ -2605,7 +2612,11 @@ async def list_contacts(
     access: DealAccess = Depends(get_deal_access),
 ):
     """Контакты контрагента сделки (основной — первым), sales-13."""
-    deal = await visible_deal_or_404(session, deal_id, access)
+    deal = await visible_deal_or_none(session, deal_id, access)
+    if deal is None:
+        if access.own_only:
+            raise HTTPException(status_code=404, detail="Сделка не найдена")
+        return []
     cp = await _counterparty_for_deal(session, deal)
     if cp is None:
         return []
@@ -3586,7 +3597,11 @@ async def list_messages(
     access: DealAccess = Depends(get_deal_access),
 ):
     """Омниканальная история переписки по сделке (часть 10)."""
-    await visible_deal_or_404(session, deal_id, access)
+    deal = await visible_deal_or_none(session, deal_id, access)
+    if deal is None:
+        if access.own_only:
+            raise HTTPException(status_code=404, detail="Сделка не найдена")
+        return []
     return (
         await session.execute(
             select(Message).where(Message.deal_id == deal_id).order_by(Message.id)

@@ -93,6 +93,21 @@ async def visible_deal_or_404(
     return deal
 
 
+async def visible_deal_or_none(
+    session: AsyncSession, deal_id: int, access: DealAccess
+) -> Deal | None:
+    """Return a visible deal without changing legacy empty-list contracts.
+
+    Read-only collection endpoints historically return an empty list when the
+    requested deal does not exist. Callers may use this helper for that
+    compatibility case; an ``own`` caller still receives no foreign row.
+    Mutating and direct-object endpoints must keep using ``visible_deal_or_404``.
+    """
+
+    stmt = select(Deal).where(Deal.id == deal_id)
+    return (await session.execute(scope_deals(stmt, access))).scalar_one_or_none()
+
+
 def require_owner_assignment(access: DealAccess, owner_id: int | None) -> int | None:
     """Prevent an own-scope employee from assigning a deal to another person."""
     if access.own_only:
