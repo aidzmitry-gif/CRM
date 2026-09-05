@@ -35,8 +35,8 @@ from modules.sales.access import (
     get_deal_access,
     resolve_owner_assignment,
     scope_deals,
-    visible_deal_or_none,
     visible_deal_or_404,
+    visible_deal_or_none,
 )
 from modules.sales.ai import (
     call_script_hint,
