@@ -74,19 +74,26 @@ def _card(call: CallLog) -> dict:
     }
 
 
-def _push_card(call: CallLog) -> bool:
-    """Положить карточку звонка в очереди подписок резолвленного продавца."""
-    if not call.owner:
+def _publish_card(card: dict) -> bool:
+    """Publish a committed snapshot without retaining a mutable ORM object."""
+    if not card["owner"]:
         return False  # новый номер / дежурный пул без подписки — карточка не пушится
-    card = _card(call)
     delivered = False
-    for queue in list(_subscribers.get(call.owner, ())):
+    for queue in list(_subscribers.get(card["owner"], ())):
         try:
             queue.put_nowait(card)
             delivered = True
         except asyncio.QueueFull:
-            logger.warning("calls: очередь подписки переполнена (owner=%s)", call.owner)
+            logger.warning("calls: очередь подписки переполнена (owner=%s)", card["owner"])
     return delivered
+
+
+def _push_card(call: CallLog, ctx=None) -> bool:
+    """Relay publishes after commit; the direct fallback keeps immediate push."""
+    card = _card(call)
+    if ctx is None:
+        return _publish_card(card)
+    return bool(ctx.after_commit(lambda: _publish_card(card)))
 
 
 # --- Резолв продавца по номеру (A.2) ----------------------------------------------
@@ -163,6 +170,11 @@ async def resolve_owner(session, phone_e164: str | None) -> dict:
 
 
 # --- Апсерт записи звонка по событию ----------------------------------------------
+def _extension(value: object) -> str | None:
+    """Validate legacy event values without guessing or changing the audit payload."""
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9]{1,8}", value) else None
+
+
 async def record_event(session, payload: dict, event_type: str) -> tuple[CallLog | None, bool]:
     """Применить событие телефонии к ``CallLog`` (апсерт по ``call_id``).
 
@@ -172,6 +184,8 @@ async def record_event(session, payload: dict, event_type: str) -> tuple[CallLog
     call_id = (payload.get("call_id") or "").strip()
     if not call_id:
         return None, False
+    agent_ext = _extension(payload.get("agent_ext"))
+    to_ext = _extension(payload.get("to_ext"))
 
     call = (
         await session.execute(select(CallLog).where(CallLog.call_id == call_id))
@@ -183,7 +197,7 @@ async def record_event(session, payload: dict, event_type: str) -> tuple[CallLog
             direction=payload.get("direction") or "in",
             phone_e164=payload.get("phone_e164"),
             did=payload.get("did"),
-            agent_ext=payload.get("agent_ext"),
+            agent_ext=agent_ext,
             status="ringing",
             started_at=_utcnow(),
         )
@@ -198,8 +212,8 @@ async def record_event(session, payload: dict, event_type: str) -> tuple[CallLog
         created = True
 
     # дозаполнить поля, приходящие на более поздних этапах (дозвон/ответ несут code/did)
-    if payload.get("agent_ext") and not call.agent_ext:
-        call.agent_ext = payload["agent_ext"]
+    if agent_ext and not call.agent_ext:
+        call.agent_ext = agent_ext
     if payload.get("did") and not call.did:
         call.did = payload["did"]
 
@@ -225,8 +239,8 @@ async def record_event(session, payload: dict, event_type: str) -> tuple[CallLog
             call.hold_sec = payload["hold_sec"]
         if payload.get("recording_url"):
             call.recording_url = payload["recording_url"]
-    elif event_type == "telephony.call.transfer" and payload.get("to_ext"):
-        note = f"Перевод на {payload['to_ext']}"
+    elif event_type == "telephony.call.transfer" and to_ext:
+        note = f"Перевод на {to_ext}"
         call.comment = f"{call.comment}; {note}" if call.comment else note
 
     return call, created
@@ -247,7 +261,7 @@ def _emit_logged(ctx, call: CallLog) -> None:
             "call_id": call.call_id,
             "direction": call.direction,
             "owner": call.owner,
-            "agent_ext": call.agent_ext,  # кто поднял трубку — репо лидов заводит лид на него
+            "agent_ext": call.agent_ext,  # validated extension; employee mapping is separate
             "phone": call.phone_e164,
             "deal_id": call.deal_id,
             "actor": "telephony",
@@ -266,7 +280,7 @@ async def on_incoming_call(payload: dict, ctx) -> None:
         return
     if created:
         _emit_logged(ctx, call)
-    _push_card(call)
+    _push_card(call, ctx)
 
 
 async def on_call_answered(payload: dict, ctx) -> None:
@@ -277,7 +291,7 @@ async def on_call_answered(payload: dict, ctx) -> None:
         return
     if created:
         _emit_logged(ctx, call)
-    _push_card(call)
+    _push_card(call, ctx)
 
 
 async def on_call_ended(payload: dict, ctx) -> None:
@@ -302,7 +316,7 @@ async def on_call_ended(payload: dict, ctx) -> None:
             "entity_ref": f"call:{call.call_id}",
         },
     )
-    _push_card(call)
+    _push_card(call, ctx)
 
 
 async def on_call_transfer(payload: dict, ctx) -> None:
@@ -313,7 +327,7 @@ async def on_call_transfer(payload: dict, ctx) -> None:
         return
     if created:
         _emit_logged(ctx, call)
-    _push_card(call)
+    _push_card(call, ctx)
 
 
 # Карта обработчиков по типу события — для синхронного приёма через эндпоинт-fallback
