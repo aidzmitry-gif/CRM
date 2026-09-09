@@ -6,24 +6,16 @@
 контрагента из звонков (``call_log``), сообщений (``message`` по его сделкам) и
 самих сделок (``deal``), свежие сверху.
 
-Связь с контрагентом: в схеме ``sales`` сделки/сообщения привязаны к контрагенту по
-ИМЕНИ (``Deal.counterparty``), а ``call_log`` — мягким ``counterparty_id`` (shared kernel).
-Поэтому имя резолвится из ядра (``Counterparty.name``) по переданному ``counterparty_id``,
-а звонки берутся и по ``counterparty_id``, и по сделкам контрагента.
-
-# ponytail: изоляция по ИМЕНИ — при одинаковом названии у разных контрагентов их сделки/
-# сообщения смешаются (у ``Deal`` нет ``counterparty_id``, только строка). Системное
-# ограничение модели sales, не этого фасада; MDM держит имена эталонными. Апгрейд —
-# добавить ``Deal.counterparty_id`` (мягкая ссылка) и фильтровать по нему.
+Сделки связаны стабильным counterparty_id. Миграция переносит однозначные старые
+связи; оставшиеся записи требуют явного выбора и не смешивают историю.
 """
 from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.domain.models import Counterparty
 from modules.sales.models import CallLog, Deal, Message
 
 
@@ -34,45 +26,33 @@ def _iso(dt: datetime | None) -> str | None:
 class SalesTouchHistory:
     """История касаний (звонки/сообщения/сделки) контрагента для карточки ядра."""
 
-    async def _counterparty_name(
-        self, session: AsyncSession, counterparty_id: int
-    ) -> str | None:
-        return (
-            await session.execute(
-                select(Counterparty.name).where(Counterparty.id == counterparty_id)
-            )
-        ).scalar_one_or_none()
+    async def has_deals(self, session: AsyncSession, counterparty_ids: tuple[int, ...]) -> bool:
+        return await session.scalar(select(Deal.id).where(
+            Deal.counterparty_id.in_(counterparty_ids),
+        ).limit(1)) is not None
 
-    async def _deal_ids(self, session: AsyncSession, name: str | None) -> list[int]:
-        # Пустое имя не фильтруем — иначе сматчились бы ВСЕ сделки без контрагента.
-        if not name:
-            return []
-        return list(
-            (
-                await session.execute(select(Deal.id).where(Deal.counterparty == name))
-            ).scalars()
-        )
+    async def _deal_ids(self, session: AsyncSession, counterparty_id: int) -> list[int]:
+        return list(await session.scalars(select(Deal.id).where(Deal.counterparty_id == counterparty_id)))
 
     def _call_filter(self, counterparty_id: int, deal_ids: list[int]):
         # Звонок принадлежит контрагенту, если у него его counterparty_id ИЛИ он привязан
         # к сделке этого контрагента (телефония резолвит не всегда).
         conds = [CallLog.counterparty_id == counterparty_id]
         if deal_ids:
-            conds.append(CallLog.deal_id.in_(deal_ids))
+            conds.append(and_(CallLog.counterparty_id.is_(None), CallLog.deal_id.in_(deal_ids)))
         return or_(*conds)
 
     async def touches(
         self, session: AsyncSession, counterparty_id: int, *, limit: int = 50
     ) -> list[dict]:
-        name = await self._counterparty_name(session, counterparty_id)
-        deal_ids = await self._deal_ids(session, name)
+        deal_ids = await self._deal_ids(session, counterparty_id)
         out: list[dict] = []
 
-        if name:
+        if deal_ids:
             deals = (
                 await session.execute(
                     select(Deal)
-                    .where(Deal.counterparty == name)
+                    .where(Deal.id.in_(deal_ids))
                     .order_by(Deal.created_at.desc())
                     .limit(limit)
                 )
@@ -123,8 +103,7 @@ class SalesTouchHistory:
         return out[:limit]
 
     async def summary(self, session: AsyncSession, counterparty_id: int) -> dict:
-        name = await self._counterparty_name(session, counterparty_id)
-        deal_ids = await self._deal_ids(session, name)
+        deal_ids = await self._deal_ids(session, counterparty_id)
 
         async def _count(stmt) -> int:
             return (await session.execute(stmt)).scalar_one()
@@ -140,11 +119,11 @@ class SalesTouchHistory:
 
         deals_n = 0
         last_deal: datetime | None = None
-        if name:
+        if deal_ids:
             deals_n = await _count(
-                select(func.count()).select_from(Deal).where(Deal.counterparty == name)
+                select(func.count()).select_from(Deal).where(Deal.id.in_(deal_ids))
             )
-            last_deal = await _max(Deal.created_at, Deal.counterparty == name)
+            last_deal = await _max(Deal.created_at, Deal.id.in_(deal_ids))
 
         msgs_n = 0
         last_msg: datetime | None = None

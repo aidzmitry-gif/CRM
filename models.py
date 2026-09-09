@@ -33,6 +33,9 @@ class Deal(Base):
     number: Mapped[str] = mapped_column(String(64), unique=True)
     title: Mapped[str] = mapped_column(String(255))
     counterparty: Mapped[str] = mapped_column(String(255))
+    # Shared-kernel soft references; legacy text remains the original display label.
+    counterparty_id: Mapped[int | None] = mapped_column(index=True)
+    branch_id: Mapped[int | None] = mapped_column(index=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0"), server_default="0")
     priority: Mapped[str] = mapped_column(String(32), default="Средний", server_default="Средний")
     stage: Mapped[str] = mapped_column(String(32), default="new", server_default="new")

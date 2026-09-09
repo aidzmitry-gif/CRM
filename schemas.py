@@ -13,6 +13,8 @@ class DealCreate(BaseModel):
     number: str
     title: str
     counterparty: str
+    counterparty_id: int | None = Field(default=None, ge=1)
+    branch_id: int | None = Field(default=None, ge=1)
     amount: float = 0.0
     priority: str = "Средний"
     stage: str = "new"
@@ -40,6 +42,8 @@ class DealUpdate(BaseModel):
 
     title: str | None = None
     counterparty: str | None = None
+    counterparty_id: int | None = Field(default=None, ge=1)
+    branch_id: int | None = Field(default=None, ge=1)
     amount: float | None = None
     priority: str | None = None
     stage: str | None = None
@@ -72,6 +76,8 @@ class DealRead(BaseModel):
     number: str
     title: str
     counterparty: str
+    counterparty_id: int | None = None
+    branch_id: int | None = None
     amount: float
     priority: str
     stage: str

@@ -71,6 +71,7 @@ from modules.sales.models import (
     PriceQuote,
     Stage,
 )
+from modules.sales.party_identity import party_for_deal, prepare_party_change
 from modules.sales.repository import DealRepository, record_stage
 from modules.sales.schemas import (
     ActivityCreate,
@@ -310,15 +311,8 @@ async def _build_item_out(session: AsyncSession, item: DealItem, counterparty: s
 async def _counterparty_for_deal(
     session: AsyncSession, deal: Deal, create: bool = False
 ) -> Counterparty | None:
-    """Найти контрагента сделки по имени (связь по названию); опц. создать."""
-    cp = (
-        await session.execute(select(Counterparty).where(Counterparty.name == deal.counterparty))
-    ).scalars().first()
-    if cp is None and create:
-        cp = Counterparty(name=deal.counterparty)
-        session.add(cp)
-        await session.flush()
-    return cp
+    """Resolve the stable party, with an unambiguous legacy fallback."""
+    return await party_for_deal(session, deal, create=create)
 
 
 async def _counterparty_ref(session: AsyncSession, deal: Deal) -> CounterpartyRef | None:
@@ -1235,6 +1229,7 @@ async def update_deal(
     repo = DealRepository(session)
     deal = await visible_deal_or_404(session, deal_id, access)
     data = payload.model_dump(exclude_unset=True)
+    await prepare_party_change(session, data, deal=deal)
     if access.own_only:
         # Check a supplied value before overwriting it with self: otherwise a
         # client could attempt reassignment and receive a misleading success.
@@ -2447,6 +2442,9 @@ async def create_deal(
     """Создать сделку и опубликовать доменное событие через шину ядра."""
     try:
         data = payload.model_copy(deep=True)
+        party_data = data.model_dump()
+        await prepare_party_change(session, party_data)
+        data = DealCreate.model_validate(party_data)
         data.owner_id, owner_name = await resolve_owner_assignment(session, access, data.owner_id)
         if owner_name is not None:
             data.owner = owner_name
@@ -2541,10 +2539,13 @@ async def repeat_last_order(
     deal = await visible_deal_or_404(session, deal_id, access)
     # Одним запросом: последний (по дате, tie-break по id) предыдущий заказ С позициями —
     # join к DealItem отсекает пустые сделки, limit 1 берёт самый свежий (без N+1-скана).
+    if deal.counterparty_id is None:
+        return []
     prior_stmt = (
         select(DealItem.deal_id)
         .join(Deal, Deal.id == DealItem.deal_id)
-        .where(Deal.counterparty == deal.counterparty, Deal.id < deal_id)
+        .where(Deal.counterparty_id == deal.counterparty_id,
+               Deal.branch_id == deal.branch_id, Deal.id < deal_id)
         .order_by(Deal.created_at.desc(), Deal.id.desc())
         .limit(1)
     )
