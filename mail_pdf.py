@@ -35,9 +35,9 @@ def render_original(source: str) -> bytes:
 
     class EmbeddedImagesOnly(URLFetcher):
         def fetch(self, url, headers=None):
-            match = re.fullmatch(r"data:(image/(?:png|jpeg));base64,([A-Za-z0-9+/=\s]+)", url)
+            match = re.fullmatch(r"data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=\s]+)", url)
             if not match or len(url) > 2 * 1024 * 1024:
-                raise FatalURLFetchingError("Document resource is not an embedded PNG/JPEG")
+                raise FatalURLFetchingError("Document resource is not an embedded PNG/JPEG/WebP")
             try:
                 data = base64.b64decode(match[2], validate=True)
             except ValueError as exc:
