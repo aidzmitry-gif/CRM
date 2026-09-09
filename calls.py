@@ -102,7 +102,7 @@ def _digits_tail(phone: str | None, length: int = 9) -> str:
     return re.sub(r"\D", "", phone or "")[-length:]
 
 
-async def _deal_context(session, cp_name: str) -> tuple[str, int | None]:
+async def _deal_context(session, counterparty_id: int, branch_id: int | None) -> tuple[str, int | None]:
     """Owner и сделка по контрагенту.
 
     Открытая (не терминальная) сделка → ``(owner, deal_id)`` — звонок вешаем на неё.
@@ -112,7 +112,8 @@ async def _deal_context(session, cp_name: str) -> tuple[str, int | None]:
     active = (
         await session.execute(
             select(Deal)
-            .where(Deal.counterparty == cp_name, Deal.owner != "", Deal.stage.notin_(TERMINAL_STAGES))
+            .where(Deal.counterparty_id == counterparty_id, Deal.branch_id == branch_id,
+                   Deal.owner != "", Deal.stage.notin_(TERMINAL_STAGES))
             .order_by(Deal.created_at.desc())
         )
     ).scalars().first()
@@ -120,7 +121,8 @@ async def _deal_context(session, cp_name: str) -> tuple[str, int | None]:
         return active.owner, active.id
     closed = (
         await session.execute(
-            select(Deal).where(Deal.counterparty == cp_name, Deal.owner != "").order_by(Deal.created_at.desc())
+            select(Deal).where(Deal.counterparty_id == counterparty_id, Deal.branch_id == branch_id,
+                               Deal.owner != "").order_by(Deal.created_at.desc())
         )
     ).scalars().first()
     return (closed.owner if closed is not None else ""), None
@@ -148,20 +150,23 @@ async def resolve_owner(session, phone_e164: str | None) -> dict:
     if not tail:
         return result
 
-    contact = (
+    contacts = (
         await session.execute(
             select(Contact)
             .where(Contact.phone.isnot(None), Contact.phone.like(f"%{tail}"))
             .order_by(Contact.is_primary.desc(), Contact.id)
         )
-    ).scalars().first()
+    ).scalars().all()
+    if len({(c.counterparty_id, c.branch_id, c.id if c.counterparty_id is None else None) for c in contacts}) > 1:
+        return result  # Shared phone across parties/branches is not an ownership decision.
+    contact = contacts[0] if contacts else None
     if contact is not None:
         result["contact_id"] = contact.id
         result["counterparty_id"] = contact.counterparty_id
         if contact.counterparty_id is not None:
             cp = await session.get(Counterparty, contact.counterparty_id)
-            if cp is not None:
-                owner, deal_id = await _deal_context(session, cp.name)
+            if cp is not None and cp.is_active and cp.merged_into_id is None:
+                owner, deal_id = await _deal_context(session, cp.id, contact.branch_id)
                 result["deal_id"] = deal_id
                 if owner:
                     result["owner"] = owner
