@@ -18,6 +18,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db.base import Base
+from modules.sales.mail_models import EmailAttempt, OutgoingEmail  # noqa: F401
 
 
 class Deal(Base):

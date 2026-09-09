@@ -286,7 +286,7 @@ class PackageSentOut(BaseModel):
     invoice_number: str
     contract_number: str
     channel: str
-    sent: bool = True
+    sent: bool = False
 
 
 class CounterpartyRef(BaseModel):

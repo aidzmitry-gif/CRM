@@ -3542,51 +3542,11 @@ async def send_package(
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
     _: object = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
 ):
-    """SALES-53 C.4: отправить клиенту пакет «счёт + договор» одной записью.
-
-    Берём последний проведённый счёт и последний согласованный (проведённый) договор
-    сделки — по ТЗ пакет уходит ПОСЛЕ согласования договора. Эмитим ``sales.package.sent``
-    и пишем ОДНУ запись в историю переписки. Реальная доставка (email/Telegram, B.3) —
-    отдельный слой; здесь фиксируем факт отправки пакета.
-    """
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
-    invoice, contract = await _package_docs(session, deal_id)
-    if invoice is None or contract is None:
-        raise HTTPException(
-            status_code=409, detail="Нужны проведённый счёт и согласованный договор"
-        )
-
-    channel = "email"
-    session.add(
-        Message(
-            deal_id=deal_id,
-            channel=channel,
-            direction="out",
-            author="Система",
-            text=f"Отправлен пакет: счёт {invoice.number} + договор {contract.number}",
-        )
-    )
-    core.event_bus.emit(
-        session,
-        "sales.package.sent",
-        {
-            "deal_id": deal_id,
-            "invoice_number": invoice.number,
-            "contract_number": contract.number,
-            "channel": channel,
-            "entity_ref": f"deal:{deal_id}",
-        },
-    )
-    await session.commit()
-    return PackageSentOut(
-        deal_id=deal_id,
-        invoice_number=invoice.number,
-        contract_number=contract.number,
-        channel=channel,
-    )
+    """Legacy action cannot authorize external mail without a reviewed recipient."""
+    await visible_deal_or_404(session, deal_id, access)
+    raise HTTPException(409, "Для отправки откройте «Email документов», выберите адресатов и подтвердите письмо")
 
 
 @router.get("/deals/{deal_id}/messages", response_model=list[MessageOut])
