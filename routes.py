@@ -28,7 +28,17 @@ from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
 from core.services.auth import CurrentUser, get_current_user, require_permission
 from core.services.price_cost import ItemPriceCost
+from modules.sales import documents as originals
 from modules.sales._money_words import money_words
+from modules.sales.access import (
+    DealAccess,
+    deny_unscoped_own_routes,
+    get_deal_access,
+    resolve_owner_assignment,
+    scope_deals,
+    visible_deal_or_404,
+    visible_deal_or_none,
+)
 from modules.sales.ai import (
     call_script_hint,
     classify_objection,
@@ -52,6 +62,7 @@ from modules.sales.models import (
     DealItem,
     DealStageEvent,
     DealTask,
+    DocumentPackage,
     KpiTarget,
     LossReason,
     Message,
@@ -94,7 +105,9 @@ from modules.sales.schemas import (
     DealUpdate,
     DocumentCreate,
     DocumentDecision,
+    DocumentDraftUpdate,
     DocumentOut,
+    DocumentRevision,
     FunnelOut,
     HandoffItem,
     JournalRowOut,
@@ -108,6 +121,7 @@ from modules.sales.schemas import (
     MessageOut,
     ObjectionReplyIn,
     ObjectionReplyOut,
+    PackagePrepare,
     PackageSentOut,
     PipelineAnalyticsOut,
     PlanDecisionIn,
@@ -143,7 +157,7 @@ from modules.sales.stages import (
     canonical_stages,
 )
 
-router = APIRouter(tags=["sales"])
+router = APIRouter(tags=["sales"], dependencies=[Depends(deny_unscoped_own_routes)])
 # Лиды (вход воронки) — отдельный роутер. Монтируется и на /leads (фронт бьёт туда), и на
 # /sales/leads (back-compat). Полный вынос в modules/leads — Шаг 2 ТЗ принятия выноса лидов.
 leads_router = APIRouter(tags=["leads"])
@@ -348,8 +362,10 @@ async def _post_document_to_1c(
     """
     result = await core.services.onec.post_document(
         doc.kind,
-        {"number": doc.number, "counterparty": counterparty, "amount": float(doc.amount)},
+        {"number": doc.number, "counterparty": counterparty, "amount": str(doc.amount)},
     )
+    if not result.get("posted"):
+        raise HTTPException(502, "Шлюз не подтвердил проведение документа")
     doc.onec_ref = result.get("ref")
     doc.status = "posted"
     doc.posted_at = _utcnow()
@@ -363,7 +379,17 @@ async def _post_document_to_1c(
             "number": doc.number,
             "onec_ref": doc.onec_ref,
             "counterparty": counterparty,
-            "amount": float(doc.amount),
+            "amount": str(doc.amount),
+            "currency": "BYN",
+            "due_date": doc.valid_until.isoformat() if doc.valid_until else None,
+            "document_version": doc.version,
+            "content_sha256": doc.content_sha256,
+            "issued_at": doc.issued_at.isoformat(),
+            "organization_unp": doc.snapshot_json["seller"].get("unp"),
+            "recipient_account": doc.snapshot_json["seller"].get("account"),
+            "payer_unp": doc.snapshot_json["buyer"].get("unp"),
+            "counterparty_ref": doc.snapshot_json["buyer"].get("unp"),
+            "supersedes_id": doc.supersedes_id,
             "entity_ref": f"deal:{doc.deal_id}",
         },
     )
@@ -411,12 +437,13 @@ async def board(
     funnel: str = DEFAULT_FUNNEL,
     session: AsyncSession = Depends(get_session),
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
 ) -> BoardOut:
     """Доска сделок воронки ``funnel``: сделки по стадиям с агрегатами. ``owner`` —
     фильтр по ответственному (видимость «по менеджеру», SALES-42). Сделки фильтруются
     по ``Deal.funnel == funnel`` (дефолт ``new_clients``); колонки — стадии этой воронки.
     """
-    deals = await DealRepository(session).list()
+    deals = (await session.execute(scope_deals(select(Deal), access))).scalars().all()
     deals = [d for d in deals if d.funnel == funnel]
     if owner:
         deals = [d for d in deals if d.owner == owner]
@@ -451,6 +478,7 @@ async def pipeline_analytics(
     owner: str = "",
     session: AsyncSession = Depends(get_session),
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Pipeline-аналитика воронки (П6 ТЗ): по каждой стадии — count/sum/weighted/avg_age/
     conv→следующая; по воронке — взвеш.прогноз + средняя длина цикла won-сделок.
@@ -459,7 +487,7 @@ async def pipeline_analytics(
     среди тех, кто хотя бы был в этой стадии. honest-empty: пусто, если истории нет.
     """
     stage_rows = await _board_stages(session, funnel)
-    deals = await DealRepository(session).list()
+    deals = (await session.execute(scope_deals(select(Deal), access))).scalars().all()
     deals = [d for d in deals if d.funnel == funnel]
     if owner:
         deals = [d for d in deals if d.owner == owner]
@@ -559,6 +587,7 @@ async def pipeline_stage_metrics(
     date_to: date | None = None,
     session: AsyncSession = Depends(get_session),
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Период-срез конверсии стадия→след.стадия и среднего времени на стадии.
 
@@ -579,7 +608,7 @@ async def pipeline_stage_metrics(
 
     stage_rows = await _board_stages(session, funnel)
     stage_codes = [s["id"] for s in stage_rows]
-    deals = await DealRepository(session).list()
+    deals = (await session.execute(scope_deals(select(Deal), access))).scalars().all()
     deals = [d for d in deals if d.funnel == funnel]
     if owner:
         deals = [d for d in deals if d.owner == owner]
@@ -1009,6 +1038,8 @@ async def list_deals(
     stuck_days: int = 0,
     has_open_task: bool | None = None,
     session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Плоский список сделок. ``stuck_days>0`` — только «висяки» (SALES-43): открытые
     сделки без смены стадии дольше N дней. ``has_open_task=false`` — открытые сделки
@@ -1017,7 +1048,7 @@ async def list_deals(
         cutoff = _utcnow() - timedelta(days=stuck_days)
         return (
             await session.execute(
-                select(Deal)
+                scope_deals(select(Deal), access)
                 .where(Deal.stage.notin_(TERMINAL_STAGES), Deal.stage_changed_at < cutoff)
                 .order_by(Deal.id)
             )
@@ -1028,20 +1059,23 @@ async def list_deals(
         )
         return (
             await session.execute(
-                select(Deal)
+                scope_deals(select(Deal), access)
                 .where(Deal.stage.notin_(TERMINAL_STAGES), Deal.id.notin_(open_deal_ids))
                 .order_by(Deal.id)
             )
         ).scalars().all()
-    return await DealRepository(session).list()
+    return (await session.execute(scope_deals(select(Deal), access).order_by(Deal.id))).scalars().all()
 
 
 @router.get("/deals/{deal_id}", response_model=DealDetailOut)
-async def get_deal(deal_id: int, session: AsyncSession = Depends(get_session)):
+async def get_deal(
+    deal_id: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
     """Одна сделка по id с позициями номенклатуры (со связью к SKU)."""
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    deal = await visible_deal_or_404(session, deal_id, access)
 
     rows = (
         await session.execute(select(DealItem).where(DealItem.deal_id == deal_id))
@@ -1194,14 +1228,31 @@ async def update_deal(
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
     user: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Частично обновить сделку. Смена стадии (drag&drop) пишется в историю и
     обновляет ``stage_changed_at`` через единый хелпер ``record_stage`` (SALES-43)."""
     repo = DealRepository(session)
-    deal = await repo.get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    deal = await visible_deal_or_404(session, deal_id, access)
     data = payload.model_dump(exclude_unset=True)
+    if access.own_only:
+        # Check a supplied value before overwriting it with self: otherwise a
+        # client could attempt reassignment and receive a misleading success.
+        owner_id, owner_name = await resolve_owner_assignment(
+            session, access, data.get("owner_id")
+        )
+        data["owner_id"] = owner_id
+        data["owner"] = owner_name
+    elif "owner_id" in data:
+        owner_id, owner_name = await resolve_owner_assignment(session, access, data["owner_id"])
+        data["owner_id"] = owner_id
+        if owner_name is not None:
+            data["owner"] = owner_name
+    elif "owner" in data and data["owner"] != deal.owner:
+        # The existing frontend still submits a free-text display owner.  It
+        # cannot claim a numeric identity: a changed unconfirmed name clears
+        # the previous binding, while an unchanged form value preserves it.
+        data["owner_id"] = None
     new_stage = data.pop("stage", None)
     new_funnel = data.pop("funnel", None)
     # R5-3: нельзя двинуть сделку в стадию ЧУЖОЙ воронки — иначе сделка выпадает с обеих досок
@@ -1399,6 +1450,7 @@ async def deal_margin(
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Факт-маржа сделки: цена из ``PriceQuote`` × qty минус landed × qty (по позициям).
 
@@ -1408,9 +1460,7 @@ async def deal_margin(
     причина; позиции без цены/себеса в gross НЕ попадают (``no_price``/``no_cost``).
     Методику установки цены НЕ изобретаем — отдаём ФАКТ-маржу где данные уже есть.
     """
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    deal = await visible_deal_or_404(session, deal_id, access)
 
     lines, facade_missing = await _deal_margin(session, core, deal)
     if not lines:
@@ -1456,6 +1506,7 @@ async def pipeline_margin_forecast(
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Взвешенный прогноз ВАЛОВОЙ МАРЖИ воронки (S3-1) — маржа из карточки на уровень воронки.
 
@@ -1471,7 +1522,7 @@ async def pipeline_margin_forecast(
     stage_rows = await _board_stages(session, funnel)
     prob_by_stage = {s["id"]: s["probability"] for s in stage_rows}
 
-    deals = await DealRepository(session).list()
+    deals = (await session.execute(scope_deals(select(Deal), access))).scalars().all()
     deals = [
         d for d in deals
         if d.funnel == funnel and d.stage not in TERMINAL_STAGES and d.stage != "cond_lost"
@@ -1531,6 +1582,7 @@ async def deal_margin_reconcile(
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Сверка прогнозной маржи sales с фактической себестоимостью из аудита шины (S3-4, ось A).
 
@@ -1549,9 +1601,7 @@ async def deal_margin_reconcile(
     решение оператора на реальных данных (память cost-price-from-1c-decision, офисный чек-лист
     п.4). Не гадаем здесь; правим вместе с наполнением 1С в integrations.
     """
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    deal = await visible_deal_or_404(session, deal_id, access)
 
     lines, facade_missing = await _deal_margin(session, core, deal)
     priced_lines = [ln for ln in lines if ln.status == "priced"]
@@ -2217,6 +2267,7 @@ async def lose_deal(
     session: AsyncSession = Depends(get_session),
     user: CurrentUser = Depends(get_current_user),
     _: object = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Закрыть сделку в отказ с обязательной причиной (SALES-40).
 
@@ -2227,9 +2278,7 @@ async def lose_deal(
     Как и в win_deal (Фикс 1, цикл 18): lost-код резолвится по воронке сделки, а не
     литералом "lost" — для repeat_clients/tenders это rp_lost/tn_lost; литерал "lost"
     не входит ни в одну их колонку и сделка пропадала бы с доски."""
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    deal = await visible_deal_or_404(session, deal_id, access)
     kind_map = await _stage_kind_map(session, deal.funnel)
     lost_code = next((code for code, kind in kind_map.items() if kind == "lost"), "lost")
     if deal.stage == lost_code:
@@ -2266,6 +2315,7 @@ async def win_deal(
     session: AsyncSession = Depends(get_session),
     user: CurrentUser = Depends(get_current_user),
     _: object = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Закрыть сделку успешно (SALES-40). Единый путь с логистикой (`record_stage`):
     стадия ``won`` воронки сделки, дата закрытия, событие ``sales.deal.won`` (→ audit).
@@ -2274,9 +2324,7 @@ async def win_deal(
     "won" — для repeat_clients/tenders это rp_won/tn_won; литерал "won" не входит ни в одну
     их колонку и после перезагрузки сделка пропадала с доски.
     """
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    deal = await visible_deal_or_404(session, deal_id, access)
     kind_map = await _stage_kind_map(session, deal.funnel)
     won_code = next((code for code, kind in kind_map.items() if kind == "won"), "won")
     if deal.stage == won_code:
@@ -2296,8 +2344,14 @@ async def win_deal(
 
 
 @router.get("/deals/{deal_id}/history", response_model=list[StageEventOut])
-async def deal_history(deal_id: int, session: AsyncSession = Depends(get_session)):
+async def deal_history(
+    deal_id: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
     """Хронология смен стадий сделки (SALES-43)."""
+    await visible_deal_or_404(session, deal_id, access)
     return (
         await session.execute(
             select(DealStageEvent)
@@ -2308,8 +2362,14 @@ async def deal_history(deal_id: int, session: AsyncSession = Depends(get_session
 
 
 @router.get("/deals/{deal_id}/tasks", response_model=list[TaskOut])
-async def list_tasks(deal_id: int, session: AsyncSession = Depends(get_session)):
+async def list_tasks(
+    deal_id: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
     """Задачи по сделке (SALES-41): открытые — первыми, по сроку."""
+    await visible_deal_or_404(session, deal_id, access)
     rows = (
         await session.execute(
             select(DealTask)
@@ -2326,11 +2386,11 @@ async def create_task(
     payload: TaskCreate,
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Поставить задачу по сделке (SALES-41) — событие ``sales.task.created`` (→ audit)."""
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    await visible_deal_or_404(session, deal_id, access)
     task = DealTask(
         deal_id=deal_id,
         title=payload.title,
@@ -2382,10 +2442,15 @@ async def create_deal(
     session: AsyncSession = Depends(get_session),
     core: Core = Depends(get_core),
     _: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Создать сделку и опубликовать доменное событие через шину ядра."""
     try:
-        deal = await DealRepository(session).create(payload)
+        data = payload.model_copy(deep=True)
+        data.owner_id, owner_name = await resolve_owner_assignment(session, access, data.owner_id)
+        if owner_name is not None:
+            data.owner = owner_name
+        deal = await DealRepository(session).create(data)
         core.event_bus.emit(session, "sales.deal.created", {"number": deal.number, "title": deal.title})
         if deal.ship_deadline:
             await _emit_ship_deadline(session, core, deal)
@@ -2402,11 +2467,10 @@ async def request_approval(
     payload: ApprovalRequest,
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Отправить сделку на согласование (например, договор → юристу)."""
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    deal = await visible_deal_or_404(session, deal_id, access)
     approval = await core.services.approvals.request(
         session,
         payload.kind,
@@ -2438,10 +2502,21 @@ async def list_skus(
 
 
 @router.get("/deals/{deal_id}/items", response_model=list[DealItemOut])
-async def list_deal_items(deal_id: int, session: AsyncSession = Depends(get_session)):
+async def list_deal_items(
+    deal_id: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
     """Позиции номенклатуры сделки (с данными SKU и ценами клиенту)."""
-    deal = await DealRepository(session).get(deal_id)
-    counterparty = deal.counterparty if deal else ""
+    deal = await visible_deal_or_none(session, deal_id, access)
+    if deal is None:
+        if access.own_only:
+            raise HTTPException(status_code=404, detail="Сделка не найдена")
+        # Preserve the established read-only collection contract for a
+        # non-existent deal while keeping own-scope foreign rows invisible.
+        return []
+    counterparty = deal.counterparty
     rows = (
         await session.execute(
             select(DealItem).where(DealItem.deal_id == deal_id).order_by(DealItem.id)
@@ -2451,27 +2526,31 @@ async def list_deal_items(deal_id: int, session: AsyncSession = Depends(get_sess
 
 
 @router.get("/deals/{deal_id}/repeat-last-order", response_model=list[DealItemOut])
-async def repeat_last_order(deal_id: int, session: AsyncSession = Depends(get_session)):
+async def repeat_last_order(
+    deal_id: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
     """Позиции из последней ПРЕДЫДУЩЕЙ сделки того же контрагента (повтор заказа).
 
     «Предыдущая» = созданная раньше текущей (``Deal.id < deal_id`` — id монотонен по
     вставке, null-безопасен), у которой есть позиции. Параллельная более новая сделка
     (id больше) в повтор не попадёт. Пусто, если сделки нет или прошлых заказов нет.
     """
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    deal = await visible_deal_or_404(session, deal_id, access)
     # Одним запросом: последний (по дате, tie-break по id) предыдущий заказ С позициями —
     # join к DealItem отсекает пустые сделки, limit 1 берёт самый свежий (без N+1-скана).
-    prior_id = (
-        await session.execute(
-            select(DealItem.deal_id)
-            .join(Deal, Deal.id == DealItem.deal_id)
-            .where(Deal.counterparty == deal.counterparty, Deal.id < deal_id)
-            .order_by(Deal.created_at.desc(), Deal.id.desc())
-            .limit(1)
-        )
-    ).scalar()
+    prior_stmt = (
+        select(DealItem.deal_id)
+        .join(Deal, Deal.id == DealItem.deal_id)
+        .where(Deal.counterparty == deal.counterparty, Deal.id < deal_id)
+        .order_by(Deal.created_at.desc(), Deal.id.desc())
+        .limit(1)
+    )
+    if access.own_only:
+        prior_stmt = prior_stmt.where(Deal.owner_id == access.employee_id)
+    prior_id = (await session.execute(prior_stmt)).scalar()
     if prior_id is None:
         return []
     rows = (
@@ -2488,11 +2567,11 @@ async def add_deal_item(
     payload: DealItemCreate,
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Добавить позицию номенклатуры в сделку (подбор из SKU, sales-12)."""
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    deal = await visible_deal_or_404(session, deal_id, access)
     if await session.get(Sku, payload.sku_id) is None:
         raise HTTPException(status_code=404, detail="Номенклатура не найдена")
     item = DealItem(deal_id=deal_id, sku_id=payload.sku_id, qty=Decimal(str(payload.qty)))
@@ -2512,11 +2591,14 @@ async def update_deal_item(
     item_id: int,
     payload: DealItemUpdate,
     session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Изменить количество в позиции сделки."""
     item = await session.get(DealItem, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Позиция не найдена")
+    await visible_deal_or_404(session, item.deal_id, access)
     item.qty = Decimal(str(payload.qty))
     deal = await DealRepository(session).get(item.deal_id)
     await session.commit()
@@ -2524,20 +2606,33 @@ async def update_deal_item(
 
 
 @router.delete("/deal-items/{item_id}", status_code=204)
-async def delete_deal_item(item_id: int, session: AsyncSession = Depends(get_session)):
+async def delete_deal_item(
+    item_id: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
+):
     """Удалить позицию номенклатуры из сделки."""
     item = await session.get(DealItem, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Позиция не найдена")
+    await visible_deal_or_404(session, item.deal_id, access)
     await session.delete(item)
     await session.commit()
 
 
 @router.get("/deals/{deal_id}/contacts", response_model=list[ContactOut])
-async def list_contacts(deal_id: int, session: AsyncSession = Depends(get_session)):
+async def list_contacts(
+    deal_id: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
     """Контакты контрагента сделки (основной — первым), sales-13."""
-    deal = await DealRepository(session).get(deal_id)
+    deal = await visible_deal_or_none(session, deal_id, access)
     if deal is None:
+        if access.own_only:
+            raise HTTPException(status_code=404, detail="Сделка не найдена")
         return []
     cp = await _counterparty_for_deal(session, deal)
     if cp is None:
@@ -2553,12 +2648,14 @@ async def list_contacts(deal_id: int, session: AsyncSession = Depends(get_sessio
 
 @router.post("/deals/{deal_id}/contacts", response_model=ContactOut, status_code=201)
 async def add_contact(
-    deal_id: int, payload: ContactCreate, session: AsyncSession = Depends(get_session)
+    deal_id: int,
+    payload: ContactCreate,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Добавить контакт контрагенту сделки (контрагент создаётся по имени при нужде)."""
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    deal = await visible_deal_or_404(session, deal_id, access)
     cp = await _counterparty_for_deal(session, deal, create=True)
     assert cp is not None
     if payload.is_primary:
@@ -2577,7 +2674,11 @@ async def add_contact(
 
 
 @router.get("/chats", response_model=list[ChatOut])
-async def list_chats(session: AsyncSession = Depends(get_session)):
+async def list_chats(
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
     """Диалоги для панели «Чаты и дела»: сделки с последним сообщением переписки.
 
     Graceful fallback: при ``OperationalError`` (колонка/таблица отсутствует — старый
@@ -2590,7 +2691,10 @@ async def list_chats(session: AsyncSession = Depends(get_session)):
         msgs = (
             await session.execute(select(Message).order_by(Message.id.desc()).limit(100))
         ).scalars().all()
-        deals = {d.id: d for d in (await session.execute(select(Deal))).scalars().all()}
+        deals = {
+            d.id: d
+            for d in (await session.execute(scope_deals(select(Deal), access))).scalars().all()
+        }
     except (OperationalError, ProgrammingError):
         await session.rollback()
         return []
@@ -2673,8 +2777,14 @@ async def set_primary_contact(contact_id: int, session: AsyncSession = Depends(g
 
 
 @router.get("/deals/{deal_id}/documents", response_model=list[DocumentOut])
-async def list_documents(deal_id: int, session: AsyncSession = Depends(get_session)):
+async def list_documents(
+    deal_id: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
     """Документы сделки (счета/договоры/заказы) с их состоянием и номерами в 1С."""
+    await visible_deal_or_404(session, deal_id, access)
     return (
         await session.execute(
             select(DealDocument).where(DealDocument.deal_id == deal_id).order_by(DealDocument.id)
@@ -2682,122 +2792,167 @@ async def list_documents(deal_id: int, session: AsyncSession = Depends(get_sessi
     ).scalars().all()
 
 
+async def _issue_original(core, session, doc, actor):
+    if core.services.onec is None:
+        raise HTTPException(503, "Интеграция 1С не подключена")
+    if not doc.original_html:
+        if doc.kind in RESERVES_STOCK:
+            doc.valid_until = _utcnow().date() + timedelta(days=int(os.getenv("AIOS_INVOICE_VALID_DAYS", "5")))
+        await originals.capture(session, core, doc)
+    await originals.mark_issued(session, core, doc, actor)
+    if doc.kind in RESERVES_STOCK and core.services.stock is not None:
+        reserved = await core.services.stock.reserve(session, [
+            {"sku_code": line["sku_code"], "qty": Decimal(line["qty"])}
+            for line in doc.snapshot_json["items"] if line.get("sku_code")
+        ])
+        if reserved:
+            doc.reserve_status = "reserved"
+            doc.reserved_at = _utcnow()
+            core.event_bus.emit(session, "sales.stock.reserved", {
+                "document_id": doc.id, "deal_id": doc.deal_id, "items": reserved,
+                "valid_until": doc.valid_until.isoformat(), "entity_ref": f"deal:{doc.deal_id}",
+            })
+    await _post_document_to_1c(core, session, doc, doc.snapshot_json["buyer"].get("name", ""))
+
+
 @router.post("/deals/{deal_id}/documents", response_model=DocumentOut, status_code=201)
 async def create_document(
-    deal_id: int,
-    payload: DocumentCreate,
-    core: Core = Depends(get_core),
-    session: AsyncSession = Depends(get_session),
+    deal_id: int, payload: DocumentCreate,
+    core: Core = Depends(get_core), session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
 ):
-    """Сформировать документ сделки (часть 9).
-
-    Счёт/заказ пишутся в 1С сразу (``draft`` → ``posted``). Договор сначала
-    уходит на согласование юристу (движок ч.4, маршрут ``deal.contract``) —
-    статус ``pending_approval``; в 1С он записывается только после одобрения
-    (``POST /sales/documents/{id}/decide``). Здесь ядро и CRM смыкаются в поток.
-    """
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
-    if core.services.onec is None:
-        raise HTTPException(status_code=503, detail="Интеграция 1С не подключена")
-
-    prefix = DOC_NUMBER_PREFIX.get(payload.kind, "ДОК")
-    number = f"{prefix}-{deal.number}"
-    # Счёт клиенту выставляется С НДС — сумма документа = грандтотал печатной формы (нетто+НДС),
-    # чтобы дебиторка/проводка в 1С/KPI «Оплаты с НДС» совпадали с тем, что реально платит клиент
-    # (PLATFORM #1; решение оператора «с НДС»). Заказ/договор — как есть (нетто). Нет позиций —
-    # fallback на deal.amount (не обнуляем документ).
-    if payload.kind == "invoice":
-        _inv_items = await _invoice_items(session, deal_id)
-        amount = _invoice_gross(_inv_items) if _inv_items else deal.amount
-    else:
-        amount = deal.amount
-    doc = DealDocument(deal_id=deal_id, kind=payload.kind, number=number, amount=amount)
+    """Invoice/order issue immediately; contracts save the exact approval candidate."""
+    deal = await visible_deal_or_404(session, deal_id, access)
+    await originals.lock_deal(session, deal_id)
+    request = {"deal_id": deal_id, "operation": "create", **payload.model_dump()}
+    repeated = await originals.retry_document(session, payload.request_key, request)
+    if repeated:
+        return repeated
+    existing = (await session.execute(select(DealDocument).where(
+        DealDocument.deal_id == deal_id, DealDocument.kind == payload.kind,
+    ))).scalars().first()
+    if existing:
+        raise HTTPException(409, "Документ уже существует; используйте явную новую версию")
+    doc = DealDocument(deal_id=deal_id, kind=payload.kind,
+                       number=f"{DOC_NUMBER_PREFIX[payload.kind]}-{deal.number}",
+                       request_key=payload.request_key, request_hash=originals.digest(request))
     session.add(doc)
-    await session.flush()
-
+    await originals.flush_document(session)
     if payload.kind in REQUIRES_APPROVAL:
-        # договор: на согласование юристу (ч.4); запись в 1С — после одобрения
-        await _submit_contract_for_approval(core, session, doc, deal, payload.requested_by)
+        await _submit_contract_for_approval(core, session, doc, deal, user.username)
     else:
-        # счёт/заказ: пишем в 1С сразу; счёт и заказ дополнительно резервируют остатки (SALES-51)
-        if payload.kind in RESERVES_STOCK and core.services.stock is not None:
-            reserved = await core.services.stock.reserve(
-                session, await _deal_stock_items(session, deal_id)
-            )
-            if reserved:
-                # фиксируем резерв на документе + срок действия счёта (5 дней по счёт-протоколу)
-                valid_days = int(os.getenv("AIOS_INVOICE_VALID_DAYS", "5"))
-                doc.reserve_status = "reserved"
-                doc.reserved_at = _utcnow()
-                doc.valid_until = _utcnow().date() + timedelta(days=valid_days)
-                core.event_bus.emit(
-                    session,
-                    "sales.stock.reserved",
-                    {
-                        "document_id": doc.id,
-                        "deal_id": deal_id,
-                        "items": reserved,
-                        "valid_until": doc.valid_until.isoformat(),
-                        "entity_ref": f"deal:{deal_id}",
-                    },
-                )
-        await _post_document_to_1c(core, session, doc, deal.counterparty)
+        await _issue_original(core, session, doc, user.username)
+    await session.commit()
+    return doc
 
+
+@router.post("/documents/{doc_id}/revision", response_model=DocumentOut, status_code=201)
+async def revise_document(
+    doc_id: int, payload: DocumentRevision,
+    session: AsyncSession = Depends(get_session), core: Core = Depends(get_core),
+    user: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
+):
+    old = await originals.locked_document(session, doc_id, access)
+    request = {"document_id": doc_id, "operation": "revision", **payload.model_dump()}
+    repeated = await originals.retry_document(session, payload.request_key, request)
+    if repeated:
+        return repeated
+    if old.status not in {"posted", "paid", "cancelled", "rejected"} or old.superseded_by_id:
+        raise HTTPException(409, "Новая версия доступна для последнего выпущенного или отклонённого документа")
+    target = old
+    if old.status == "rejected" and old.supersedes_id:
+        target = await session.get(DealDocument, old.supersedes_id)
+        if target.superseded_by_id:
+            raise HTTPException(409, "Исходная версия уже заменена")
+    children = (await session.execute(select(DealDocument).where(
+        DealDocument.supersedes_id == target.id, DealDocument.status != "rejected",
+    ))).scalars().all()
+    if children:
+        raise HTTPException(409, "Новая версия уже подготовлена")
+    version = (await session.scalar(select(func.max(DealDocument.version)).where(
+        DealDocument.deal_id == old.deal_id, DealDocument.kind == old.kind,
+    ))) + 1
+    doc = DealDocument(deal_id=old.deal_id, kind=old.kind, version=version,
+        number=old.number, amount=old.amount, supersedes_id=target.id,
+        template_id=old.template_id, payment_terms=old.payment_terms, delivery_terms=old.delivery_terms,
+        terms_json={"custom": (old.terms_json or {}).get("custom", {})},
+        replacement_reason=payload.reason.strip(), request_key=payload.request_key,
+        request_hash=originals.digest(request))
+    session.add(doc)
+    await originals.flush_document(session)
+    doc.number = f"{old.number.split('-v')[0][:42]}-v{version}-{doc.id}"
+    core.event_bus.emit(session, "sales.document.revision_created", {
+        "document_id": doc.id, "supersedes_id": old.id, "version": doc.version,
+        "reason": doc.replacement_reason, "by": user.username, "entity_ref": f"deal:{doc.deal_id}",
+    })
+    await session.commit()
+    return doc
+
+
+@router.patch("/documents/{doc_id}/draft", response_model=DocumentOut)
+async def update_document_draft(
+    doc_id: int, payload: DocumentDraftUpdate, session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
+):
+    doc = await originals.locked_document(session, doc_id, access)
+    if doc.status != "draft" or doc.original_html:
+        raise HTTPException(409, "Редактируется только черновик; для выпущенного документа нужна новая версия")
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        setattr(doc, key, value)
+    await session.commit()
+    return doc
+
+
+@router.post("/documents/{doc_id}/issue", response_model=DocumentOut)
+async def issue_document(
+    doc_id: int, session: AsyncSession = Depends(get_session), core: Core = Depends(get_core),
+    user: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
+):
+    doc = await originals.locked_document(session, doc_id, access)
+    if doc.original_html and doc.status in {"posted", "paid", "pending_approval"}:
+        return doc
+    if doc.status != "draft":
+        raise HTTPException(409, "Документ не является черновиком")
+    if doc.kind == "contract":
+        deal = await session.get(Deal, doc.deal_id)
+        await _submit_contract_for_approval(core, session, doc, deal, user.username)
+    else:
+        await _issue_original(core, session, doc, user.username)
     await session.commit()
     return doc
 
 
 @router.post("/documents/{doc_id}/decide", response_model=DocumentOut)
 async def decide_document(
-    doc_id: int,
-    payload: DocumentDecision,
-    core: Core = Depends(get_core),
-    session: AsyncSession = Depends(get_session),
-    _: object = Depends(require_permission("sales.deal.approve")),
+    doc_id: int, payload: DocumentDecision,
+    core: Core = Depends(get_core), session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.approve")),
+    access: DealAccess = Depends(get_deal_access),
 ):
-    """Решение по документу на согласовании (договор): провести в 1С или отклонить.
-
-    Решает связанное согласование (движок ч.4) и, при одобрении, проводит документ
-    в 1С (часть 9) — всё в одной транзакции. Согласование и проведение фиксируются
-    событиями (→ audit log).
-    """
-    doc = await session.get(DealDocument, doc_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Документ не найден")
+    doc = await originals.locked_document(session, doc_id, access)
     if doc.status != "pending_approval":
-        raise HTTPException(status_code=409, detail="Документ не на согласовании")
-    if core.services.onec is None:
-        raise HTTPException(status_code=503, detail="Интеграция 1С не подключена")
-
-    approval = (
-        await session.execute(
-            select(Approval).where(
-                Approval.entity_ref == f"document:{doc_id}", Approval.status == "pending"
-            )
-        )
-    ).scalars().first()
-    if approval is not None:
-        await core.services.approvals.decide(session, approval, payload.approved, payload.by)
-
+        raise HTTPException(409, "Документ не на согласовании")
+    if payload.approved and core.services.onec is None:
+        raise HTTPException(503, "Интеграция 1С не подключена")
+    approval = (await session.execute(select(Approval).where(
+        Approval.entity_ref == f"document:{doc_id}", Approval.status == "pending",
+    ))).scalars().first()
+    if approval is None:
+        raise HTTPException(409, "Нет действующего согласования документа")
     if payload.approved:
-        deal = await DealRepository(session).get(doc.deal_id)
-        await _post_document_to_1c(core, session, doc, deal.counterparty if deal else "")
+        originals.original(doc)  # A legacy candidate must be prepared again explicitly.
+        await _issue_original(core, session, doc, user.username)
     else:
         doc.status = "rejected"
-        core.event_bus.emit(
-            session,
-            "sales.document.rejected",
-            {
-                "document_id": doc.id,
-                "deal_id": doc.deal_id,
-                "kind": doc.kind,
-                "number": doc.number,
-                "entity_ref": f"deal:{doc.deal_id}",
-            },
-        )
-
+        core.event_bus.emit(session, "sales.document.rejected", {
+            "document_id": doc.id, "deal_id": doc.deal_id, "kind": doc.kind,
+            "number": doc.number, "entity_ref": f"deal:{doc.deal_id}",
+        })
+    await core.services.approvals.decide(session, approval, payload.approved, user.username)
     await session.commit()
     return doc
 
@@ -3082,7 +3237,10 @@ def _render_invoice(
     rows_html, grand, vat_sum = [], Decimal("0"), Decimal("0")
     for i, it in enumerate(items, start=1):
         qty, price = Decimal(str(it["qty"])), Decimal(str(it["price"]))
-        net, vat, total = _invoice_line(qty, price)
+        if it.get("total") is not None:
+            net, vat, total = (Decimal(it[key]) for key in ("net", "tax", "total"))
+        else:
+            net, vat, total = _invoice_line(qty, price)
         grand += total
         vat_sum += vat
         rows_html.append(
@@ -3190,6 +3348,7 @@ async def _submit_contract_for_approval(
     ``POST /documents`` и ``POST /deals/{id}/contract`` (SALES-53) — чтобы маршрут
     согласования и форма события не разъезжались.
     """
+    await originals.capture(session, core, doc)
     doc.status = "pending_approval"
     await core.services.approvals.request(
         session,
@@ -3245,7 +3404,8 @@ async def prepare_contract(
     payload: ContractPrepareIn,
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
-    _: object = Depends(require_permission("sales.deal.write")),
+    user: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """SALES-53: подготовить договор по шаблону + реквизиты покупателя по УНП.
 
@@ -3254,9 +3414,12 @@ async def prepare_contract(
     создаётся как DealDocument(kind=contract) и уходит на согласование; запись в 1С —
     после одобрения (/documents/{id}/decide), поэтому шлюз 1С здесь не требуется.
     """
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    deal = await visible_deal_or_404(session, deal_id, access)
+    await originals.lock_deal(session, deal_id)
+    request = {"deal_id": deal_id, "operation": "contract", **payload.model_dump()}
+    repeated = await originals.retry_document(session, payload.request_key, request)
+    if repeated:
+        return repeated
     tpl = (
         await session.execute(
             select(ContractTemplate).where(
@@ -3274,7 +3437,6 @@ async def prepare_contract(
             select(DealDocument).where(
                 DealDocument.deal_id == deal_id,
                 DealDocument.kind == "contract",
-                DealDocument.status != "rejected",
             )
         )
     ).scalars().first()
@@ -3287,15 +3449,16 @@ async def prepare_contract(
         kind="contract",
         number=f"{DOC_NUMBER_PREFIX['contract']}-{deal.number}",
         amount=deal.amount,
+        request_key=payload.request_key, request_hash=originals.digest(request),
         template_id=tpl.id,
         payment_terms=payload.payment_terms or None,
         delivery_terms=payload.delivery_terms or None,
         terms_json={"buyer": buyer, "custom": payload.terms or {}},
     )
     session.add(doc)
-    await session.flush()
+    await originals.flush_document(session)
     await _submit_contract_for_approval(
-        core, session, doc, deal, payload.requested_by,
+        core, session, doc, deal, user.username,
         extra_event={"template": tpl.code, "buyer_unp": buyer.get("unp", "")},
     )
     await session.commit()
@@ -3303,34 +3466,11 @@ async def prepare_contract(
 
 
 async def _invoice_html(session: AsyncSession, doc: DealDocument, seller: dict) -> str:
-    """HTML счёта-протокола (реквизиты продавца + факсимиле уже в ``seller``)."""
-    deal = await DealRepository(session).get(doc.deal_id)
-    buyer = (doc.terms_json or {}).get("buyer") or {"name": deal.counterparty if deal else ""}
-    items = await _invoice_items(session, doc.deal_id)
-    return _render_invoice(doc, deal, seller, buyer, items)
+    return originals.original(doc)
 
 
 async def _contract_html(session: AsyncSession, core: Core, doc: DealDocument, seller: dict) -> str:
-    """HTML договора: по шаблону + хвостовой блок факсимиле, либо честная обложка «по форме
-    клиента», если шаблон не задан (issueClientContract) — чтобы «открыть»/пакет не падали 409."""
-    items = "; ".join(await _contract_items(session, doc.deal_id))
-    buyer = (doc.terms_json or {}).get("buyer", {})
-    tpl = await session.get(ContractTemplate, doc.template_id) if doc.template_id else None
-    if tpl is None:
-        return _contract_cover_html(doc, seller, buyer, items)
-    deal = await DealRepository(session).get(doc.deal_id)
-    ctx = {
-        "number": doc.number,
-        "items": items,
-        "total": f"{float(doc.amount):.2f} BYN",
-        "payment_terms": doc.payment_terms or "",
-        "delivery_terms": doc.delivery_terms or "",
-        "valid_until": doc.valid_until.isoformat() if doc.valid_until else "",
-        "deal": deal.number if deal else "",
-    }
-    ctx.update({f"seller.{k}": v for k, v in _seller_requisites(core).items()})
-    ctx.update({f"buyer.{k}": str(v) for k, v in buyer.items()})
-    return _render_contract(tpl.body, ctx, _contract_facsimile_block(seller))
+    return originals.original(doc)
 
 
 def _contract_cover_html(doc: DealDocument, seller: dict, buyer: dict, items: str) -> str:
@@ -3370,136 +3510,159 @@ def _contract_cover_html(doc: DealDocument, seller: dict, buyer: dict, items: st
 
 @router.get("/documents/{doc_id}/render", response_class=HTMLResponse)
 async def render_document(
-    doc_id: int,
-    core: Core = Depends(get_core),
-    session: AsyncSession = Depends(get_session),
-    _: object = Depends(require_permission("sales.deal.read")),
+    doc_id: int, session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
 ):
-    """Рендер документа в HTML: договор по шаблону (ТЗ C.2) или счёт-протокол (kind=invoice).
-
-    Гард ``sales.deal.read``: форма содержит реквизиты продавца и покупателя (ЕГР) —
-    не отдаём анонимно (прод публичен).
-    """
     doc = await session.get(DealDocument, doc_id)
     if doc is None:
-        raise HTTPException(status_code=404, detail="Документ не найден")
-
-    seller = _seller_with_facsimile(core, await _current_branding(session))
-    if doc.kind == "invoice":
-        return HTMLResponse(await _invoice_html(session, doc, seller))
-    if doc.kind != "contract":
-        raise HTTPException(
-            status_code=400, detail="Рендер по шаблону — только для договора/счёта"
-        )
-    return HTMLResponse(await _contract_html(session, core, doc, seller))
+        raise HTTPException(404, "Документ не найден")
+    await visible_deal_or_404(session, doc.deal_id, access)
+    if doc.kind not in {"invoice", "contract"}:
+        raise HTTPException(400, "Печатная форма доступна для счёта и договора")
+    return HTMLResponse(originals.original(doc), headers={
+        "ETag": f'"{doc.content_sha256}"', "Cache-Control": "private, no-store",
+        "X-Document-State": doc.original_state,
+    })
 
 
-async def _package_docs(
-    session: AsyncSession, deal_id: int
-) -> tuple[DealDocument | None, DealDocument | None]:
-    """Документы пакета: последний проведённый/оплаченный счёт + последний договор.
+@router.get("/documents/{doc_id}/preview", response_class=HTMLResponse)
+async def preview_document(
+    doc_id: int, session: AsyncSession = Depends(get_session), core: Core = Depends(get_core),
+    user: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
+    doc = await session.get(DealDocument, doc_id)
+    if doc is None:
+        raise HTTPException(404, "Документ не найден")
+    await visible_deal_or_404(session, doc.deal_id, access)
+    if doc.status != "draft":
+        raise HTTPException(409, "Предпросмотр доступен только для черновика")
+    preview = DealDocument(**{col.name: getattr(doc, col.name) for col in DealDocument.__table__.columns})
+    if preview.kind in RESERVES_STOCK:
+        preview.valid_until = _utcnow().date() + timedelta(days=int(os.getenv("AIOS_INVOICE_VALID_DAYS", "5")))
+    await originals.capture(session, core, preview)
+    return HTMLResponse('<p style="color:#b45309;font-weight:bold">ЧЕРНОВИК — НЕ ВЫПУЩЕН</p>' + preview.original_html,
+        headers={"Cache-Control": "private, no-store", "X-Document-State": "draft"})
 
-    Единый выбор для ``send_package`` и рендера пакета — чтобы состав пакета не разъехался.
-    """
-    docs = (
-        await session.execute(
-            select(DealDocument)
-            .where(
-                DealDocument.deal_id == deal_id,
-                DealDocument.status.in_(("posted", "paid")),
-            )
-            .order_by(DealDocument.id.desc())
-        )
-    ).scalars().all()
-    invoice = next((d for d in docs if d.kind == "invoice"), None)
-    contract = next((d for d in docs if d.kind == "contract"), None)
+
+@router.get("/documents/{doc_id}/snapshot")
+async def document_snapshot(
+    doc_id: int, session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
+    doc = await session.get(DealDocument, doc_id)
+    if doc is None:
+        raise HTTPException(404, "Документ не найден")
+    await visible_deal_or_404(session, doc.deal_id, access)
+    originals.original(doc)
+    return doc.snapshot_json
+
+
+async def _package_docs(session, deal_id, selection=None):
+    docs = (await session.execute(select(DealDocument).where(
+        DealDocument.deal_id == deal_id, DealDocument.status.in_(("posted", "paid")),
+        DealDocument.superseded_by_id.is_(None),
+    ).order_by(DealDocument.id.desc()))).scalars().all()
+    invoice = next((d for d in docs if d.kind == "invoice" and
+                    (not selection or selection.invoice_id is None or d.id == selection.invoice_id)), None)
+    contract = next((d for d in docs if d.kind == "contract" and
+                     (not selection or selection.contract_id is None or d.id == selection.contract_id)), None)
+    if invoice is None or contract is None:
+        raise HTTPException(409, "Нужны действующие выпущенные версии счёта и договора")
+    originals.original(invoice, issued_only=True)
+    originals.original(contract, issued_only=True)
     return invoice, contract
+
+
+def _package_html(invoice, contract):
+    return (originals.original(invoice, issued_only=True)
+            + '<div style="page-break-before:always"></div>'
+            + originals.original(contract, issued_only=True))
 
 
 @router.get("/deals/{deal_id}/package/render", response_class=HTMLResponse)
 async def render_package(
-    deal_id: int,
-    core: Core = Depends(get_core),
-    session: AsyncSession = Depends(get_session),
-    _: object = Depends(require_permission("sales.deal.read")),
+    deal_id: int, session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
 ):
-    """Печатный пакет «счёт + договор» на одном листе (Ctrl+P → PDF).
+    await visible_deal_or_404(session, deal_id, access)
+    package = (await session.execute(select(DocumentPackage).where(
+        DocumentPackage.deal_id == deal_id,
+    ).order_by(DocumentPackage.id.desc()))).scalars().first()
+    if package is None:
+        raise HTTPException(409, "Сначала подготовьте пакет с конкретными версиями документов")
+    if originals.digest(package.original_html) != package.content_sha256:
+        raise HTTPException(409, "Контроль целостности пакета не пройден")
+    return HTMLResponse(package.original_html, headers={"Cache-Control": "private, no-store"})
 
-    Тот же выбор документов, что и в ``send_package``. Счёт, затем разрыв страницы,
-    затем договор — с наложенным факсимиле (печать/подпись) продавца.
-    """
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
-    invoice, contract = await _package_docs(session, deal_id)
-    if invoice is None or contract is None:
-        raise HTTPException(
-            status_code=409, detail="Нужны проведённый счёт и согласованный договор"
-        )
-    seller = _seller_with_facsimile(core, await _current_branding(session))
-    invoice_html = await _invoice_html(session, invoice, seller)
-    contract_html = await _contract_html(session, core, contract, seller)
-    return HTMLResponse(
-        f'{invoice_html}<div style="page-break-before:always"></div>{contract_html}'
-    )
+
+@router.get("/packages/{package_id}/render", response_class=HTMLResponse)
+async def render_saved_package(
+    package_id: int, session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
+    package = await session.get(DocumentPackage, package_id)
+    if package is None:
+        raise HTTPException(404, "Пакет не найден")
+    await visible_deal_or_404(session, package.deal_id, access)
+    if originals.digest(package.original_html) != package.content_sha256:
+        raise HTTPException(409, "Контроль целостности пакета не пройден")
+    return HTMLResponse(package.original_html, headers={"Cache-Control": "private, no-store"})
 
 
 @router.post("/deals/{deal_id}/send-package", response_model=PackageSentOut)
 async def send_package(
-    deal_id: int,
-    core: Core = Depends(get_core),
-    session: AsyncSession = Depends(get_session),
-    _: object = Depends(require_permission("sales.deal.write")),
+    deal_id: int, payload: PackagePrepare | None = None,
+    session: AsyncSession = Depends(get_session), core: Core = Depends(get_core),
+    user: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
 ):
-    """SALES-53 C.4: отправить клиенту пакет «счёт + договор» одной записью.
-
-    Берём последний проведённый счёт и последний согласованный (проведённый) договор
-    сделки — по ТЗ пакет уходит ПОСЛЕ согласования договора. Эмитим ``sales.package.sent``
-    и пишем ОДНУ запись в историю переписки. Реальная доставка (email/Telegram, B.3) —
-    отдельный слой; здесь фиксируем факт отправки пакета.
-    """
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
-    invoice, contract = await _package_docs(session, deal_id)
-    if invoice is None or contract is None:
-        raise HTTPException(
-            status_code=409, detail="Нужны проведённый счёт и согласованный договор"
-        )
-
-    channel = "email"
-    session.add(
-        Message(
-            deal_id=deal_id,
-            channel=channel,
-            direction="out",
-            author="Система",
-            text=f"Отправлен пакет: счёт {invoice.number} + договор {contract.number}",
-        )
-    )
-    core.event_bus.emit(
-        session,
-        "sales.package.sent",
-        {
-            "deal_id": deal_id,
-            "invoice_number": invoice.number,
-            "contract_number": contract.number,
-            "channel": channel,
-            "entity_ref": f"deal:{deal_id}",
-        },
-    )
-    await session.commit()
-    return PackageSentOut(
-        deal_id=deal_id,
-        invoice_number=invoice.number,
-        contract_number=contract.number,
-        channel=channel,
-    )
+    """Prepare a pinned outgoing package. Delivery belongs to the mail integration."""
+    await visible_deal_or_404(session, deal_id, access)
+    await originals.lock_deal(session, deal_id)
+    invoice, contract = await _package_docs(session, deal_id, payload)
+    package = (await session.execute(select(DocumentPackage).where(
+        DocumentPackage.invoice_id == invoice.id, DocumentPackage.contract_id == contract.id,
+    ))).scalar_one_or_none()
+    if package is None:
+        rendered = _package_html(invoice, contract)
+        package = DocumentPackage(deal_id=deal_id, invoice_id=invoice.id, contract_id=contract.id,
+            original_html=rendered, content_sha256=originals.digest(rendered), created_by=user.username)
+        session.add(package)
+        await session.flush()
+        url = f"/sales/packages/{package.id}/render"
+        session.add(Message(deal_id=deal_id, channel="email", direction="out", author=user.username,
+            text=f"Подготовлен пакет #{package.id}: счёт {invoice.number} (ID {invoice.id}) + договор {contract.number} (ID {contract.id}). {url}"))
+        core.event_bus.emit(session, "sales.package.prepared", {
+            "package_id": package.id, "deal_id": deal_id, "invoice_id": invoice.id,
+            "contract_id": contract.id, "invoice_sha256": invoice.content_sha256,
+            "contract_sha256": contract.content_sha256, "content_sha256": package.content_sha256,
+            "render_url": url, "entity_ref": f"deal:{deal_id}",
+        })
+        await session.commit()
+    return PackageSentOut(deal_id=deal_id, invoice_number=invoice.number,
+        contract_number=contract.number, channel="email", package_id=package.id,
+        invoice_id=invoice.id, contract_id=contract.id,
+        render_url=f"/sales/packages/{package.id}/render", content_sha256=package.content_sha256)
 
 
 @router.get("/deals/{deal_id}/messages", response_model=list[MessageOut])
-async def list_messages(deal_id: int, session: AsyncSession = Depends(get_session)):
+async def list_messages(
+    deal_id: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
     """Омниканальная история переписки по сделке (часть 10)."""
+    deal = await visible_deal_or_none(session, deal_id, access)
+    if deal is None:
+        if access.own_only:
+            raise HTTPException(status_code=404, detail="Сделка не найдена")
+        return []
     return (
         await session.execute(
             select(Message).where(Message.deal_id == deal_id).order_by(Message.id)
@@ -3513,11 +3676,11 @@ async def create_message(
     payload: MessageCreate,
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Отправить/зафиксировать сообщение по сделке (канал + текст) — событие в шину."""
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    await visible_deal_or_404(session, deal_id, access)
     msg = Message(
         deal_id=deal_id,
         channel=payload.channel,
@@ -3543,11 +3706,14 @@ async def create_message(
 
 
 @router.post("/deals/{deal_id}/messages/read")
-async def mark_messages_read(deal_id: int, session: AsyncSession = Depends(get_session)):
+async def mark_messages_read(
+    deal_id: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
+):
     """Пометить входящие сообщения сделки прочитанными (обнуляет счётчик, SALES-49)."""
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    await visible_deal_or_404(session, deal_id, access)
     rows = (
         await session.execute(
             select(Message).where(
@@ -3600,6 +3766,8 @@ async def ai_draft_reply(
     deal_id: int,
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """AI-черновик ответа клиенту по истории переписки (AI-слой, Итерация 1).
 
@@ -3609,9 +3777,7 @@ async def ai_draft_reply(
     """
     if not core.services.llm.enabled:
         raise HTTPException(status_code=503, detail="AI-слой выключен (feature-flag)")
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    deal = await visible_deal_or_404(session, deal_id, access)
 
     messages = (
         await session.execute(
@@ -3636,6 +3802,8 @@ async def ai_assist(
     payload: AiAssistRequest,
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """AI-ассистент сделки: резюме или следующий шаг (AI-слой, Итерация 1).
 
@@ -3645,9 +3813,7 @@ async def ai_assist(
     """
     if not core.services.llm.enabled:
         raise HTTPException(status_code=503, detail="AI-слой выключен (feature-flag)")
-    deal = await DealRepository(session).get(deal_id)
-    if deal is None:
-        raise HTTPException(status_code=404, detail="Сделка не найдена")
+    deal = await visible_deal_or_404(session, deal_id, access)
 
     async def _count(model, deal_col) -> int:
         return (

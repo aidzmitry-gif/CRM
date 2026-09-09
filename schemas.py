@@ -17,6 +17,7 @@ class DealCreate(BaseModel):
     priority: str = "Средний"
     stage: str = "new"
     owner: str = ""
+    owner_id: int | None = None
     next_step: str | None = None
     next_step_at: datetime.datetime | None = None
     deal_date: str | None = None
@@ -43,6 +44,7 @@ class DealUpdate(BaseModel):
     priority: str | None = None
     stage: str | None = None
     owner: str | None = None
+    owner_id: int | None = None
     next_step: str | None = None
     next_step_at: datetime.datetime | None = None
     deal_date: str | None = None
@@ -74,6 +76,7 @@ class DealRead(BaseModel):
     priority: str
     stage: str
     owner: str
+    owner_id: int | None = None
     next_step: str | None = None
     next_step_at: datetime.datetime | None = None
     deal_date: str | None = None
@@ -221,8 +224,32 @@ class PriceInfo(BaseModel):
 class DocumentCreate(BaseModel):
     """Запрос на формирование документа сделки (счёт/договор/заказ)."""
 
-    kind: str = "invoice"  # invoice | contract | order
+    kind: Literal["invoice", "contract", "order"] = "invoice"
+    request_key: str | None = Field(default=None, min_length=8, max_length=64)
     requested_by: str = ""  # инициатор (для согласования договора)
+
+
+class DocumentRevision(BaseModel):
+    reason: str = Field(min_length=3, max_length=500)
+    request_key: str = Field(min_length=8, max_length=64)
+
+
+    @model_validator(mode="after")
+    def substantive_reason(self):
+        if len(self.reason.strip()) < 3:
+            raise ValueError("Укажите причину новой версии")
+        self.reason = self.reason.strip()
+        return self
+
+
+class DocumentDraftUpdate(BaseModel):
+    payment_terms: str | None = Field(default=None, max_length=255)
+    delivery_terms: str | None = Field(default=None, max_length=255)
+
+
+class PackagePrepare(BaseModel):
+    invoice_id: int | None = None
+    contract_id: int | None = None
 
 
 class DocumentDecision(BaseModel):
@@ -245,6 +272,13 @@ class DocumentOut(BaseModel):
     amount: float
     valid_until: datetime.date | None = None  # SALES-51: срок действия счёта (резерв)
     reserve_status: str = "none"  # none | reserved | consumed | released
+    version: int = 1
+    supersedes_id: int | None = None
+    superseded_by_id: int | None = None
+    replacement_reason: str | None = None
+    original_state: str = "legacy_unavailable"
+    content_sha256: str | None = None
+    issued_at: datetime.datetime | None = None
 
 
 class ContractTemplateOut(BaseModel):
@@ -269,6 +303,7 @@ class ContractPrepareIn(BaseModel):
     """SALES-53: подготовить договор по шаблону + реквизиты покупателя по УНП."""
 
     template_code: str
+    request_key: str | None = Field(default=None, min_length=8, max_length=64)
     unp: str = ""  # УНП покупателя → core.services.registry.lookup (graceful при выкл)
     payment_terms: str = ""
     delivery_terms: str = ""
@@ -283,7 +318,13 @@ class PackageSentOut(BaseModel):
     invoice_number: str
     contract_number: str
     channel: str
-    sent: bool = True
+    sent: bool = False
+    status: str = "prepared"
+    package_id: int
+    invoice_id: int
+    contract_id: int
+    render_url: str
+    content_sha256: str
 
 
 class CounterpartyRef(BaseModel):

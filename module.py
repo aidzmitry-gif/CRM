@@ -10,7 +10,7 @@ import logging
 
 from core.runtime.contract import ModuleContract, Widget
 from core.runtime.core import Core
-from modules.sales import routes, telegram
+from modules.sales import mail_routes, routes, telegram
 from modules.sales.calls import (
     on_call_answered,
     on_call_ended,
@@ -27,6 +27,7 @@ from modules.sales.events import (
     on_procurement_received,
     on_shipment_delivered,
 )
+from modules.sales.mail_queue import EmailWorker
 from modules.sales.permissions import PERMISSIONS, ROLES
 from modules.sales.reserve import tick_invoice_reserve
 from modules.sales.touch_history import SalesTouchHistory
@@ -42,6 +43,10 @@ class SalesModule(ModuleContract):
 
     def register(self, core: Core) -> None:
         core.include_router(routes.router, prefix=self.api_prefix)
+        core.include_router(mail_routes.router, prefix=self.api_prefix)
+        email_worker = EmailWorker(core.services)
+        core.on_startup(email_worker.start)
+        core.on_shutdown(email_worker.stop)
         # Лиды: фронт бьёт в /leads (был 404 — отдавались на /sales/leads). Монтируем тот же
         # роутер на /leads (фронт) и /sales/leads (back-compat). Полный вынос — Шаг 2 ТЗ.
         core.include_router(routes.leads_router, prefix="/leads")

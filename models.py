@@ -13,11 +13,14 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     func,
+    inspect,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db.base import Base
+from modules.sales.mail_models import EmailAttempt, OutgoingEmail  # noqa: F401
 
 
 class Deal(Base):
@@ -34,6 +37,9 @@ class Deal(Base):
     priority: Mapped[str] = mapped_column(String(32), default="Средний", server_default="Средний")
     stage: Mapped[str] = mapped_column(String(32), default="new", server_default="new")
     owner: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    # Soft reference to hr.employee.  It is the only trustworthy key for a
+    # per-employee visibility decision; ``owner`` remains legacy display text.
+    owner_id: Mapped[int | None] = mapped_column(index=True)
     next_step: Mapped[str | None] = mapped_column(String(128))
     # Дата+время следующего шага (открытый хвост с круга 2) — next_step остаётся текстом-описанием.
     next_step_at: Mapped[datetime | None] = mapped_column(DateTime)
@@ -147,6 +153,47 @@ class DealDocument(Base):
     payment_terms: Mapped[str | None] = mapped_column(String(255))
     delivery_terms: Mapped[str | None] = mapped_column(String(255))
     terms_json: Mapped[dict | None] = mapped_column(JSON)
+    # One row is one document version. A replacement never inherits payment state.
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    supersedes_id: Mapped[int | None] = mapped_column(ForeignKey("sales.deal_document.id"))
+    superseded_by_id: Mapped[int | None] = mapped_column(ForeignKey("sales.deal_document.id"))
+    replacement_reason: Mapped[str | None] = mapped_column(String(500))
+    request_key: Mapped[str | None] = mapped_column(String(64), unique=True)
+    request_hash: Mapped[str | None] = mapped_column(String(64))
+    snapshot_json: Mapped[dict | None] = mapped_column(JSON)
+    original_html: Mapped[str | None] = mapped_column(Text)
+    content_sha256: Mapped[str | None] = mapped_column(String(64))
+    issued_at: Mapped[datetime | None] = mapped_column(DateTime)
+    issued_by: Mapped[str | None] = mapped_column(String(128))
+
+    @property
+    def original_state(self) -> str:
+        if self.issued_at and self.original_html:
+            return "issued"
+        if self.original_html:
+            return "approval_copy"
+        if self.status in {"posted", "paid", "cancelled"}:
+            return "legacy_unavailable"
+        return "draft"
+
+
+class DocumentPackage(Base):
+    """Prepared outgoing package pinned to two immutable document IDs."""
+
+    __tablename__ = "document_package"
+    __table_args__ = (
+        UniqueConstraint("invoice_id", "contract_id", name="uq_document_package_versions"),
+        {"schema": "sales"},
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    deal_id: Mapped[int] = mapped_column(ForeignKey("sales.deal.id"))
+    invoice_id: Mapped[int] = mapped_column(ForeignKey("sales.deal_document.id"))
+    contract_id: Mapped[int] = mapped_column(ForeignKey("sales.deal_document.id"))
+    original_html: Mapped[str] = mapped_column(Text)
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_by: Mapped[str] = mapped_column(String(128))
+
 
 
 class ContractTemplate(Base):
@@ -392,3 +439,41 @@ class CompanyBranding(Base):
     stamp_data_url: Mapped[str | None] = mapped_column(Text)  # печать (штамп) — факсимиле
     signature_data_url: Mapped[str | None] = mapped_column(Text)  # подпись руководителя — факсимиле
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+# ORM protection also covers internal writers. PostgreSQL migration adds the same
+# guard for SQL/other processes; payment/reserve lifecycle fields remain mutable.
+_IMMUTABLE_DOCUMENT_FIELDS = (
+    "deal_id", "kind", "number", "amount", "created_at", "valid_until",
+    "template_id", "payment_terms", "delivery_terms", "terms_json", "version",
+    "supersedes_id", "replacement_reason", "snapshot_json", "original_html", "content_sha256",
+)
+
+
+@event.listens_for(DealDocument, "before_update")
+def _protect_document_original(mapper, connection, target):
+    state = inspect(target)
+    history = state.attrs.original_html.history
+    prior_html = history.deleted[0] if history.deleted else target.original_html
+    # First capture is allowed; every later content update must use another row.
+    if history.has_changes() and not history.deleted:
+        prior_html = None
+    if prior_html and any(state.attrs[key].history.has_changes() for key in _IMMUTABLE_DOCUMENT_FIELDS):
+        raise ValueError("Сохранённый оригинал неизменяем; создайте новую версию")
+    for key in ("issued_at", "issued_by", "superseded_by_id"):
+        history = state.attrs[key].history
+        if history.has_changes() and history.deleted and history.deleted[0] is not None:
+            raise ValueError("Историю выпуска и замены нельзя переписать")
+
+
+
+@event.listens_for(DealDocument, "before_delete")
+def _protect_document_delete(mapper, connection, target):
+    if target.original_html or target.status in {"posted", "paid", "cancelled"}:
+        raise ValueError("Исторический документ нельзя удалить")
+
+
+@event.listens_for(DocumentPackage, "before_update")
+@event.listens_for(DocumentPackage, "before_delete")
+def _protect_package(mapper, connection, target):
+    raise ValueError("Подготовленный пакет неизменяем")
