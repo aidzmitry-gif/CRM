@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from email import policy
 from email.message import EmailMessage
@@ -58,6 +58,14 @@ class Attachment:
         }
 
 
+@dataclass(frozen=True)
+class ReplyContext:
+    receipt_id: str
+    raw_sha256: str
+    message_id: str | None
+    references: tuple[str, ...]
+
+
 def request_fingerprint(
     *,
     deal_id: int,
@@ -67,6 +75,7 @@ def request_fingerprint(
     subject: str,
     body: str,
     attachments: list[dict],
+    reply: ReplyContext | None = None,
 ) -> str:
     """Hash user input and immutable attachment identity.
 
@@ -101,6 +110,7 @@ def request_fingerprint(
                 "subject": subject,
                 "body": body,
                 "attachments": relevant,
+                **({"reply": asdict(reply)} if reply is not None else {}),
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -132,6 +142,7 @@ async def prepare(
     body: str,
     attachments: list[Attachment],
     fingerprint_body: str | None = None,
+    reply: ReplyContext | None = None,
 ) -> OutgoingEmail:
     try:
         sender = address(sender)
@@ -172,6 +183,7 @@ async def prepare(
         subject=subject,
         body=body if fingerprint_body is None else fingerprint_body,
         attachments=metadata,
+        reply=reply,
     )
     existing = await session.scalar(
         select(OutgoingEmail).where(
@@ -191,6 +203,10 @@ async def prepare(
         msg["Cc"] = ", ".join(cc)
     msg["Subject"], msg["Message-ID"] = subject, message_id
     msg["Date"] = format_datetime(created.replace(tzinfo=timezone.utc))
+    if reply is not None and reply.message_id:
+        msg["In-Reply-To"] = reply.message_id
+        references = list(dict.fromkeys((*reply.references, reply.message_id)))[-50:]
+        msg["References"] = " ".join(references)
     msg.set_content(body)
     for attachment in attachments:
         maintype, subtype = attachment.content_type.split("/", 1)
@@ -219,6 +235,7 @@ async def prepare(
         mime=mime,
         mime_sha256=digest(mime),
         message_id=message_id,
+        reply_to_receipt_id=reply.receipt_id if reply else None,
         status="prepared",
         attempt_count=0,
         round_attempts=0,

@@ -10,7 +10,7 @@ import logging
 
 from core.runtime.contract import ModuleContract, Widget
 from core.runtime.core import Core
-from modules.sales import mail_routes, routes, telegram
+from modules.sales import mail_inbound, mail_routes, mail_routing, routes, telegram
 from modules.sales.calls import (
     on_call_answered,
     on_call_ended,
@@ -44,6 +44,8 @@ class SalesModule(ModuleContract):
     def register(self, core: Core) -> None:
         core.include_router(routes.router, prefix=self.api_prefix)
         core.include_router(mail_routes.router, prefix=self.api_prefix)
+        core.include_router(mail_routing.router, prefix=self.api_prefix)
+        core.include_router(mail_inbound.router)
         email_worker = EmailWorker(core.services)
         core.on_startup(email_worker.start)
         core.on_shutdown(email_worker.stop)
