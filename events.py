@@ -99,47 +99,49 @@ async def on_lead_converted(payload: dict, ctx) -> None:
 
 
 async def on_payment_paid(payload: dict, ctx) -> None:
-    """Платёж проведён → документ-счёт помечается оплаченным (finance → sales).
+    """Apply a confirmed payment only to its exact invoice identity.
 
-    Сначала по ``ref`` (= номер счёта). Если не нашли — по ``deal_id`` (шов 0105 /
-    finance.payment.*), чтобы оплата не терялась при расхождении номеров.
+    Legacy ref-only events are accepted only for a unique invoice number.
+    A deal ID alone is never sufficient and never transfers money to a revision.
     """
     if ctx is None:
         return
+    from modules.sales.documents import lock_deal
     from modules.sales.models import DealDocument
 
-    doc = None
-    ref = payload.get("ref")
-    if ref:
-        doc = (
-            await ctx.session.execute(select(DealDocument).where(DealDocument.number == ref))
-        ).scalars().first()
-    if doc is None and payload.get("deal_id") is not None:
+    doc_id = payload.get("document_id")
+    if doc_id is not None:
         try:
-            deal_id = int(payload["deal_id"])
+            doc_id = int(doc_id)
         except (TypeError, ValueError):
-            deal_id = None
-        if deal_id is not None:
-            # S4: среди счетов сделки берём СТАРЕЙШИЙ НЕОПЛАЧЕННЫЙ (FIFO), а не слепо
-            # новейший — иначе при нескольких счетах оплата пометит уже оплаченный/чужой,
-            # а реальный долг останется висеть (потеря учёта). amount в payload нет
-            # (finance.payment.paid несёт лишь ref/deal_id) → матч по сумме невозможен.
-            doc = (
-                await ctx.session.execute(
-                    select(DealDocument)
-                    .where(
-                        DealDocument.deal_id == deal_id,
-                        DealDocument.kind == "invoice",
-                        DealDocument.status != "paid",
-                    )
-                    .order_by(DealDocument.id)
-                )
-            ).scalars().first()
-    if doc is not None:
-        doc.status = "paid"
-        if doc.reserve_status == "reserved":
-            doc.reserve_status = "consumed"  # SALES-51: оплачен → резерв израсходован
-        logger.info("Sales: документ %s помечен оплаченным", doc.number)
+            return
+        docs = (await ctx.session.execute(select(DealDocument).where(DealDocument.id == doc_id))).scalars().all()
+    elif payload.get("ref"):
+        docs = (await ctx.session.execute(select(DealDocument).where(
+            DealDocument.number == payload["ref"], DealDocument.kind == "invoice",
+        ))).scalars().all()
+    else:
+        return
+    if len(docs) != 1:
+        logger.warning("Payment requires review: missing or ambiguous invoice identity")
+        return
+    doc = docs[0]
+    await lock_deal(ctx.session, doc.deal_id)
+    await ctx.session.refresh(doc)
+    if doc.kind != "invoice" or doc.status not in {"posted", "paid", "cancelled"}:
+        return
+    if payload.get("ref") and payload["ref"] != doc.number:
+        return
+    if payload.get("deal_id") is not None and payload["deal_id"] != doc.deal_id:
+        return
+    if payload.get("content_sha256") and payload["content_sha256"] != doc.content_sha256:
+        return
+    if payload.get("document_version") and payload["document_version"] != doc.version:
+        return
+    doc.status = "paid"
+    if doc.reserve_status == "reserved":
+        doc.reserve_status = "consumed"
+    logger.info("Sales: документ %s помечен оплаченным", doc.number)
 
 
 async def on_shipment_delivered(payload: dict, ctx) -> None:

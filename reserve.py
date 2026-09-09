@@ -12,8 +12,9 @@ from datetime import timedelta
 
 from sqlalchemy import select
 
+from modules.sales.documents import lock_deal
 from modules.sales.models import DealDocument
-from modules.sales.routes import _deal_stock_items, _utcnow
+from modules.sales.routes import _utcnow
 
 logger = logging.getLogger("aios.sales")
 
@@ -32,9 +33,17 @@ async def tick_invoice_reserve(session, services) -> None:
     ).scalars().all()
 
     for doc in docs:
+        await lock_deal(session, doc.deal_id)
+        await session.refresh(doc)
+        if doc.reserve_status != "reserved" or doc.status == "paid":
+            continue
         if today > doc.valid_until:
             # срок истёк и счёт не оплачен → аннулировать и снять резерв
-            items = await _deal_stock_items(session, doc.deal_id)
+            if not doc.snapshot_json:
+                logger.warning("Legacy reserve needs review for document %s; original items unknown", doc.id)
+                continue
+            items = [{"sku_code": line["sku_code"], "qty": line["qty"]}
+                     for line in doc.snapshot_json["items"] if line.get("sku_code")]
             if getattr(services, "stock", None) is not None and items:
                 await services.stock.release(session, items)
             doc.status = "cancelled"
