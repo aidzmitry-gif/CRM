@@ -2415,12 +2415,15 @@ async def update_task(
     payload: TaskUpdate,
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Изменить задачу: перенос срока / исполнение / отмена. При закрытии (``done``)
     ставит ``done_at`` и публикует ``sales.task.completed`` (→ audit, SALES-41)."""
     task = await session.get(DealTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Задача не найдена")
+    await visible_deal_or_404(session, task.deal_id, access)
     data = payload.model_dump(exclude_unset=True)
     becoming_done = data.get("status") == "done" and task.status != "done"
     for key, value in data.items():

@@ -165,6 +165,7 @@ _OWN_ROUTE_NAMES = frozenset(
         "deal_history",
         "list_tasks",
         "create_task",
+        "update_task",
         "list_deal_items",
         "repeat_last_order",
         "add_deal_item",
