@@ -2804,10 +2804,16 @@ async def _issue_original(core, session, doc, actor):
         await originals.capture(session, core, doc)
     await originals.mark_issued(session, core, doc, actor)
     if doc.kind in RESERVES_STOCK and core.services.stock is not None:
-        reserved = await core.services.stock.reserve(session, [
-            {"sku_code": line["sku_code"], "qty": Decimal(line["qty"])}
-            for line in doc.snapshot_json["items"] if line.get("sku_code")
-        ])
+        try:
+            reserved = await core.services.stock.reserve(session, [
+                {"sku_code": line["sku_code"], "qty": Decimal(line["qty"])}
+                for line in doc.snapshot_json["items"] if line.get("sku_code")
+            ])
+        except ValueError as exc:
+            # Replacement may already have released the old reserve. Restore it,
+            # the document and its outbox together, before any external posting.
+            await session.rollback()
+            raise HTTPException(409, str(exc)) from None
         if reserved:
             doc.reserve_status = "reserved"
             doc.reserved_at = _utcnow()
