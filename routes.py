@@ -3315,7 +3315,10 @@ def _render_invoice(
             f'<td class="c">{_INVOICE_VAT_RATE}%</td><td class="r">{_money(vat)}</td><td class="r">{_money(total)}</td>'
             "</tr>"
         )
-    valid_days = int(os.getenv("AIOS_INVOICE_VALID_DAYS", "5"))
+    validity_text = (
+        f"Счёт действителен до {doc.valid_until:%d.%m.%Y} включительно."
+        if doc.valid_until else "Срок действия счёта не указан."
+    )
     order_no = deal.number if deal else ""
     return f"""<!DOCTYPE html>
 <html lang="ru">
@@ -3387,7 +3390,7 @@ def _render_invoice(
     <div class="line"><div class="ln"></div><div class="cap">расшифровка подписи</div></div>
   </div>
   <div class="terms">
-    <div class="b">Счёт действителен в течение {valid_days} банковских дней.</div>
+    <div class="b">{validity_text}</div>
     Отгрузка товара клиенту при самовывозе осуществляется только при наличии следующих документов:<br>
     1. Подписанный Счёт-протокол с синей печатью<br>
     2. — если товар получает ИП — копия свидетельства о регистрации<br>
