@@ -225,13 +225,21 @@ class DocumentCreate(BaseModel):
     """Запрос на формирование документа сделки (счёт/договор/заказ)."""
 
     kind: Literal["invoice", "contract", "order"] = "invoice"
+    reserve_mode: Literal["stock", "on_order"] = "stock"
     request_key: str | None = Field(default=None, min_length=8, max_length=64)
     requested_by: str = ""  # инициатор (для согласования договора)
+
+    @model_validator(mode="after")
+    def invoice_reserve_mode(self):
+        if self.reserve_mode == "on_order" and self.kind != "invoice":
+            raise ValueError("Режим «под заказ» доступен только для счёта")
+        return self
 
 
 class DocumentRevision(BaseModel):
     reason: str = Field(min_length=3, max_length=500)
     request_key: str = Field(min_length=8, max_length=64)
+    reserve_mode: Literal["stock", "on_order"] | None = None  # None inherits the original.
 
 
     @model_validator(mode="after")
@@ -271,7 +279,8 @@ class DocumentOut(BaseModel):
     onec_ref: str | None = None
     amount: float
     valid_until: datetime.date | None = None  # SALES-51: срок действия счёта (резерв)
-    reserve_status: str = "none"  # none | reserved | consumed | released
+    reserve_mode: Literal["stock", "on_order"] = "stock"
+    reserve_status: str = "none"  # none | unreserved | reserved | consumed | released
     version: int = 1
     supersedes_id: int | None = None
     superseded_by_id: int | None = None

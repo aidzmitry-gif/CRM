@@ -141,6 +141,7 @@ class DealDocument(Base):
     posted_at: Mapped[datetime | None] = mapped_column(DateTime)
     # SALES-51: резерв под счёт/заказ + срок действия счёта (valid_until = +AIOS_INVOICE_VALID_DAYS дн.).
     # reserve_status: none → reserved → consumed (оплата) | released (истёк/снят).
+    # Explicit on-order invoices issue as unreserved without changing stock.
     valid_until: Mapped[date | None] = mapped_column(Date)
     reserve_status: Mapped[str] = mapped_column(String(16), default="none", server_default="none")
     reserved_at: Mapped[datetime | None] = mapped_column(DateTime)
@@ -165,6 +166,16 @@ class DealDocument(Base):
     content_sha256: Mapped[str | None] = mapped_column(String(64))
     issued_at: Mapped[datetime | None] = mapped_column(DateTime)
     issued_by: Mapped[str | None] = mapped_column(String(128))
+
+    @property
+    def reserve_mode(self) -> str:
+        # A captured original owns its mode. Legacy originals without this field
+        # are always stock, even if mutable draft terms are subsequently changed.
+        if self.snapshot_json is not None:
+            return self.snapshot_json.get("reserve_mode", "stock")
+        if self.issued_at or self.original_html or self.status in {"posted", "paid", "cancelled"}:
+            return "stock"
+        return (self.terms_json or {}).get("reserve_mode", "stock")
 
     @property
     def original_state(self) -> str:

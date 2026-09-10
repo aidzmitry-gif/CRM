@@ -167,6 +167,7 @@ async def capture(session, core, doc):
     source = {
         'schema_version': 1, 'document_id': doc.id, 'version': doc.version,
         'number': doc.number, 'kind': doc.kind, 'deal_id': deal.id,
+        'reserve_mode': doc.reserve_mode,
         'deal': {'number': deal.number, 'title': deal.title, 'counterparty': deal.counterparty},
         'seller': seller, 'buyer': buyer, 'items': lines,
         'currency': 'BYN', 'amount': str(doc.amount),

@@ -386,6 +386,8 @@ async def _post_document_to_1c(
             "counterparty": counterparty,
             "amount": str(doc.amount),
             "currency": "BYN",
+            "reserve_mode": doc.reserve_mode,
+            "reserve_status": doc.reserve_status,
             "due_date": doc.valid_until.isoformat() if doc.valid_until else None,
             "document_version": doc.version,
             "content_sha256": doc.content_sha256,
@@ -2825,13 +2827,19 @@ async def _issue_original(core, session, doc, actor):
         if doc.kind in RESERVES_STOCK:
             doc.valid_until = _utcnow().date() + timedelta(days=int(os.getenv("AIOS_INVOICE_VALID_DAYS", "5")))
         await originals.capture(session, core, doc)
+    reserves_stock = doc.kind in RESERVES_STOCK and doc.reserve_mode == "stock"
+    if reserves_stock and core.services.stock is None and any(
+        line.get("sku_code") for line in doc.snapshot_json["items"]
+    ):
+        await session.rollback()
+        raise HTTPException(503, "Для резервирования товара нужен складской шлюз")
     if doc.supersedes_id and core.services.stock is not None:
         old = await session.get(DealDocument, doc.supersedes_id)
         if old is not None and old.reserve_status == "reserved":
             # Ordering each call separately is insufficient: release(HIGH), then
             # reserve(LOW) can deadlock another invoice reserving LOW + HIGH.
             snapshots = [old.snapshot_json]
-            if doc.kind in RESERVES_STOCK:
+            if reserves_stock:
                 snapshots.append(doc.snapshot_json)
             await core.services.stock.lock_reservation_items(session, [
                 {"sku_code": line["sku_code"], "qty": line["qty"]}
@@ -2839,7 +2847,10 @@ async def _issue_original(core, session, doc, actor):
                 if line.get("sku_code")
             ])
     await originals.mark_issued(session, core, doc, actor)
-    if doc.kind in RESERVES_STOCK and core.services.stock is not None:
+    if doc.reserve_mode == "on_order":
+        doc.reserve_status = "unreserved"
+        doc.reserved_at = None
+    elif reserves_stock and core.services.stock is not None:
         try:
             reserved = await core.services.stock.reserve(session, [
                 {"sku_code": line["sku_code"], "qty": Decimal(line["qty"])}
@@ -2870,7 +2881,10 @@ async def create_document(
     """Invoice/order issue immediately; contracts save the exact approval candidate."""
     deal = await visible_deal_or_404(session, deal_id, access)
     await originals.lock_deal(session, deal_id)
-    request = {"deal_id": deal_id, "operation": "create", **payload.model_dump()}
+    # Omit default stock from the key hash to preserve pre-mode request replays.
+    request = {"deal_id": deal_id, "operation": "create", **payload.model_dump(exclude={"reserve_mode"})}
+    if payload.reserve_mode != "stock":
+        request["reserve_mode"] = payload.reserve_mode
     repeated = await originals.retry_document(session, payload.request_key, request)
     if repeated:
         return repeated
@@ -2881,6 +2895,7 @@ async def create_document(
         raise HTTPException(409, "Документ уже существует; используйте явную новую версию")
     doc = DealDocument(deal_id=deal_id, kind=payload.kind,
                        number=f"{DOC_NUMBER_PREFIX[payload.kind]}-{deal.number}",
+                       terms_json={"reserve_mode": payload.reserve_mode},
                        request_key=payload.request_key, request_hash=originals.digest(request))
     session.add(doc)
     await originals.flush_document(session)
@@ -2900,7 +2915,11 @@ async def revise_document(
     access: DealAccess = Depends(get_deal_access),
 ):
     old = await originals.locked_document(session, doc_id, access)
-    request = {"document_id": doc_id, "operation": "revision", **payload.model_dump()}
+    if payload.reserve_mode == "on_order" and old.kind != "invoice":
+        raise HTTPException(422, "Режим «под заказ» доступен только для счёта")
+    request = {"document_id": doc_id, "operation": "revision", **payload.model_dump(exclude={"reserve_mode"})}
+    if payload.reserve_mode is not None:
+        request["reserve_mode"] = payload.reserve_mode
     repeated = await originals.retry_document(session, payload.request_key, request)
     if repeated:
         return repeated
@@ -2922,7 +2941,8 @@ async def revise_document(
     doc = DealDocument(deal_id=old.deal_id, kind=old.kind, version=version,
         number=old.number, amount=old.amount, supersedes_id=target.id,
         template_id=old.template_id, payment_terms=old.payment_terms, delivery_terms=old.delivery_terms,
-        terms_json={"custom": (old.terms_json or {}).get("custom", {})},
+        terms_json={"custom": (old.terms_json or {}).get("custom", {}),
+                    "reserve_mode": payload.reserve_mode if payload.reserve_mode is not None else old.reserve_mode},
         replacement_reason=payload.reason.strip(), request_key=payload.request_key,
         request_hash=originals.digest(request))
     session.add(doc)
@@ -3338,6 +3358,7 @@ def _render_invoice(
 <div class="sheet">
   {f'<div class="logo"><img src="{_esc(seller.get("logo_data_url"))}" alt="{_esc(seller.get("name", ""))}"></div>' if seller.get("logo_data_url") else ""}
   <h1>Счёт-протокол на оплату № {_esc(doc.number)} от {date_str}</h1>
+  {'<div class="order"><b>Под заказ — товар не зарезервирован</b></div>' if doc.reserve_mode == "on_order" else ""}
   <div class="party"><div class="lbl">Поставщик:</div><div class="body">{_req_line(seller)}</div></div>
   <div class="party"><div class="lbl">Покупатель:</div><div class="body">{_req_line(buyer)}</div></div>
   <table class="doc">
