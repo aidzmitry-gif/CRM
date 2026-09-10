@@ -2802,6 +2802,19 @@ async def _issue_original(core, session, doc, actor):
         if doc.kind in RESERVES_STOCK:
             doc.valid_until = _utcnow().date() + timedelta(days=int(os.getenv("AIOS_INVOICE_VALID_DAYS", "5")))
         await originals.capture(session, core, doc)
+    if doc.supersedes_id and core.services.stock is not None:
+        old = await session.get(DealDocument, doc.supersedes_id)
+        if old is not None and old.reserve_status == "reserved":
+            # Ordering each call separately is insufficient: release(HIGH), then
+            # reserve(LOW) can deadlock another invoice reserving LOW + HIGH.
+            snapshots = [old.snapshot_json]
+            if doc.kind in RESERVES_STOCK:
+                snapshots.append(doc.snapshot_json)
+            await core.services.stock.lock_reservation_items(session, [
+                {"sku_code": line["sku_code"], "qty": line["qty"]}
+                for snapshot in snapshots for line in ((snapshot or {}).get("items") or [])
+                if line.get("sku_code")
+            ])
     await originals.mark_issued(session, core, doc, actor)
     if doc.kind in RESERVES_STOCK and core.services.stock is not None:
         try:
