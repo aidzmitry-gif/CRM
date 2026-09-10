@@ -310,10 +310,15 @@ async def _build_item_out(session: AsyncSession, item: DealItem, counterparty: s
 async def _counterparty_for_deal(
     session: AsyncSession, deal: Deal, create: bool = False
 ) -> Counterparty | None:
-    """Найти контрагента сделки по имени (связь по названию); опц. создать."""
-    cp = (
-        await session.execute(select(Counterparty).where(Counterparty.name == deal.counterparty))
-    ).scalars().first()
+    """Однозначно найти контрагента по имени; при отсутствии опционально создать."""
+    matches = (
+        await session.execute(
+            select(Counterparty).where(Counterparty.name == deal.counterparty).limit(2)
+        )
+    ).scalars().all()
+    if len(matches) > 1:
+        raise HTTPException(status_code=409, detail="Неоднозначный контрагент сделки")
+    cp = matches[0] if matches else None
     if cp is None and create:
         cp = Counterparty(name=deal.counterparty)
         session.add(cp)
@@ -682,6 +687,7 @@ async def pipeline_stage_metrics(
 async def list_funnels(
     session: AsyncSession = Depends(get_session),
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Воронки sales: код + титул + сколько активных сделок. Имена — из ``FUNNELS``
     (справочник в коде), порядок — как там; неизвестные коды (созданы через редактор
@@ -697,7 +703,7 @@ async def list_funnels(
     try:
         stage_counts = (
             await session.execute(
-                select(Deal.funnel, func.count())
+                scope_deals(select(Deal.funnel, func.count()), access)
                 .where(Deal.stage.notin_(TERMINAL_STAGES))
                 .group_by(Deal.funnel)
             )
@@ -2767,11 +2773,28 @@ async def list_chats(
 
 
 @router.patch("/contacts/{contact_id}/primary", response_model=ContactOut)
-async def set_primary_contact(contact_id: int, session: AsyncSession = Depends(get_session)):
+async def set_primary_contact(
+    contact_id: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
+):
     """Назначить контакт основным (снимая признак с остальных контактов контрагента)."""
     contact = await session.get(Contact, contact_id)
     if contact is None:
         raise HTTPException(status_code=404, detail="Контакт не найден")
+    if access.own_only:
+        deal = (await session.execute(
+            scope_deals(
+                select(Deal).join(Counterparty, Counterparty.name == Deal.counterparty)
+                .where(Counterparty.id == contact.counterparty_id), access,
+            ).limit(1)
+        )).scalars().first()
+        if deal is None:
+            raise HTTPException(status_code=404, detail="Контакт не найден")
+        counterparty = await _counterparty_for_deal(session, deal)
+        if counterparty is None or counterparty.id != contact.counterparty_id:
+            raise HTTPException(status_code=404, detail="Контакт не найден")
     if contact.counterparty_id is not None:
         await _clear_primary(session, contact.counterparty_id)
     contact.is_primary = True
