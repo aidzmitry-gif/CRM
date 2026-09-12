@@ -34,8 +34,11 @@ from modules.sales.access import (
     DealAccess,
     deny_unscoped_own_routes,
     get_deal_access,
+    locked_call_for_write,
     resolve_owner_assignment,
+    scope_calls,
     scope_deals,
+    visible_call_or_404,
     visible_deal_or_404,
     visible_deal_or_none,
 )
@@ -4053,17 +4056,20 @@ async def list_calls(
     date: str | None = None,
     deal_id: int | None = None,
     session: AsyncSession = Depends(get_session),
+    access: DealAccess = Depends(get_deal_access),
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
 ):
     """Журнал звонков: статус / продавец / дата / сделка (``deal_id`` — лента карточки)."""
     from modules.sales.models import CallLog
 
-    stmt = select(CallLog).order_by(CallLog.started_at.desc())
+    stmt = scope_calls(select(CallLog), access).order_by(CallLog.started_at.desc())
     if status:
         stmt = stmt.where(CallLog.status == status)
     if owner:
         stmt = stmt.where(CallLog.owner == owner)
     if deal_id is not None:
+        if access.own_only:
+            await visible_deal_or_404(session, deal_id, access)
         stmt = stmt.where(CallLog.deal_id == deal_id)
     if date:
         try:
@@ -4079,15 +4085,11 @@ async def list_calls(
 async def get_call(
     cid: int,
     session: AsyncSession = Depends(get_session),
+    access: DealAccess = Depends(get_deal_access),
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
 ):
     """Карточка одного звонка."""
-    from modules.sales.models import CallLog
-
-    call = await session.get(CallLog, cid)
-    if call is None:
-        raise HTTPException(status_code=404, detail="Звонок не найден")
-    return call
+    return await visible_call_or_404(session, cid, access)
 
 
 @router.post("/calls/{cid}/comment", response_model=CallOut)
@@ -4095,14 +4097,11 @@ async def call_comment(
     cid: int,
     payload: CallCommentIn,
     session: AsyncSession = Depends(get_session),
+    access: DealAccess = Depends(get_deal_access),
     _: CurrentUser = Depends(require_permission("sales.deal.write")),
 ):
     """Заметка по звонку."""
-    from modules.sales.models import CallLog
-
-    call = await session.get(CallLog, cid)
-    if call is None:
-        raise HTTPException(status_code=404, detail="Звонок не найден")
+    call = await locked_call_for_write(session, cid, access)
     call.comment = payload.comment
     await session.commit()
     return call
@@ -4113,14 +4112,11 @@ async def call_result(
     cid: int,
     payload: CallResultIn,
     session: AsyncSession = Depends(get_session),
+    access: DealAccess = Depends(get_deal_access),
     _: CurrentUser = Depends(require_permission("sales.deal.write")),
 ):
     """Отметить итог/классификацию звонка."""
-    from modules.sales.models import CallLog
-
-    call = await session.get(CallLog, cid)
-    if call is None:
-        raise HTTPException(status_code=404, detail="Звонок не найден")
+    call = await locked_call_for_write(session, cid, access)
     call.result = payload.result
     await session.commit()
     return call
@@ -4131,25 +4127,19 @@ async def call_link_deal(
     cid: int,
     payload: CallLinkDealIn,
     session: AsyncSession = Depends(get_session),
+    access: DealAccess = Depends(get_deal_access),
     core: Core = Depends(get_core),
     _: CurrentUser = Depends(require_permission("sales.deal.write")),
 ):
     """Привязать звонок к существующей сделке (``deal_id``) или создать новую (``create``)."""
-    from modules.sales.models import CallLog
-
-    # ponytail: остаточный риск authz (security-review MED) — нет проверки call.owner ==
-    # вызывающий, любой с sales.deal.write привязывает/создаёт сделку по чужому звонку.
-    # Тот же блокер, что у /calls/stream: в dev нет идентичности (user.username ==
-    # "anonymous"), сверять не с чем. Апгрейд — Keycloak P1 → проверка владельца + set owner.
-    call = await session.get(CallLog, cid)
-    if call is None:
-        raise HTTPException(status_code=404, detail="Звонок не найден")
+    call = await locked_call_for_write(session, cid, access, payload.deal_id)
     if payload.deal_id is not None:
-        deal = await session.get(Deal, payload.deal_id)
-        if deal is None:
-            raise HTTPException(status_code=404, detail="Сделка не найдена")
+        deal = await visible_deal_or_404(session, payload.deal_id, access)
         call.deal_id = deal.id
     elif payload.create:
+        owner_id, owner_name = await resolve_owner_assignment(
+            session, access, access.employee_id if access.own_only else call.owner_id
+        )
         cp_name = ""
         if call.counterparty_id is not None:
             cp = await session.get(Counterparty, call.counterparty_id)
@@ -4158,7 +4148,8 @@ async def call_link_deal(
             number=f"CRM-CALL-{call.id}",
             title=f"Звонок {call.phone_e164 or call.call_id}",
             counterparty=cp_name or (call.phone_e164 or "Неизвестный номер"),
-            owner=call.owner,
+            owner=owner_name if owner_name is not None else call.owner,
+            owner_id=owner_id,
             stage="new",
         )
         session.add(deal)

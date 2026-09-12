@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from fastapi import Depends, HTTPException, Request
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.access import is_super
@@ -17,7 +17,7 @@ from config.settings import get_settings
 from core.domain.models import User
 from core.runtime.deps import get_session
 from core.services.auth import CurrentUser, get_current_user
-from modules.sales.models import Deal
+from modules.sales.models import CallLog, Deal
 
 # ``Deal.owner_id`` stores ``hr.employee.id`` (via this soft link), never the
 # primary key of app_user.  Only a current CRM employee may become a confirmed
@@ -80,6 +80,49 @@ async def get_deal_access(
 def scope_deals(stmt, access: DealAccess):
     """Append the server-side owner predicate for a list/aggregate query."""
     return stmt.where(Deal.owner_id == access.employee_id) if access.own_only else stmt
+
+
+def scope_calls(stmt, access: DealAccess):
+    """Linked calls follow deal scope; unlinked calls require a confirmed owner."""
+    if not access.own_only:
+        return stmt
+    own_deals = scope_deals(select(Deal.id), access)
+    return stmt.where(or_(
+        CallLog.deal_id.in_(own_deals),
+        and_(CallLog.deal_id.is_(None), CallLog.owner_id == access.employee_id),
+    ))
+
+
+async def visible_call_or_404(session: AsyncSession, call_id: int, access: DealAccess) -> CallLog:
+    call = (await session.execute(scope_calls(select(CallLog).where(CallLog.id == call_id), access))).scalar_one_or_none()
+    if call is None:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    return call
+
+
+async def locked_call_for_write(
+    session: AsyncSession, call_id: int, access: DealAccess, target_deal_id: int | None = None,
+) -> CallLog:
+    """Keep call assignment and both deal owners stable until the caller commits."""
+    call = (await session.execute(
+        select(CallLog).where(CallLog.id == call_id).with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if call is None:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    deal_ids = {value for value in (call.deal_id, target_deal_id) if value is not None}
+    if deal_ids:
+        await session.execute(
+            select(Deal).where(Deal.id.in_(deal_ids)).order_by(Deal.id).with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    if call.deal_id is not None:
+        await visible_deal_or_404(session, call.deal_id, access)
+    elif access.own_only and call.owner_id != access.employee_id:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    if target_deal_id is not None:
+        await visible_deal_or_404(session, target_deal_id, access)
+    return call
 
 
 async def visible_deal_or_404(
@@ -182,6 +225,7 @@ _OWN_ROUTE_NAMES = frozenset(
         "decide_document", "render_document", "document_snapshot", "render_package",
         "render_saved_package", "send_package", "preview_document",
         "list_messages",
+        "list_calls", "get_call", "call_comment", "call_result", "call_link_deal",
         "create_message",
         "mark_messages_read",
         "ai_draft_reply",
