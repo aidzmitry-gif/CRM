@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -140,6 +141,7 @@ class DealItemOut(BaseModel):
     title: str
     unit: str
     qty: float
+    unit_price: float | None = None  # подтверждённая цена этой строки, без НДС
     last_price: float | None = None  # последняя цена клиенту (Price Engine)
     min_price: float | None = None  # минимальная цена клиенту
 
@@ -149,12 +151,14 @@ class DealItemCreate(BaseModel):
 
     sku_id: int
     qty: float = 1.0
+    unit_price: Decimal | None = Field(default=None, ge=0, max_digits=14, decimal_places=2)
 
 
 class DealItemUpdate(BaseModel):
-    """Изменить позицию (количество)."""
+    """Изменить количество или явно подтвердить/снять цену строки."""
 
-    qty: float
+    qty: float = Field(default=None)
+    unit_price: Decimal | None = Field(default=None, ge=0, max_digits=14, decimal_places=2)
 
 
 class SkuOut(BaseModel):

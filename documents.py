@@ -24,7 +24,6 @@ from modules.sales.models import (
     Deal,
     DealDocument,
     DealItem,
-    PriceQuote,
 )
 
 
@@ -103,19 +102,14 @@ async def capture(session, core, doc):
     """Save the agreed candidate; called only on issue or submission, never GET."""
     from modules.sales import routes as r
 
-    quote_id = (select(PriceQuote.id).where(
-        PriceQuote.sku_code == Sku.code, PriceQuote.counterparty == Deal.counterparty,
-    ).order_by(PriceQuote.created_at.desc(), PriceQuote.id.desc()).limit(1)
-        .correlate(Deal, Sku).scalar_subquery())
     buyer_id = (select(Counterparty.id).where(
         Counterparty.name == Deal.counterparty, Counterparty.is_active.is_(True),
     ).order_by(Counterparty.id).limit(1).correlate(Deal).scalar_subquery())
     rows = (await session.execute(
-        select(Deal, DealItem, Sku, PriceQuote, Counterparty, CompanyBranding, ContractTemplate)
+        select(Deal, DealItem, Sku, Counterparty, CompanyBranding, ContractTemplate)
         .select_from(Deal)
         .outerjoin(DealItem, DealItem.deal_id == Deal.id)
         .outerjoin(Sku, Sku.id == DealItem.sku_id)
-        .outerjoin(PriceQuote, PriceQuote.id == quote_id)
         .outerjoin(Counterparty, Counterparty.id == buyer_id)
         .outerjoin(CompanyBranding, CompanyBranding.id == 1)
         .outerjoin(ContractTemplate, ContractTemplate.id == doc.template_id)
@@ -124,14 +118,14 @@ async def capture(session, core, doc):
     )).all()
     if not rows:
         raise HTTPException(404, 'Сделка не найдена')
-    deal, _, _, _, cp, branding, template = rows[0]
+    deal, _, _, cp, branding, template = rows[0]
     seller = r._seller_with_facsimile(core, branding)
     buyer = {'name': deal.counterparty, 'unp': cp.unp or '' if cp else ''}
     if cp:
         buyer.update(cp.requisites or {})
     buyer.update((doc.terms_json or {}).get('buyer') or {})
     lines = []
-    for _, item, sku, quote, *_ in rows:
+    for _, item, sku, *_ in rows:
         if item is None:
             continue
         if item.qty <= 0:
@@ -139,13 +133,15 @@ async def capture(session, core, doc):
         line = {'item_id': item.id, 'sku_id': item.sku_id, 'sku_code': sku.code if sku else None,
                 'name': sku.title if sku else f'позиция #{item.sku_id}',
                 'unit': sku.unit if sku else 'шт', 'qty': str(item.qty), 'currency': 'BYN',
-                'discount': None, 'quote_id': quote.id if quote else None}
+                'discount': None, 'quote_id': None}
         if doc.kind == 'invoice':
-            if quote is None or quote.price < 0:
-                raise HTTPException(422, 'Для выпуска счёта нужна неотрицательная цена каждой позиции')
-            net, tax, gross = r._invoice_line(item.qty, quote.price)
-            line.update(price=str(quote.price), net=str(net), tax=str(tax), total=str(gross),
-                        vat_rate=str(r._INVOICE_VAT_RATE))
+            if sku is None:
+                raise HTTPException(422, 'Номенклатура позиции счёта не найдена')
+            if item.unit_price is None or not item.unit_price.is_finite() or item.unit_price < 0:
+                raise HTTPException(422, 'Для выпуска счёта подтвердите неотрицательную цену каждой позиции')
+            net, tax, gross = r._invoice_line(item.qty, item.unit_price)
+            line.update(price=str(item.unit_price), net=str(net), tax=str(tax), total=str(gross),
+                        vat_rate=str(r._INVOICE_VAT_RATE), basis='confirmed_deal_item_price')
         else:
             # Existing contract model is an unpriced specification with one agreed total.
             line.update(price=None, net=None, tax=None, total=None, vat_rate=None)

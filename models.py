@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -110,12 +111,17 @@ class DealItem(Base):
     """
 
     __tablename__ = "deal_item"
-    __table_args__ = {"schema": "sales"}
+    __table_args__ = (
+        CheckConstraint("unit_price >= 0", name="unit_price_nonnegative"),
+        {"schema": "sales"},
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     deal_id: Mapped[int] = mapped_column(ForeignKey("sales.deal.id"))
     sku_id: Mapped[int] = mapped_column()
     qty: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("1"), server_default="1")
+    # Confirmed net unit price for this line; NULL requires explicit pricing.
+    unit_price: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
 
 
 class DealDocument(Base):

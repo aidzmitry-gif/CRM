@@ -305,6 +305,7 @@ async def _build_item_out(session: AsyncSession, item: DealItem, counterparty: s
         title=sku.title if sku else "",
         unit=sku.unit if sku else "",
         qty=float(item.qty),
+        unit_price=float(item.unit_price) if item.unit_price is not None else None,
         last_price=price.last_price,
         min_price=price.min_price,
     )
@@ -1127,6 +1128,7 @@ async def get_deal(
             title=skus[r.sku_id].title if r.sku_id in skus else "",
             unit=skus[r.sku_id].unit if r.sku_id in skus else "",
             qty=float(r.qty),
+            unit_price=float(r.unit_price) if r.unit_price is not None else None,
             last_price=price_map.get(skus[r.sku_id].code, (None, None))[0]
             if r.sku_id in skus
             else None,
@@ -1369,7 +1371,7 @@ async def _deal_margin(
         pc = pc_map.get(code)
 
         # Цена клиенту: КП перекрывает всё; иначе дефолт из прайса 1С (с пометкой источника).
-        quote_price = last_price.get(code)
+        quote_price = float(r.unit_price) if r.unit_price is not None else last_price.get(code)
         if quote_price is not None:
             price, price_source = quote_price, "quote"
         elif pc is not None and pc.price_byn is not None:
@@ -2588,7 +2590,8 @@ async def add_deal_item(
     deal = await visible_deal_or_404(session, deal_id, access)
     if await session.get(Sku, payload.sku_id) is None:
         raise HTTPException(status_code=404, detail="Номенклатура не найдена")
-    item = DealItem(deal_id=deal_id, sku_id=payload.sku_id, qty=Decimal(str(payload.qty)))
+    item = DealItem(deal_id=deal_id, sku_id=payload.sku_id,
+                    qty=Decimal(str(payload.qty)), unit_price=payload.unit_price)
     session.add(item)
     await session.flush()
     core.event_bus.emit(
@@ -2608,12 +2611,15 @@ async def update_deal_item(
     _: CurrentUser = Depends(require_permission("sales.deal.write")),
     access: DealAccess = Depends(get_deal_access),
 ):
-    """Изменить количество в позиции сделки."""
+    """Изменить количество/подтверждённую цену; пропущенные поля сохраняются."""
     item = await session.get(DealItem, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Позиция не найдена")
     await visible_deal_or_404(session, item.deal_id, access)
-    item.qty = Decimal(str(payload.qty))
+    if "qty" in payload.model_fields_set:
+        item.qty = Decimal(str(payload.qty))
+    if "unit_price" in payload.model_fields_set:
+        item.unit_price = payload.unit_price
     deal = await DealRepository(session).get(item.deal_id)
     await session.commit()
     return await _build_item_out(session, item, deal.counterparty if deal else "")
@@ -3224,13 +3230,7 @@ def _invoice_gross(items: list[dict]) -> Decimal:
 
 
 async def _invoice_items(session: AsyncSession, deal_id: int) -> list[dict]:
-    """Позиции счёта: наименование/кол-во/ед.изм. из сделки + цена — последняя котировка клиента.
-
-    Цена берётся по последней ``PriceQuote`` для пары (sku.code, deal.counterparty);
-    нет котировки — честный ноль (счёт без цены на позицию — сигнал менеджеру, не падение).
-    """
-    deal = await DealRepository(session).get(deal_id)
-    counterparty = deal.counterparty if deal else ""
+    """Позиции счёта с подтверждённой ценой строки; история клиента её не меняет."""
     rows = (
         await session.execute(
             select(DealItem, Sku)
@@ -3243,17 +3243,9 @@ async def _invoice_items(session: AsyncSession, deal_id: int) -> list[dict]:
     for item, sku in rows:
         name = sku.title if sku else f"позиция #{item.sku_id}"
         unit = sku.unit if sku else "шт"
-        price = Decimal("0")
-        if sku is not None:
-            quote = (
-                await session.execute(
-                    select(PriceQuote)
-                    .where(PriceQuote.sku_code == sku.code, PriceQuote.counterparty == counterparty)
-                    .order_by(PriceQuote.created_at.desc(), PriceQuote.id.desc())
-                )
-            ).scalars().first()
-            if quote is not None:
-                price = quote.price
+        price = item.unit_price
+        if price is None or not price.is_finite() or price < 0:
+            raise HTTPException(422, "Для счёта подтвердите неотрицательную цену каждой позиции")
         items.append({"name": name, "qty": item.qty, "unit": unit, "price": price})
     return items
 

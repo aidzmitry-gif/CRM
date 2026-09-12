@@ -29,7 +29,7 @@ async def on_lead_converted(payload: dict, ctx) -> None:
     """
     if ctx is None:
         return
-    from decimal import Decimal, InvalidOperation
+    from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
     lead_id = payload.get("lead_id")
     if not lead_id:
@@ -62,25 +62,22 @@ async def on_lead_converted(payload: dict, ctx) -> None:
             sku_id = int(raw["sku_id"])
             qty = Decimal(str(raw.get("qty") or 1))
             price = Decimal(str(raw.get("price") or 0))
-            disc = Decimal(str(raw.get("discount_pct") or 0))
         except (KeyError, TypeError, ValueError, InvalidOperation):
             continue
         if qty <= 0:
             continue
-        ctx.session.add(DealItem(deal_id=deal.id, sku_id=sku_id, qty=qty))
-        # Котировка клиенту (S3): печать счёта берёт цену из PriceQuote(sku_code, counterparty)
-        # (routes._invoice_items) — без записи счёт печатается с НУЛЯМИ при верной сумме сделки.
-        # Цена-за-единицу ПОСЛЕ скидки: unit×qty == сумма позиции == Deal.amount; счёт скидку
-        # повторно не применяет (net=qty×price), поэтому цена ДО скидки завысила бы счёт клиенту.
-        # Пишем только при непустом sku_code и цене >0 (disc=100 / price=0 → без котировки).
-        unit_price = (price * (Decimal("1") - disc / Decimal("100"))).quantize(Decimal("0.01"))
+        # LeadItem.price уже учитывает скидку; discount_pct — только справочная метка.
+        # Строка сохраняет переданную подтверждённую цену, включая явный ноль.
+        # PriceQuote пополняет историю клиента, но не задаёт цену уже созданной строки.
+        unit_price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        ctx.session.add(DealItem(deal_id=deal.id, sku_id=sku_id, qty=qty, unit_price=unit_price))
         sku_code = (raw.get("sku_code") or "").strip()
         if unit_price > 0 and sku_code:
             ctx.session.add(
                 PriceQuote(sku_code=sku_code, counterparty=deal.counterparty, price=unit_price)
             )
-        # линия = price×qty×(1−скидка%); деньги Decimal, не float
-        line = (price * qty * (Decimal("1") - disc / Decimal("100"))).quantize(Decimal("0.01"))
+        # Сумма сделки совпадает с сохранёнными ценами строк и нетто будущего счёта.
+        line = (unit_price * qty).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         total += line
     deal.amount = total
 
