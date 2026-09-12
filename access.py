@@ -17,14 +17,13 @@ from config.settings import get_settings
 from core.domain.models import User
 from core.runtime.deps import get_session
 from core.services.auth import CurrentUser, get_current_user
+from core.services.crm_owners import resolve_crm_owner
 from modules.sales.models import CallLog, Deal
+
 
 # ``Deal.owner_id`` stores ``hr.employee.id`` (via this soft link), never the
 # primary key of app_user.  Only a current CRM employee may become a confirmed
 # numeric owner; a legacy text owner remains display-only.
-CRM_OWNER_ROLES = frozenset({"sales_head", "sales", "sales_manager", "sales_cli"})
-
-
 @dataclass(frozen=True)
 class DealAccess:
     """Resolved, request-scoped visibility. ``employee_id`` is required for own."""
@@ -171,18 +170,7 @@ async def resolve_owner_assignment(
     assigned_id = require_owner_assignment(access, owner_id)
     if assigned_id is None:
         return None, None
-    assigned = (
-        await session.execute(
-            select(User).where(
-                User.employee_id == assigned_id,
-                User.status == "active",
-                User.department == "Продажи",
-                User.role.in_(CRM_OWNER_ROLES),
-            )
-        )
-    ).scalar_one_or_none()
-    if assigned is None:
-        raise HTTPException(status_code=422, detail="Владелец сделки не является активным сотрудником CRM")
+    assigned = await resolve_crm_owner(session, employee_id=assigned_id)
     return assigned.employee_id, assigned.full_name
 
 

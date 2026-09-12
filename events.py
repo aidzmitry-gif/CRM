@@ -50,6 +50,10 @@ async def on_lead_converted(payload: dict, ctx) -> None:
         title=payload.get("title") or "Лид",
         counterparty=payload.get("counterparty") or "Новый лид",
         owner=payload.get("owner", ""),
+        # The producer validated this employee ID before committing conversion.
+        # Keep its assignment snapshot if the account changes before delivery.
+        # Legacy events have no numeric identity and retain display-only ownership.
+        owner_id=payload.get("owner_id"),
         stage="new",
         priority=payload.get("priority", "Средний"),
     )
