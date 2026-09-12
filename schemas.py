@@ -544,7 +544,7 @@ class MarginLine(BaseModel):
     """Маржа позиции сделки: цена клиенту × кол-во минус landed себестоимость × кол-во.
 
     ``status`` — honest-разбивка: ``priced`` (есть цена И landed → попадает в gross);
-    ``no_price`` (нет последней котировки клиенту); ``no_cost`` (нет закрытого landed по SKU).
+    ``no_price`` (нет подтверждённой цены строки сделки); ``no_cost`` (нет закрытого landed по SKU).
     Позиции без обоих в gross НЕ попадают (не маскируем дыру нулём — [[landed_cost]]).
     """
 
@@ -562,7 +562,7 @@ class MarginLine(BaseModel):
     cost_fixed_at: datetime.datetime | None = None
     cost_fx_rate: float | None = None
     # Провенанс источника (PC3) — для честной пометки в UI, «откуда цифра».
-    # cost_source: "onec"|"demo"|"landed"|None; price_source: "quote" (КП клиента)|"onec"|"demo"|None.
+    # cost_source: "onec"|"demo"|"landed"|None; price_source: "quote" (подтверждённая цена строки)|None.
     cost_source: str | None = None
     price_source: str | None = None
 

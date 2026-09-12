@@ -1311,15 +1311,11 @@ async def _deal_margin(
 
     Единый расчёт для карточки (``GET /deals/{id}/margin``) и прогноза воронки
     (``GET /pipeline/margin-forecast``) — DRY, обе считают одинаково. Приоритет источников (PC3):
-    себестоимость — 1С через фасад ``price_cost`` (``onec``/``demo``), иначе landed из закупок
-    (фолбэк/сверка), иначе нет. Цена клиенту — котировка КП (``quote``) перекрывает всё, иначе
-    дефолт из прайса 1С (``price_cost.price_byn``), иначе нет; ``revenue = price×qty`` не зависит
-    от себеса. Каждая строка несёт провенанс ``cost_source``/``price_source``.
-
-    Второй элемент кортежа — ``True``, когда НЕ подключён ни один источник себеса (оба фасада
-    ``None``). Когда ``price_cost`` не подключён (дефолт/прод/тесты) — равен «landed is None»,
-    т.е. прежнее поведение (только landed + КП) сохраняется байт-в-байт. Пустой список =
-    у сделки нет позиций.
+    себестоимость — 1С через фасад ``price_cost``, иначе landed из закупок.
+    Цена клиенту — только подтверждённая ``DealItem.unit_price`` этой строки;
+    NULL остаётся неизвестной ценой, явный ноль сохраняется. ``price_source=quote``
+    сохраняет API-обозначение согласованной цены. История КП и прайс не подставляются.
+    Второй элемент — отсутствие обоих фасадов себестоимости. Пустой список — нет позиций.
     """
     rows = (
         await session.execute(select(DealItem).where(DealItem.deal_id == deal.id))
@@ -1339,19 +1335,6 @@ async def _deal_margin(
     }
     codes = sorted({skus[r.sku_id].code for r in rows if r.sku_id in skus})
 
-    # Последняя цена клиенту (КП) по (sku_code, counterparty) — как ``_price_summary``.
-    last_price: dict[str, float] = {}
-    if codes:
-        quotes = (
-            await session.execute(
-                select(PriceQuote)
-                .where(PriceQuote.counterparty == deal.counterparty, PriceQuote.sku_code.in_(codes))
-                .order_by(PriceQuote.id)
-            )
-        ).scalars().all()
-        for q in quotes:
-            last_price[q.sku_code] = float(q.price)  # перезаписываем — побеждает последняя
-
     # Цена/себес из 1С через фасад ядра (приоритетный источник). None → фасад не подключён.
     pc_map: dict[str, ItemPriceCost] = {}
     if pc_facade is not None and codes:
@@ -1370,12 +1353,10 @@ async def _deal_margin(
         qty = float(r.qty)
         pc = pc_map.get(code)
 
-        # Цена клиенту: КП перекрывает всё; иначе дефолт из прайса 1С (с пометкой источника).
-        quote_price = float(r.unit_price) if r.unit_price is not None else last_price.get(code)
+        # Только подтверждённая цена этой строки; NULL не заменяется котировкой или прайсом.
+        quote_price = float(r.unit_price) if r.unit_price is not None else None
         if quote_price is not None:
             price, price_source = quote_price, "quote"
-        elif pc is not None and pc.price_byn is not None:
-            price, price_source = pc.price_byn, pc.source  # onec / demo
         else:
             price, price_source = None, None
 
@@ -1465,13 +1446,10 @@ async def deal_margin(
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
     access: DealAccess = Depends(get_deal_access),
 ):
-    """Факт-маржа сделки: цена из ``PriceQuote`` × qty минус landed × qty (по позициям).
+    """Маржа по подтверждённым ценам строк сделки и доступной себестоимости.
 
-    Цена — последняя котировка клиенту (``PriceQuote(sku_code, counterparty)``); себес —
-    через фасад ``core.services.landed_cost.last_landed_cost_batch`` (модуль procurement,
-    результат закрытой партии). Деградация honest: фасад ``None`` → ``cogs_landed=None`` +
-    причина; позиции без цены/себеса в gross НЕ попадают (``no_price``/``no_cost``).
-    Методику установки цены НЕ изобретаем — отдаём ФАКТ-маржу где данные уже есть.
+    Неизвестная цена остаётся no_price, без подстановки исторического КП или прайса.
+    Агрегаты содержат только priced-позиции; priced_count/total_count показывают покрытие.
     """
     deal = await visible_deal_or_404(session, deal_id, access)
 
