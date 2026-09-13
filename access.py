@@ -9,12 +9,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from fastapi import Depends, HTTPException, Request
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.access import is_super
 from config.settings import get_settings
-from core.domain.models import User
+from core.domain.models import Counterparty, User
 from core.runtime.deps import get_session
 from core.services.auth import CurrentUser, get_current_user
 from core.services.crm_owners import resolve_crm_owner
@@ -79,6 +79,22 @@ async def get_deal_access(
 def scope_deals(stmt, access: DealAccess):
     """Append the server-side owner predicate for a list/aggregate query."""
     return stmt.where(Deal.owner_id == access.employee_id) if access.own_only else stmt
+
+
+def unique_counterparty_names():
+    """Keep the same fail-closed name resolution as deal contact endpoints."""
+    return select(Counterparty.name).group_by(Counterparty.name).having(
+        func.count(Counterparty.id) == 1,
+    ).correlate(None)
+
+
+def scope_counterparties(stmt, access: DealAccess):
+    if not access.own_only:
+        return stmt
+    return stmt.where(
+        Counterparty.name.in_(scope_deals(select(Deal.counterparty), access)),
+        Counterparty.name.in_(unique_counterparty_names()),
+    )
 
 
 def scope_calls(stmt, access: DealAccess):
@@ -204,6 +220,8 @@ _OWN_ROUTE_NAMES = frozenset(
         "update_deal_item",
         "delete_deal_item",
         "list_contacts",
+        "list_crm_clients",
+        "list_crm_contacts",
         "add_contact",
         "set_primary_contact",
         "list_chats",

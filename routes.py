@@ -9,9 +9,9 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from sqlalchemy import delete, func, select
+from sqlalchemy import case, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,7 +37,9 @@ from modules.sales.access import (
     locked_call_for_write,
     resolve_owner_assignment,
     scope_calls,
+    scope_counterparties,
     scope_deals,
+    unique_counterparty_names,
     visible_call_or_404,
     visible_deal_or_404,
     visible_deal_or_none,
@@ -2617,6 +2619,69 @@ async def delete_deal_item(
     await visible_deal_or_404(session, item.deal_id, access)
     await session.delete(item)
     await session.commit()
+
+
+def _directory_deal_id(access: DealAccess):
+    # A name shared by several MDM records cannot identify a safe deal link,
+    # even for all-scope users. Never choose the first ambiguous company.
+    return case(
+        (Counterparty.name.in_(unique_counterparty_names()),
+         scope_deals(select(func.min(Deal.id)).where(
+             Deal.counterparty == Counterparty.name,
+         ), access).correlate(Counterparty).scalar_subquery()),
+        else_=None,
+    ).label("deal_id")
+
+
+@router.get("/clients")
+async def list_crm_clients(
+    q: str = Query(default="", max_length=120),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+) -> dict:
+    stmt = scope_counterparties(select(
+        Counterparty.id, Counterparty.name, Counterparty.unp, Counterparty.is_active,
+        _directory_deal_id(access),
+    ), access)
+    if query := q.strip():
+        stmt = stmt.where(or_(
+            Counterparty.name.icontains(query, autoescape=True),
+            Counterparty.unp.icontains(query, autoescape=True),
+        ))
+    total = await session.scalar(select(func.count()).select_from(stmt.subquery()))
+    rows = (await session.execute(stmt.order_by(Counterparty.name, Counterparty.id)
+                                  .offset(offset).limit(limit))).mappings().all()
+    return {"rows": [dict(row) for row in rows], "total": total}
+
+
+@router.get("/contacts")
+async def list_crm_contacts(
+    q: str = Query(default="", max_length=120),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+) -> dict:
+    stmt = scope_counterparties(select(
+        Contact.id, Contact.full_name, Contact.phone, Contact.email, Contact.is_primary,
+        Counterparty.id.label("counterparty_id"), Counterparty.name.label("counterparty_name"),
+        _directory_deal_id(access),
+    ).join(Counterparty, Counterparty.id == Contact.counterparty_id), access)
+    if query := q.strip():
+        stmt = stmt.where(or_(
+            Contact.full_name.icontains(query, autoescape=True),
+            Contact.phone.icontains(query, autoescape=True),
+            Contact.email.icontains(query, autoescape=True),
+            Counterparty.name.icontains(query, autoescape=True),
+        ))
+    total = await session.scalar(select(func.count()).select_from(stmt.subquery()))
+    rows = (await session.execute(stmt.order_by(Contact.full_name, Contact.id)
+                                  .offset(offset).limit(limit))).mappings().all()
+    return {"rows": [dict(row) for row in rows], "total": total}
 
 
 @router.get("/deals/{deal_id}/contacts", response_model=list[ContactOut])
