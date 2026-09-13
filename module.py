@@ -19,7 +19,9 @@ from modules.sales import (
     invoice_notification_routes,
     invoice_reconciliation,
     invoice_settlements,
+    mail_inbound,
     mail_routes,
+    mail_routing,
     routes,
     telegram,
 )
@@ -72,6 +74,8 @@ class SalesModule(ModuleContract):
         core.include_router(invoice_cancellation.router, prefix=self.api_prefix)
         core.include_router(invoice_notification_routes.router, prefix=self.api_prefix)
         core.include_router(mail_routes.router, prefix=self.api_prefix)
+        core.include_router(mail_routing.router, prefix=self.api_prefix)
+        core.include_router(mail_inbound.router)
         email_worker = EmailWorker(core.services)
         core.on_startup(email_worker.start)
         core.on_shutdown(email_worker.stop)

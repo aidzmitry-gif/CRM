@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from email import policy
 from email.message import EmailMessage
@@ -37,12 +37,13 @@ def digest(value: bytes) -> str:
 
 @dataclass(frozen=True)
 class Attachment:
-    document_id: int
-    version: int
+    document_id: int | None
+    version: int | None
     number: str
     source_sha256: str
     filename: str
     content: bytes
+    content_type: str = "application/pdf"
 
     def metadata(self) -> dict:
         return {
@@ -51,10 +52,70 @@ class Attachment:
             "number": self.number,
             "source_sha256": self.source_sha256,
             "filename": self.filename,
-            "content_type": "application/pdf",
+            "content_type": self.content_type,
             "size": len(self.content),
             "sha256": digest(self.content),
         }
+
+
+@dataclass(frozen=True)
+class ReplyContext:
+    receipt_id: str
+    raw_sha256: str
+    message_id: str | None
+    references: tuple[str, ...]
+
+
+def request_fingerprint(
+    *,
+    deal_id: int,
+    sender: str,
+    to: list[str],
+    cc: list[str],
+    subject: str,
+    body: str,
+    attachments: list[dict],
+    reply: ReplyContext | None = None,
+) -> str:
+    """Hash user input and immutable attachment identity.
+
+    Rendered PDF bytes are intentionally excluded for issued documents: the
+    renderer may add volatile metadata. Uploaded bytes are represented by
+    their source hash, filename, type, and order.
+    """
+    relevant = []
+    for metadata in attachments:
+        item = {
+            key: metadata.get(key)
+            for key in (
+                "document_id",
+                "version",
+                "number",
+                "source_sha256",
+                "filename",
+                "content_type",
+            )
+        }
+        if metadata.get("document_id") is None:
+            item["size"] = metadata.get("size")
+            item["sha256"] = metadata.get("sha256")
+        relevant.append(item)
+    return digest(
+        json.dumps(
+            {
+                "deal": deal_id,
+                "sender": sender,
+                "to": to,
+                "cc": cc,
+                "subject": subject,
+                "body": body,
+                "attachments": relevant,
+                **({"reply": asdict(reply)} if reply is not None else {}),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode()
+    )
 
 
 def audit(session, email, action: str, actor: str = "", **detail) -> None:
@@ -80,6 +141,8 @@ async def prepare(
     subject: str,
     body: str,
     attachments: list[Attachment],
+    fingerprint_body: str | None = None,
+    reply: ReplyContext | None = None,
 ) -> OutgoingEmail:
     try:
         sender = address(sender)
@@ -92,34 +155,35 @@ async def prepare(
         or any(ord(c) < 32 or ord(c) == 127 for c in subject)
     ):
         raise HTTPException(422, "Некорректная тема письма")
-    if len(body) > 10000 or not 1 <= len(attachments) <= 10:
+    if len(body) > 11000 or not 0 <= len(attachments) <= 10:
         raise HTTPException(422, "Недопустимый размер письма или количество документов")
     if sum(len(a.content) for a in attachments) > 14 * 1024 * 1024:
-        raise HTTPException(413, "Общий размер PDF превышает 14 МиБ")
+        raise HTTPException(413, "Общий размер вложений превышает 14 МиБ")
+    if not body.strip() and not attachments:
+        raise HTTPException(422, "Укажите текст письма или хотя бы одно вложение")
     if any(
-        not a.content.startswith(b"%PDF-") or any(c in a.filename for c in "\r\n/\\")
+        any(ord(c) < 32 or ord(c) == 127 for c in a.filename)
+        or any(c in a.filename for c in "\r\n/\\")
         for a in attachments
     ):
-        raise HTTPException(422, "Некорректное PDF-вложение")
+        raise HTTPException(422, "Некорректное имя вложения")
+    for attachment in attachments:
+        from modules.sales.mail_attachments import validate_content
+
+        # Issued originals were rendered and checked by mail_documents.  Their
+        # rendered byte length is deliberately not part of idempotency and they
+        # must not be sent through the upload-only structural PDF validator.
+        validate_content(attachment.content, attachment.content_type, uploaded=attachment.document_id is None)
     metadata = [a.metadata() for a in attachments]
-    # PDF engines may add volatile metadata: idempotency is based on immutable
-    # source hashes, not the bytes of a redundant conversion.
-    fingerprint = digest(
-        json.dumps(
-            {
-                "deal": deal_id,
-                "sender": sender,
-                "to": to,
-                "cc": cc,
-                "subject": subject,
-                "body": body,
-                "documents": [
-                    {k: m[k] for k in ("document_id", "version", "source_sha256")} for m in metadata
-                ],
-            },
-            sort_keys=True,
-            ensure_ascii=False,
-        ).encode()
+    fingerprint = request_fingerprint(
+        deal_id=deal_id,
+        sender=sender,
+        to=to,
+        cc=cc,
+        subject=subject,
+        body=body if fingerprint_body is None else fingerprint_body,
+        attachments=metadata,
+        reply=reply,
     )
     existing = await session.scalar(
         select(OutgoingEmail).where(
@@ -139,10 +203,18 @@ async def prepare(
         msg["Cc"] = ", ".join(cc)
     msg["Subject"], msg["Message-ID"] = subject, message_id
     msg["Date"] = format_datetime(created.replace(tzinfo=timezone.utc))
+    if reply is not None and reply.message_id:
+        msg["In-Reply-To"] = reply.message_id
+        references = list(dict.fromkeys((*reply.references, reply.message_id)))[-50:]
+        msg["References"] = " ".join(references)
     msg.set_content(body)
     for attachment in attachments:
+        maintype, subtype = attachment.content_type.split("/", 1)
         msg.add_attachment(
-            attachment.content, maintype="application", subtype="pdf", filename=attachment.filename
+            attachment.content,
+            maintype=maintype,
+            subtype=subtype,
+            filename=attachment.filename,
         )
     mime = msg.as_bytes()
     if len(mime) > MAX_MESSAGE_BYTES:
@@ -163,6 +235,7 @@ async def prepare(
         mime=mime,
         mime_sha256=digest(mime),
         message_id=message_id,
+        reply_to_receipt_id=reply.receipt_id if reply else None,
         status="prepared",
         attempt_count=0,
         round_attempts=0,

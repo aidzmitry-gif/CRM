@@ -2,13 +2,92 @@
 
 from __future__ import annotations
 
+import os
 import re
 import smtplib
 import ssl
+import stat
 from dataclasses import dataclass, field
+from pathlib import Path
 
 MAX_MESSAGE_BYTES = 20 * 1024 * 1024  # includes MIME/base64 overhead
 MAX_RECIPIENTS = 10
+_SALES_ENV = {
+    "host": "AIOS_SALES_SMTP_HOST",
+    "port": "AIOS_SALES_SMTP_PORT",
+    "user": "AIOS_SALES_SMTP_USER",
+    "sender": "AIOS_SALES_SMTP_FROM",
+    "tls": "AIOS_SALES_SMTP_TLS",
+    "password_file": "AIOS_SALES_SMTP_PASSWORD_FILE",
+}
+
+
+@dataclass(frozen=True)
+class SalesSMTPConfig:
+    host: str
+    port: int
+    user: str
+    password: str
+    sender: str
+    tls: bool
+
+
+def _read_private_password(path_value: str) -> str:
+    path = Path(path_value).expanduser()
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise ValueError("Файл пароля SMTP недоступен") from exc
+    if not stat.S_ISREG(info.st_mode) or path.is_symlink() or info.st_size > 4096:
+        raise ValueError("Файл пароля SMTP должен быть закрытым обычным файлом")
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o077:
+        raise ValueError("Файл пароля SMTP должен быть доступен только владельцу")
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("Файл пароля SMTP недоступен") from exc
+
+
+def _parse_bool(value: str) -> bool:
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("Некорректный dedicated SMTP TLS-параметр")
+
+
+def sales_smtp_config(settings) -> SalesSMTPConfig:
+    """Resolve sales-only SMTP overrides without mutating global settings."""
+    present = {key: os.environ[name] for key, name in _SALES_ENV.items() if name in os.environ}
+    if not present:
+        return SalesSMTPConfig(
+            host=str(settings.smtp_host or ""),
+            port=int(settings.smtp_port),
+            user=str(settings.smtp_user or ""),
+            password=str(settings.smtp_password or ""),
+            sender=str(settings.smtp_from or ""),
+            tls=bool(settings.smtp_tls),
+        )
+    if set(present) != set(_SALES_ENV):
+        raise ValueError("Dedicated SMTP для продаж настроен не полностью")
+    try:
+        port = int(present["port"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Некорректный dedicated SMTP порт") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("Некорректный dedicated SMTP порт")
+    password_file = present["password_file"].strip()
+    if not password_file:
+        raise ValueError("Файл пароля SMTP не настроен")
+    return SalesSMTPConfig(
+        host=present["host"].strip(),
+        port=port,
+        user=present["user"].strip(),
+        password=_read_private_password(password_file),
+        sender=present["sender"].strip(),
+        tls=_parse_bool(present["tls"]),
+    )
 
 
 def address(value: str) -> str:
@@ -54,15 +133,19 @@ def recipients(to: list[str], cc: list[str]) -> tuple[list[str], list[str]]:
     return output[0], output[1]
 
 
-def configured_sender(settings) -> str:
-    if not settings.smtp_host:
+def _configured_sender(config: SalesSMTPConfig) -> str:
+    if not config.host:
         raise ValueError("Корпоративный SMTP не настроен")
-    sender = address(settings.smtp_from)
+    sender = address(config.sender)
     if sender.endswith("@aios.local"):
         raise ValueError("Корпоративный отправитель не настроен")
-    if not settings.smtp_tls and settings.smtp_host not in {"127.0.0.1", "::1", "localhost"}:
+    if not config.tls and config.host not in {"127.0.0.1", "::1", "localhost"}:
         raise ValueError("Для корпоративного SMTP требуется TLS")
     return sender
+
+
+def configured_sender(settings) -> str:
+    return _configured_sender(sales_smtp_config(settings))
 
 
 @dataclass(frozen=True)
@@ -86,36 +169,40 @@ def submit(settings, sender: str, targets: list[str], mime: bytes) -> SMTPResult
     """
     if len(mime) > MAX_MESSAGE_BYTES:
         return SMTPResult("failed", "message_too_large")
+    try:
+        config = sales_smtp_config(settings)
+    except ValueError:
+        return SMTPResult("failed", "configuration_error")
     smtp = None
     data_started = False
     rcpts: dict[str, int] = {}
     try:
-        if configured_sender(settings) != sender:
+        if _configured_sender(config) != sender:
             return SMTPResult("failed", "sender_configuration_changed")
         address(sender)
         for target in targets:
             address(target)
         if not targets:
             return SMTPResult("failed", "invalid_recipient")
-        if settings.smtp_port == 465:
+        if config.port == 465:
             smtp = smtplib.SMTP_SSL(
-                settings.smtp_host,
-                settings.smtp_port,
+                config.host,
+                config.port,
                 timeout=15,
                 context=ssl.create_default_context(),
             )
         else:
-            smtp = smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=15)
+            smtp = smtplib.SMTP(config.host, config.port, timeout=15)
         code, _ = smtp.ehlo()
         if code != 250:
             return _refused(code, "greeting_rejected")
-        if settings.smtp_tls and settings.smtp_port != 465:
+        if config.tls and config.port != 465:
             smtp.starttls(context=ssl.create_default_context())
             code, _ = smtp.ehlo()
             if code != 250:
                 return _refused(code, "greeting_rejected")
-        if settings.smtp_user:
-            smtp.login(settings.smtp_user, settings.smtp_password)
+        if config.user:
+            smtp.login(config.user, config.password)
         limit = smtp.esmtp_features.get("size", "")
         if limit.isdigit() and int(limit) > 0 and len(mime) > int(limit):
             return SMTPResult("failed", "server_size_limit")
