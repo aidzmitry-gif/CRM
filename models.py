@@ -16,10 +16,12 @@ from sqlalchemy import (
     event,
     func,
     inspect,
+    select,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db.base import Base
+from modules.sales.invoice_notifications import InvoiceNotification  # noqa: F401
 from modules.sales.mail_models import EmailAttempt, OutgoingEmail  # noqa: F401
 
 
@@ -118,6 +120,27 @@ class DealItem(Base):
     qty: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("1"), server_default="1")
 
 
+class DealItemRequest(Base):
+    """Durable append receipt; item deletion must not reopen the request key."""
+    __tablename__ = "deal_item_request"
+    __table_args__ = {"schema": "sales"}
+
+    request_key: Mapped[str] = mapped_column(String(36), primary_key=True)
+    deal_id: Mapped[int] = mapped_column(ForeignKey("sales.deal.id"), index=True)
+    request_hash: Mapped[str] = mapped_column(String(64))
+    result: Mapped[dict] = mapped_column(JSON)
+    actor: Mapped[str] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+def reject_item_request_change(*args):
+    raise ValueError("Item append receipt is immutable")
+
+
+event.listen(DealItemRequest, "before_update", reject_item_request_change)
+event.listen(DealItemRequest, "before_delete", reject_item_request_change)
+
+
 class DealDocument(Base):
     """Документ сделки — счёт / договор / заказ — и его запись в 1С (часть 9).
 
@@ -140,7 +163,7 @@ class DealDocument(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     posted_at: Mapped[datetime | None] = mapped_column(DateTime)
     # SALES-51: резерв под счёт/заказ + срок действия счёта (valid_until = +AIOS_INVOICE_VALID_DAYS дн.).
-    # reserve_status: none → reserved → consumed (оплата) | released (истёк/снят).
+    # reserve_status: none → reserved → consumed (отгрузка) | released (истёк/снят).
     valid_until: Mapped[date | None] = mapped_column(Date)
     reserve_status: Mapped[str] = mapped_column(String(16), default="none", server_default="none")
     reserved_at: Mapped[datetime | None] = mapped_column(DateTime)
@@ -164,7 +187,7 @@ class DealDocument(Base):
     original_html: Mapped[str | None] = mapped_column(Text)
     content_sha256: Mapped[str | None] = mapped_column(String(64))
     issued_at: Mapped[datetime | None] = mapped_column(DateTime)
-    issued_by: Mapped[str | None] = mapped_column(String(128))
+    issued_by: Mapped[str | None] = mapped_column(String(200))
 
     @property
     def original_state(self) -> str:
@@ -175,6 +198,13 @@ class DealDocument(Base):
         if self.status in {"posted", "paid", "cancelled"}:
             return "legacy_unavailable"
         return "draft"
+
+    @property
+    def reserve_mode(self) -> str | None:
+        snapshot = self.snapshot_json
+        if self.kind == "invoice" and isinstance(snapshot, dict) and snapshot.get("issuance_mode") == "erp_issuance_v1":
+            return snapshot.get("reserve_mode", "stock")
+        return None
 
 
 class DocumentPackage(Base):
@@ -246,6 +276,26 @@ class PriceQuote(Base):
     counterparty: Mapped[str] = mapped_column(String(255), default="", server_default="")
     price: Mapped[Decimal] = mapped_column(Numeric(14, 2))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class PriceQuoteRequest(Base):
+    """Immutable acknowledgement retained independently of the price history row."""
+
+    __tablename__ = "price_quote_request"
+    __table_args__ = {"schema": "sales"}
+    request_key: Mapped[str] = mapped_column(String(36), primary_key=True)
+    request_hash: Mapped[str] = mapped_column(String(64))
+    result: Mapped[dict] = mapped_column(JSON)
+    actor: Mapped[str] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+def reject_price_request_change(*args):
+    raise ValueError("Price quote receipt is immutable")
+
+
+event.listen(PriceQuoteRequest, "before_update", reject_price_request_change)
+event.listen(PriceQuoteRequest, "before_delete", reject_price_request_change)
 
 
 class LossReason(Base):
@@ -453,6 +503,29 @@ _IMMUTABLE_DOCUMENT_FIELDS = (
 @event.listens_for(DealDocument, "before_update")
 def _protect_document_original(mapper, connection, target):
     state = inspect(target)
+    status_history = state.attrs.status.history
+    if status_history.has_changes() or state.attrs.reserve_status.history.has_changes():
+        from modules.sales.invoice_cancellation import InvoiceCancellationReceipt
+        prior_status = connection.scalar(select(DealDocument.status).where(DealDocument.id == target.id))
+        if prior_status == "cancelled" and connection.scalar(select(InvoiceCancellationReceipt.id).where(
+                InvoiceCancellationReceipt.document_id == target.id)):
+            raise ValueError("Confirmed invoice cancellation is terminal")
+    confirmed_cancel = False
+    if status_history.has_changes() and target.status == "cancelled":
+        from modules.sales.invoice_cancellation import orm_cancellation_receipt
+        confirmed_cancel = orm_cancellation_receipt(connection, target)
+        from modules.sales.invoice_issuance import InvoiceIssuanceReceipt
+        if not confirmed_cancel and connection.scalar(select(InvoiceIssuanceReceipt.document_id).where(
+                InvoiceIssuanceReceipt.document_id == target.id)):
+            raise ValueError("ERP invoice requires the atomic cancellation workflow")
+        from modules.sales.invoice_settlements import receipt_query
+
+        if not confirmed_cancel and connection.scalar(receipt_query(target.id)):
+            raise ValueError("Счёт с подтверждённым поступлением требует сверки полного возврата до аннулирования")
+    if not confirmed_cancel and status_history.has_changes() and target.status != "paid" and connection.scalar(
+        select(DealDocument.status).where(DealDocument.id == target.id)
+    ) == "paid":
+        raise ValueError("Оплаченный счёт нельзя аннулировать или сбросить его оплату без подтверждённого возврата")
     history = state.attrs.original_html.history
     prior_html = history.deleted[0] if history.deleted else target.original_html
     # First capture is allowed; every later content update must use another row.

@@ -53,6 +53,11 @@ async def get_deal_access(
     # no CRM data and must stay usable before the database is reachable.
     if request.url.path == "/sales/ping":
         return DealAccess("all")
+    return await get_deal_access_for_user(session, user)
+
+
+async def get_deal_access_for_user(session: AsyncSession, user: CurrentUser) -> DealAccess:
+    """The existing persistent scope, without HTTP liveness bypass."""
     if is_super(user.roles):
         return DealAccess("all")
 
@@ -61,7 +66,8 @@ async def get_deal_access(
         if user.keycloak_user_id
         else User.username == user.username
     )
-    app_user = (await session.execute(select(User).where(identity_filter))).scalar_one_or_none()
+    app_user = (await session.execute(select(User).where(identity_filter)
+        .execution_options(populate_existing=True))).scalar_one_or_none()
     if app_user is None:
         if not user.keycloak_user_id and get_settings().auth_mode == "dev":
             return DealAccess("all")
@@ -149,6 +155,7 @@ async def resolve_owner_assignment(
 _OWN_ROUTE_NAMES = frozenset(
     {
         "board",
+        "shipping_association_preview", "shipping_association_confirm", "shipping_envelope_prepare",
         "pipeline_analytics",
         "pipeline_stage_metrics",
         "list_deals",
@@ -175,6 +182,7 @@ _OWN_ROUTE_NAMES = frozenset(
         "list_chats",
         "list_documents",
         "create_document",
+        "preview_invoice",
         "prepare_contract", "revise_document", "update_document_draft", "issue_document",
         "decide_document", "render_document", "document_snapshot", "render_package",
         "render_saved_package", "send_package", "preview_document",

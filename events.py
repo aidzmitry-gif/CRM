@@ -138,9 +138,13 @@ async def on_payment_paid(payload: dict, ctx) -> None:
         return
     if payload.get("document_version") and payload["document_version"] != doc.version:
         return
+    if doc.status == "cancelled":
+        # Keep the durable source event pending for reconciliation. A late
+        # payment cannot resurrect an invoice or its released reservation.
+        raise ValueError("Payment for a cancelled invoice requires reconciliation")
     doc.status = "paid"
-    if doc.reserve_status == "reserved":
-        doc.reserve_status = "consumed"
+    # Payment is not a warehouse issue. Keep the reservation until the exact
+    # shipment consumes it; paid invoices are excluded from expiry release.
     logger.info("Sales: документ %s помечен оплаченным", doc.number)
 
 

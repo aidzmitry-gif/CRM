@@ -9,8 +9,9 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import ValidationError
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +30,7 @@ from core.services.approvals import ApprovalOut, ApprovalRequest
 from core.services.auth import CurrentUser, get_current_user, require_permission
 from core.services.price_cost import ItemPriceCost
 from modules.sales import documents as originals
+from modules.sales import invoice_issuance as erp_issuance
 from modules.sales._money_words import money_words
 from modules.sales.access import (
     DealAccess,
@@ -47,6 +49,12 @@ from modules.sales.ai import (
     objection_hint,
     static_call_script,
     summarize,
+)
+from modules.sales.invoice_late_reservation import (
+    LateReservationInput,
+    LateReservationPreviewInput,
+    preview_later,
+    reserve_later,
 )
 from modules.sales.kpi_facts import (
     BOARD_EXTRA_TARGETS,
@@ -110,6 +118,9 @@ from modules.sales.schemas import (
     DocumentRevision,
     FunnelOut,
     HandoffItem,
+    InvoiceCreate,
+    InvoiceIssueInput,
+    InvoicePreviewInput,
     JournalRowOut,
     KpiOut,
     LoseRequest,
@@ -148,6 +159,7 @@ from modules.sales.schemas import (
     TaskUpdate,
     TelephonyEventIn,
 )
+from modules.sales.shipping_producer import router as shipping_router
 from modules.sales.stages import (
     DEFAULT_FUNNEL,
     FUNNELS,
@@ -158,6 +170,7 @@ from modules.sales.stages import (
 )
 
 router = APIRouter(tags=["sales"], dependencies=[Depends(deny_unscoped_own_routes)])
+router.include_router(shipping_router)
 # Лиды (вход воронки) — отдельный роутер. Монтируется и на /leads (фронт бьёт туда), и на
 # /sales/leads (back-compat). Полный вынос в modules/leads — Шаг 2 ТЗ принятия выноса лидов.
 leads_router = APIRouter(tags=["leads"])
@@ -762,6 +775,10 @@ async def create_stage(
     if exists is not None:
         raise HTTPException(status_code=409, detail="Стадия с таким кодом уже есть")
     stage = Stage(**payload.model_dump())
+    if stage.kind == "lost" and stage.is_active and await session.scalar(
+        select(Deal.id).where(Deal.funnel == stage.funnel, Deal.stage == stage.code).limit(1)
+    ):
+        raise HTTPException(409, "Cannot reclassify a populated stage as lost")
     session.add(stage)
     await session.commit()
     return stage
@@ -780,6 +797,8 @@ async def update_stage(
     ).scalars().first()
     if stage is None:
         raise HTTPException(status_code=404, detail="Стадия не найдена")
+    from modules.sales.deal_loss import guard_stage_definition
+    await guard_stage_definition(session, stage, payload.model_dump(exclude_unset=True))
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(stage, field, value)
     await session.commit()
@@ -798,6 +817,8 @@ async def delete_stage(
     ).scalars().first()
     if stage is None:
         raise HTTPException(status_code=404, detail="Стадия не найдена")
+    if stage.is_active and await session.scalar(select(Deal.id).where(Deal.funnel == stage.funnel).limit(1)):
+        raise HTTPException(409, "Populated funnel semantics require an explicit migration")
     in_use = (
         await session.execute(select(func.count()).select_from(Deal).where(Deal.stage == code))
     ).scalar()
@@ -1233,8 +1254,10 @@ async def update_deal(
     """Частично обновить сделку. Смена стадии (drag&drop) пишется в историю и
     обновляет ``stage_changed_at`` через единый хелпер ``record_stage`` (SALES-43)."""
     repo = DealRepository(session)
-    deal = await visible_deal_or_404(session, deal_id, access)
+    from modules.sales.deal_loss import guard_patch, lock_mutation
+    deal, access, user = await lock_mutation(session, deal_id, access, core, user)
     data = payload.model_dump(exclude_unset=True)
+    await guard_patch(session, deal, data)
     if access.own_only:
         # Check a supplied value before overwriting it with self: otherwise a
         # client could attempt reassignment and receive a misleading success.
@@ -2259,53 +2282,26 @@ async def loss_reasons(session: AsyncSession = Depends(get_session)):
     ).scalars().all()
 
 
-@router.post("/deals/{deal_id}/lose", response_model=DealRead)
+@router.post("/deals/{deal_id}/lose")
 async def lose_deal(
     deal_id: int,
     payload: LoseRequest,
+    expected_principal: str = Header(..., alias="X-Expected-Principal", min_length=1, max_length=200),
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
     user: CurrentUser = Depends(get_current_user),
     _: object = Depends(require_permission("sales.deal.write")),
     access: DealAccess = Depends(get_deal_access),
 ):
-    """Закрыть сделку в отказ с обязательной причиной (SALES-40).
-
-    Причина обязательна; если справочник заполнен — должна быть активным кодом.
-    Ставит lost-стадию воронки сделки (через ``record_stage`` → история +
-    ``stage_changed_at``), дату закрытия и публикует ``sales.deal.lost`` (→ audit).
-
-    Как и в win_deal (Фикс 1, цикл 18): lost-код резолвится по воронке сделки, а не
-    литералом "lost" — для repeat_clients/tenders это rp_lost/tn_lost; литерал "lost"
-    не входит ни в одну их колонку и сделка пропадала бы с доски."""
-    deal = await visible_deal_or_404(session, deal_id, access)
-    kind_map = await _stage_kind_map(session, deal.funnel)
-    lost_code = next((code for code, kind in kind_map.items() if kind == "lost"), "lost")
-    if deal.stage == lost_code:
-        raise HTTPException(status_code=409, detail="Сделка уже закрыта в отказ")
-    code = (payload.reason_code or "").strip()
-    if not code:
-        raise HTTPException(status_code=422, detail="Нужна причина отказа")
-    active_codes = set(
-        (await session.execute(select(LossReason.code).where(LossReason.active))).scalars().all()
-    )
-    if active_codes and code not in active_codes:
-        raise HTTPException(status_code=422, detail="Неизвестная причина отказа")
-
-    deal.lost_reason_code = code
-    deal.lost_comment = payload.comment
-    deal.closed_date = date.today().strftime("%d.%m.%Y")
-    record_stage(session, deal, lost_code, by=user.username)
-    core.event_bus.emit(
-        session,
-        "sales.deal.lost",
-        {
-            "deal_id": deal.id, "number": deal.number, "reason_code": code,
-            "amount": float(deal.amount), "owner": deal.owner, "entity_ref": f"deal:{deal.id}",
-        },
-    )
-    await session.commit()
-    return deal
+    """Submit a durable loss request; response is a request/receipt envelope."""
+    from modules.sales.deal_loss import request_loss
+    try:
+        result = await request_loss(session, core, user, access, deal_id, payload, expected_principal)
+        await session.commit()
+        return result
+    except Exception:
+        await session.rollback()
+        raise
 
 
 @router.post("/deals/{deal_id}/win", response_model=DealRead)
@@ -2324,7 +2320,9 @@ async def win_deal(
     "won" — для repeat_clients/tenders это rp_won/tn_won; литерал "won" не входит ни в одну
     их колонку и после перезагрузки сделка пропадала с доски.
     """
-    deal = await visible_deal_or_404(session, deal_id, access)
+    from modules.sales.deal_loss import assert_not_pending, lock_mutation
+    deal, access, user = await lock_mutation(session, deal_id, access, core, user)
+    await assert_not_pending(session, deal_id)
     kind_map = await _stage_kind_map(session, deal.funnel)
     won_code = next((code for code, kind in kind_map.items() if kind == "won"), "won")
     if deal.stage == won_code:
@@ -2445,6 +2443,9 @@ async def create_deal(
     access: DealAccess = Depends(get_deal_access),
 ):
     """Создать сделку и опубликовать доменное событие через шину ядра."""
+    from modules.sales.deal_loss import kind_map
+    if (await kind_map(session, payload.funnel)).get(payload.stage) == "lost":
+        raise HTTPException(409, "Create an open deal before requesting loss")
     try:
         data = payload.model_copy(deep=True)
         data.owner_id, owner_name = await resolve_owner_assignment(session, access, data.owner_id)
@@ -2571,19 +2572,49 @@ async def add_deal_item(
     access: DealAccess = Depends(get_deal_access),
 ):
     """Добавить позицию номенклатуры в сделку (подбор из SKU, sales-12)."""
-    deal = await visible_deal_or_404(session, deal_id, access)
+    from core.services.shipping_payload import canonical_hash
+    from modules.sales.models import DealItemRequest
+
+    await visible_deal_or_404(session, deal_id, access)
+    await originals.lock_deal(session, deal_id)
+    # Ownership and employee visibility may change while waiting for the lock.
+    from modules.sales.access import get_deal_access_for_user, scope_deals
+
+    current_access = await get_deal_access_for_user(session, _)
+    deal = await session.scalar(scope_deals(select(Deal).where(Deal.id == deal_id), current_access)
+                                .execution_options(populate_existing=True))
+    if deal is None:
+        raise HTTPException(404, "Сделка не найдена")
+    request_hash = canonical_hash({"deal_id": deal_id, "sku_id": payload.sku_id,
+                                   "qty": format(payload.qty, ".2f")})
+    if payload.request_key is not None:
+        prior = await session.get(DealItemRequest, str(payload.request_key), populate_existing=True)
+        if prior is not None:
+            if prior.deal_id != deal_id or prior.request_hash != request_hash:
+                raise HTTPException(409, "Item request key is already used for another command")
+            return DealItemOut.model_validate(prior.result)
     if await session.get(Sku, payload.sku_id) is None:
         raise HTTPException(status_code=404, detail="Номенклатура не найдена")
     item = DealItem(deal_id=deal_id, sku_id=payload.sku_id, qty=Decimal(str(payload.qty)))
     session.add(item)
     await session.flush()
+    result = await _build_item_out(session, item, deal.counterparty)
+    if payload.request_key is not None:
+        session.add(DealItemRequest(request_key=str(payload.request_key), deal_id=deal_id,
+                                    request_hash=request_hash, result=result.model_dump(mode="json"),
+                                    actor=_.username))
+        try:
+            await session.flush()
+        except IntegrityError as exc:
+            await session.rollback()
+            raise HTTPException(409, "Item request key conflict") from exc
     core.event_bus.emit(
         session,
         "sales.item.changed",
         {"deal_id": deal_id, "action": "added", "entity_ref": f"deal:{deal_id}"},
     )
     await session.commit()
-    return await _build_item_out(session, item, deal.counterparty)
+    return result
 
 
 @router.patch("/deal-items/{item_id}", response_model=DealItemOut)
@@ -2599,6 +2630,8 @@ async def update_deal_item(
     if item is None:
         raise HTTPException(status_code=404, detail="Позиция не найдена")
     await visible_deal_or_404(session, item.deal_id, access)
+    await originals.lock_deal(session, item.deal_id)
+    await session.refresh(item)
     item.qty = Decimal(str(payload.qty))
     deal = await DealRepository(session).get(item.deal_id)
     await session.commit()
@@ -2617,6 +2650,7 @@ async def delete_deal_item(
     if item is None:
         raise HTTPException(status_code=404, detail="Позиция не найдена")
     await visible_deal_or_404(session, item.deal_id, access)
+    await originals.lock_deal(session, item.deal_id)
     await session.delete(item)
     await session.commit()
 
@@ -2793,6 +2827,8 @@ async def list_documents(
 
 
 async def _issue_original(core, session, doc, actor):
+    if doc.kind == "invoice":
+        raise HTTPException(409, "Invoices require explicit ERP preview and issuance payload")
     if core.services.onec is None:
         raise HTTPException(503, "Интеграция 1С не подключена")
     if not doc.original_html:
@@ -2815,14 +2851,54 @@ async def _issue_original(core, session, doc, actor):
     await _post_document_to_1c(core, session, doc, doc.snapshot_json["buyer"].get("name", ""))
 
 
-@router.post("/deals/{deal_id}/documents", response_model=DocumentOut, status_code=201)
-async def create_document(
-    deal_id: int, payload: DocumentCreate,
+@router.post("/deals/{deal_id}/invoice-preview")
+async def preview_invoice(
+    deal_id: int, payload: InvoicePreviewInput,
     core: Core = Depends(get_core), session: AsyncSession = Depends(get_session),
     user: CurrentUser = Depends(require_permission("sales.deal.write")),
     access: DealAccess = Depends(get_deal_access),
 ):
-    """Invoice/order issue immediately; contracts save the exact approval candidate."""
+    return await erp_issuance.preview(session, core, user, access, deal_id, payload)
+
+
+@router.post("/deals/{deal_id}/documents/{document_id}/reservation", status_code=201)
+async def reserve_issued_invoice(
+    deal_id: int, document_id: int, payload: LateReservationInput,
+    core: Core = Depends(get_core), session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
+):
+    try:
+        result = await reserve_later(session, core, user, access, deal_id, document_id, payload)
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+    return JSONResponse(result, status_code=200 if result["replayed"] else 201)
+
+
+@router.post("/deals/{deal_id}/documents/{document_id}/reservation-preview")
+async def preview_issued_invoice_reservation(
+    deal_id: int, document_id: int, payload: LateReservationPreviewInput,
+    core: Core = Depends(get_core), session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
+):
+    result = await preview_later(session, core, user, access, deal_id, document_id, payload)
+    return JSONResponse(result, headers={"Cache-Control": "private, no-store"})
+
+
+@router.post("/deals/{deal_id}/documents", response_model=DocumentOut | dict, status_code=201)
+async def create_document(
+    deal_id: int, payload: InvoiceCreate | DocumentCreate,
+    core: Core = Depends(get_core), session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.write")),
+    access: DealAccess = Depends(get_deal_access),
+):
+    """Invoices use explicit ERP issue; other document kinds retain their contract."""
+    if isinstance(payload, InvoiceCreate):
+        result = await erp_issuance.issue(session, core, user, access, deal_id, payload)
+        return JSONResponse(result, status_code=200 if result["replayed"] else 201)
     deal = await visible_deal_or_404(session, deal_id, access)
     await originals.lock_deal(session, deal_id)
     request = {"deal_id": deal_id, "operation": "create", **payload.model_dump()}
@@ -2859,7 +2935,7 @@ async def revise_document(
     repeated = await originals.retry_document(session, payload.request_key, request)
     if repeated:
         return repeated
-    if old.status not in {"posted", "paid", "cancelled", "rejected"} or old.superseded_by_id:
+    if old.status not in {"issued", "posted", "paid", "cancelled", "rejected"} or old.superseded_by_id:
         raise HTTPException(409, "Новая версия доступна для последнего выпущенного или отклонённого документа")
     target = old
     if old.status == "rejected" and old.supersedes_id:
@@ -2906,12 +2982,25 @@ async def update_document_draft(
     return doc
 
 
-@router.post("/documents/{doc_id}/issue", response_model=DocumentOut)
+@router.post("/documents/{doc_id}/issue", response_model=DocumentOut | dict)
 async def issue_document(
-    doc_id: int, session: AsyncSession = Depends(get_session), core: Core = Depends(get_core),
+    doc_id: int, payload: dict | None = None,
+    session: AsyncSession = Depends(get_session), core: Core = Depends(get_core),
     user: CurrentUser = Depends(require_permission("sales.deal.write")),
     access: DealAccess = Depends(get_deal_access),
 ):
+    # Discover without a row lock: ERP issue acquires org before deal/document.
+    discovered = await session.get(DealDocument, doc_id)
+    if discovered is None:
+        raise HTTPException(404, "Документ не найден")
+    await visible_deal_or_404(session, discovered.deal_id, access)
+    if discovered.kind == "invoice":
+        try:
+            command = InvoiceIssueInput.model_validate(payload or {})
+        except ValidationError as exc:
+            raise HTTPException(422, exc.errors(include_context=False)) from exc
+        result = await erp_issuance.issue(session, core, user, access, discovered.deal_id, command, doc_id)
+        return JSONResponse(result)
     doc = await originals.locked_document(session, doc_id, access)
     if doc.original_html and doc.status in {"posted", "paid", "pending_approval"}:
         return doc
@@ -3538,6 +3627,8 @@ async def preview_document(
     await visible_deal_or_404(session, doc.deal_id, access)
     if doc.status != "draft":
         raise HTTPException(409, "Предпросмотр доступен только для черновика")
+    if doc.kind == "invoice":
+        raise HTTPException(409, "Invoice preview requires explicit ERP pricing and organization payload")
     preview = DealDocument(**{col.name: getattr(doc, col.name) for col in DealDocument.__table__.columns})
     if preview.kind in RESERVES_STOCK:
         preview.valid_until = _utcnow().date() + timedelta(days=int(os.getenv("AIOS_INVOICE_VALID_DAYS", "5")))
@@ -3743,22 +3834,63 @@ async def create_price_quote(
     payload: PriceQuoteCreate,
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.write")),
 ):
     """Зафиксировать котировку цены SKU клиенту (пополняет историю Price Engine)."""
-    session.add(
-        PriceQuote(
-            sku_code=payload.sku_code,
-            counterparty=payload.counterparty,
-            price=Decimal(str(payload.price)),
-        )
-    )
+    from core.services.shipping_payload import canonical_hash
+    from modules.sales.models import PriceQuoteRequest
+
+    request_hash = canonical_hash({"sku_code": payload.sku_code, "counterparty": payload.counterparty,
+                                   "price": format(payload.price, ".2f")})
+    key = str(payload.request_key) if payload.request_key else None
+    if key:
+        previous = await session.get(PriceQuoteRequest, key, populate_existing=True)
+        if previous:
+            if previous.request_hash != request_hash:
+                raise HTTPException(409, "Price quote request key conflict")
+            return previous.result
+    quote = PriceQuote(sku_code=payload.sku_code, counterparty=payload.counterparty, price=payload.price)
+    session.add(quote)
+    await session.flush()
+    result = {"ok": True}
+    if key:
+        result = {"ok": True, "request_key": key, "quote": {"id": quote.id,
+            "sku_code": quote.sku_code, "counterparty": quote.counterparty, "price": format(quote.price, ".2f")}}
+        session.add(PriceQuoteRequest(request_key=key, request_hash=request_hash, result=result, actor=user.username))
+        try:
+            await session.flush()
+        except IntegrityError as exc:
+            # A concurrent identical command may have committed while the unique key waited.
+            # Roll back our provisional quote before returning the winner's acknowledgement.
+            await session.rollback()
+            previous = await session.get(PriceQuoteRequest, key, populate_existing=True)
+            if previous and previous.request_hash == request_hash:
+                return previous.result
+            raise HTTPException(409, "Price quote request key conflict") from exc
     core.event_bus.emit(
         session,
         "sales.price.quoted",
-        {"sku_code": payload.sku_code, "counterparty": payload.counterparty, "price": payload.price},
+        {"sku_code": payload.sku_code, "counterparty": payload.counterparty, "price": float(payload.price)},
     )
     await session.commit()
-    return {"ok": True}
+    return result
+
+
+@router.get("/price-requests/{request_key}")
+async def price_quote_request(request_key: str, session: AsyncSession = Depends(get_session),
+                              user: CurrentUser = Depends(require_permission("sales.deal.read"))):
+    from uuid import UUID
+
+    from modules.sales.models import PriceQuoteRequest
+
+    try:
+        key = str(UUID(request_key))
+    except ValueError as exc:
+        raise HTTPException(422, "A UUID price request key is required") from exc
+    row = await session.get(PriceQuoteRequest, key, populate_existing=True)
+    if row is None:
+        raise HTTPException(404, "Price quote request not found")
+    return row.result
 
 
 @router.post("/deals/{deal_id}/ai/draft-reply", response_model=AiDraftOut)

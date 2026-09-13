@@ -10,7 +10,19 @@ import logging
 
 from core.runtime.contract import ModuleContract, Widget
 from core.runtime.core import Core
-from modules.sales import mail_routes, routes, telegram
+from modules.sales import (
+    accounting_ownership,
+    client_document_register,
+    deal_loss,
+    document_register,
+    invoice_cancellation,
+    invoice_notification_routes,
+    invoice_reconciliation,
+    invoice_settlements,
+    mail_routes,
+    routes,
+    telegram,
+)
 from modules.sales.calls import (
     on_call_answered,
     on_call_ended,
@@ -27,8 +39,13 @@ from modules.sales.events import (
     on_procurement_received,
     on_shipment_delivered,
 )
+from modules.sales.invoice_notifications import (
+    on_invoice_cancelled_notification,
+    on_invoice_expiring_notification,
+)
 from modules.sales.mail_queue import EmailWorker
 from modules.sales.permissions import PERMISSIONS, ROLES
+from modules.sales.reservation_source import SalesReservationSource
 from modules.sales.reserve import tick_invoice_reserve
 from modules.sales.touch_history import SalesTouchHistory
 from modules.sales.workflows import DealApprovalWorkflow
@@ -42,7 +59,18 @@ class SalesModule(ModuleContract):
     api_prefix = "/sales"
 
     def register(self, core: Core) -> None:
+        from modules.sales.shipping_producer import SalesShippingProducer
+
+        core.services.shipping_producer.register("order", SalesShippingProducer(core))
         core.include_router(routes.router, prefix=self.api_prefix)
+        core.include_router(deal_loss.router, prefix=self.api_prefix)
+        core.include_router(document_register.router, prefix=self.api_prefix)
+        core.include_router(client_document_register.router, prefix=self.api_prefix)
+        core.include_router(accounting_ownership.router, prefix=self.api_prefix)
+        core.include_router(invoice_settlements.router, prefix=self.api_prefix)
+        core.include_router(invoice_reconciliation.router, prefix=self.api_prefix)
+        core.include_router(invoice_cancellation.router, prefix=self.api_prefix)
+        core.include_router(invoice_notification_routes.router, prefix=self.api_prefix)
         core.include_router(mail_routes.router, prefix=self.api_prefix)
         email_worker = EmailWorker(core.services)
         core.on_startup(email_worker.start)
@@ -64,6 +92,8 @@ class SalesModule(ModuleContract):
         core.subscribe("procurement.received", on_procurement_received)
         # S3-5: согласованный план РОП → цель скорборда (KpiTarget), не из сида
         core.subscribe("sales.plan.approved", on_plan_approved)
+        core.subscribe("sales.invoice.expiring", on_invoice_expiring_notification)
+        core.subscribe("sales.invoice.cancelled", on_invoice_cancelled_notification)
         # телефония (SALES-50): события коннектора → журнал звонков + push карточки продавцу
         core.subscribe("telephony.call.incoming", on_incoming_call)
         core.subscribe("telephony.call.answered", on_call_answered)
@@ -80,6 +110,7 @@ class SalesModule(ModuleContract):
         # (звонки/сообщения/сделки). Без этого core.services.touch_history=None → карточка
         # без истории (graceful). Реализация не лезет в схему ядра — только читает свою.
         core.services.touch_history = SalesTouchHistory()
+        core.services.sales_source = SalesReservationSource()
         core.on_startup(self._on_startup)
         # SALES-51: периодический шаг — срок/напоминание/аннулирование резерва под счёт
         core.on_tick(tick_invoice_reserve)

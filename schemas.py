@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import datetime
+import re
+from decimal import Decimal
 from typing import Literal
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class DealCreate(BaseModel):
@@ -147,8 +150,9 @@ class DealItemOut(BaseModel):
 class DealItemCreate(BaseModel):
     """Добавить позицию номенклатуры в сделку."""
 
-    sku_id: int
-    qty: float = 1.0
+    sku_id: int = Field(gt=0, strict=True)
+    qty: Decimal = Field(default=Decimal("1.00"), gt=0, max_digits=14, decimal_places=2, allow_inf_nan=False)
+    request_key: UUID | None = None
 
 
 class DealItemUpdate(BaseModel):
@@ -207,9 +211,10 @@ class ChatOut(BaseModel):
 class PriceQuoteCreate(BaseModel):
     """Зафиксировать котировку цены SKU клиенту (Price Engine)."""
 
-    sku_code: str
-    counterparty: str = ""
-    price: float
+    sku_code: str = Field(min_length=1, max_length=64)
+    counterparty: str = Field(default="", max_length=255)
+    price: Decimal = Field(gt=0, max_digits=14, decimal_places=2, allow_inf_nan=False)
+    request_key: UUID | None = None
 
 
 class PriceInfo(BaseModel):
@@ -224,9 +229,85 @@ class PriceInfo(BaseModel):
 class DocumentCreate(BaseModel):
     """Запрос на формирование документа сделки (счёт/договор/заказ)."""
 
-    kind: Literal["invoice", "contract", "order"] = "invoice"
+    kind: Literal["contract", "order"]
     request_key: str | None = Field(default=None, min_length=8, max_length=64)
     requested_by: str = ""  # инициатор (для согласования договора)
+
+
+class InvoicePrice(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    item_id: int = Field(gt=0, strict=True)
+    unit_price_net: str
+    vat_rate: str
+
+    @field_validator("unit_price_net", "vat_rate")
+    @classmethod
+    def exact_money(cls, value, info):
+        if not re.fullmatch(r"\d{1,12}(?:\.\d{1,2})?", value):
+            raise ValueError("Use an exact nonnegative decimal string with at most two decimal places")
+        number = Decimal(value)
+        if info.field_name == "vat_rate" and number > 100:
+            raise ValueError("VAT rate must be between 0 and 100; applicability requires explicit review")
+        return format(number, ".2f")
+
+
+class InvoicePreviewInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    reserve_mode: Literal["stock", "on_order"] = "stock"
+    organization_id: int = Field(gt=0, strict=True)
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    document_date: datetime.date
+    valid_until: datetime.date
+    document_id: int | None = Field(default=None, gt=0, strict=True)
+    pricing: list[InvoicePrice] = Field(min_length=1, max_length=1000)
+    pricing_evidence: str = Field(min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def dated_unique_prices(self):
+        if self.valid_until < self.document_date:
+            raise ValueError("valid_until must not precede document_date")
+        if len({p.item_id for p in self.pricing}) != len(self.pricing):
+            raise ValueError("Each item must have exactly one explicit price")
+        return self
+
+
+class InvoiceAllocation(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    line_no: int = Field(gt=0, strict=True)
+    warehouse: str = Field(min_length=1, max_length=128)
+    qty: str
+
+    @field_validator("qty")
+    @classmethod
+    def exact_quantity(cls, value):
+        if not re.fullmatch(r"\d{1,12}(?:\.\d{1,2})?", value) or Decimal(value) <= 0:
+            raise ValueError("Allocation requires an exact positive decimal string")
+        return format(Decimal(value), ".2f")
+
+
+class InvoiceIssueInput(InvoicePreviewInput):
+    # The target document is in the route, not a second client-selected identity.
+    document_id: None = None
+    request_key: str = Field(min_length=8, max_length=64)
+    expected_document_version: int = Field(gt=0, strict=True)
+    expected_basis_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    allocations: list[InvoiceAllocation] = Field(max_length=1000)
+    evidence: str | None = Field(default=None, min_length=1, max_length=1000)
+    journal_complete: bool | None = Field(default=None, strict=True)
+    unreserved_confirmed: bool = Field(default=False, strict=True)
+
+    @model_validator(mode="after")
+    def reservation_confirmation(self):
+        if self.reserve_mode == "stock":
+            if not self.allocations or not self.evidence or self.journal_complete is None or self.unreserved_confirmed:
+                raise ValueError("Stock issue requires complete allocations and physical journal confirmation")
+        elif self.allocations or self.evidence is not None or self.journal_complete is not None or not self.unreserved_confirmed:
+            raise ValueError("On-order issue requires explicit unreserved confirmation and no stock claims")
+        return self
+
+
+class InvoiceCreate(InvoiceIssueInput):
+    kind: Literal["invoice"]
 
 
 class DocumentRevision(BaseModel):
@@ -272,6 +353,7 @@ class DocumentOut(BaseModel):
     amount: float
     valid_until: datetime.date | None = None  # SALES-51: срок действия счёта (резерв)
     reserve_status: str = "none"  # none | reserved | consumed | released
+    reserve_mode: Literal["stock", "on_order"] | None = None
     version: int = 1
     supersedes_id: int | None = None
     superseded_by_id: int | None = None
@@ -813,10 +895,15 @@ class LossReasonOut(BaseModel):
 
 
 class LoseRequest(BaseModel):
-    """Закрыть сделку в отказ: причина (обязательна) + комментарий."""
+    """Durable request; old reason-only /lose clients must upgrade explicitly."""
 
-    reason_code: str
-    comment: str | None = None
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    organization_id: int = Field(gt=0, strict=True)
+    request_key: UUID
+    expected_composition_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    reason_code: str = Field(min_length=1, max_length=128)
+    comment: str | None = Field(default=None, max_length=2000)
+    finalize_if_empty: bool = Field(default=False, strict=True)
 
 
 class StageEventOut(BaseModel):

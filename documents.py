@@ -7,6 +7,7 @@ No service call is made while re-opening an issued original.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
 from datetime import datetime, timezone
@@ -205,11 +206,19 @@ def original(doc, *, issued_only=False):
 
 
 async def mark_issued(session, core, doc, actor):
+    if doc.kind == 'invoice':
+        from modules.sales.invoice_issuance import is_erp_invoice
+        if await is_erp_invoice(session, doc) or doc.supersedes_id:
+            raise HTTPException(409, 'ERP invoice/replacement cannot use the legacy issue/release path')
     original(doc)
     if doc.supersedes_id:
         old = await session.get(DealDocument, doc.supersedes_id)
         if old.superseded_by_id:
             raise HTTPException(409, 'У документа уже есть выпущенная замена')
+        from modules.sales.invoice_settlements import receipt_query
+
+        if old.kind == 'invoice' and (old.status == 'paid' or await session.scalar(receipt_query(old.id))):
+            raise HTTPException(409, 'Оплаченный счёт нельзя заменить со снятием резерва без подтверждённого возврата или отдельного исправительного документа')
         # Preserve old paid/status and original; a new row has its own payment identity.
         old.superseded_by_id = doc.id
         if old.reserve_status == 'reserved':
@@ -239,3 +248,47 @@ async def flush_document(session):
     except IntegrityError:
         await session.rollback()
         raise HTTPException(409, "Ключ или версия документа уже используются; повторите исходный запрос") from None
+
+
+def render_erp_invoice(number, prepared):
+    """Static local original from confirmed exact facts, with no runtime defaults."""
+    def esc(value):
+        return html.escape(str(value if value is not None else ''), quote=True)
+    seller, buyer = prepared['seller'], prepared['buyer']
+    rows = ''.join('<tr>' + ''.join(f'<td>{esc(line[key])}</td>' for key in (
+        'line_no', 'sku_code', 'name', 'qty', 'unit', 'price', 'vat_rate', 'net', 'tax', 'total'))
+        + '</tr>' for line in prepared['lines'])
+    return f'''<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">
+<title>Счёт {esc(number)}</title><style>
+body{{font-family:Arial,sans-serif;color:#172033;margin:32px}}table{{width:100%;border-collapse:collapse}}
+th,td{{border:1px solid #9ca3af;padding:6px;text-align:left}}dl{{line-height:1.6}}
+</style></head><body><h1>Счёт {esc(number)} от {esc(prepared['document_date'])}</h1>
+<dl><dt>Продавец</dt><dd>{esc(seller['name'])}, УНП {esc(seller['unp'])}, {esc(seller['address'])}</dd>
+<dt>Банк / счёт</dt><dd>{esc(seller['bank'])}, {esc(seller['bik'])}, {esc(seller['account'])}</dd>
+<dt>Контакты / руководитель</dt><dd>{esc(seller.get('phone'))}, {esc(seller.get('email'))}, {esc(seller['director'])}</dd>
+<dt>Покупатель</dt><dd>{esc(buyer['name'])}, УНП {esc(buyer['unp'])}, {esc(buyer['requisites'].get('address'))}</dd>
+<dt>Реквизиты покупателя</dt><dd>{esc(json.dumps(buyer['requisites'], ensure_ascii=False, sort_keys=True))}</dd></dl>
+<table><thead><tr><th>№</th><th>Код</th><th>Товар</th><th>Количество</th><th>Ед.</th><th>Цена нетто</th>
+<th>НДС %</th><th>Нетто</th><th>НДС</th><th>Всего</th></tr></thead><tbody>{rows}</tbody></table>
+<p>Всего: {esc(prepared['amount'])} {esc(prepared['currency'])}</p>
+<p>{'Под заказ — товар не зарезервирован.' if prepared.get('reserve_mode') == 'on_order' else 'Поставка со склада.'}</p>
+<p>Действителен до {esc(prepared['valid_until'])}.</p>
+<p>Условия оплаты: {esc(prepared['payment_terms'])}. Условия поставки: {esc(prepared['delivery_terms'])}.</p>
+<p>Основание цен и ставок: {esc(prepared['pricing_evidence'])}.</p></body></html>'''
+
+
+def capture_erp_invoice(doc, prepared, actor):
+    if doc.original_html or doc.snapshot_json or doc.issued_at:
+        raise HTTPException(409, 'An existing original cannot be captured again')
+    original_html = render_erp_invoice(doc.number, prepared)
+    validate_static(original_html)
+    doc.amount = Decimal(prepared['amount'])
+    doc.valid_until = datetime.fromisoformat(prepared['valid_until']).date()
+    doc.snapshot_json = {**prepared, 'schema_version': 1, 'issuance_mode': 'erp_issuance_v1',
+                         'document_id': doc.id, 'version': doc.version, 'number': doc.number,
+                         'kind': 'invoice', 'items': prepared['lines'],
+                         'created_at': doc.created_at.isoformat()}
+    doc.original_html = original_html
+    doc.content_sha256 = digest(original_html)
+    doc.issued_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    doc.issued_by = actor

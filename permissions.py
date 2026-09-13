@@ -17,15 +17,16 @@ PERMISSIONS = [
     Permission("sales.deal.read", "Просмотр сделок"),
     Permission("sales.deal.write", "Создание и изменение сделок"),
     Permission("sales.deal.approve", "Согласование документов сделки"),
+    Permission("sales.shipping.associate", "Подготовка и подтверждение связи заказа со счётом"),
 ]
 
 # Слаги ролей — из config/access.py. РОП (sales_head) ведёт сделку целиком, включая
 # согласование документов; продавцы (sales) и клиентская работа (sales_cli) — читают и
 # правят сделки без права согласования. Директор/Коммерческий — суперроли (минуют это).
 ROLES = [
-    Role("sales_head", ("sales.deal.read", "sales.deal.write", "sales.deal.approve")),
-    Role("sales", ("sales.deal.read", "sales.deal.write")),
+    Role("sales_head", ("sales.deal.read", "sales.deal.write", "sales.deal.approve", "sales.shipping.associate")),
+    Role("sales", ("sales.deal.read", "sales.deal.write", "sales.shipping.associate")),
     # Keycloak realm role (go-live): те же права, что у sales — иначе 403 на доске.
-    Role("sales_manager", ("sales.deal.read", "sales.deal.write")),
-    Role("sales_cli", ("sales.deal.read", "sales.deal.write")),
+    Role("sales_manager", ("sales.deal.read", "sales.deal.write", "sales.shipping.associate")),
+    Role("sales_cli", ("sales.deal.read", "sales.deal.write", "sales.shipping.associate")),
 ]
