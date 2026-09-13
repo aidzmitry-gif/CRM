@@ -37,6 +37,7 @@ from modules.sales.access import (
     deny_unscoped_own_routes,
     get_deal_access,
     locked_call_for_write,
+    require_owner_assignment,
     resolve_owner_assignment,
     scope_calls,
     scope_counterparties,
@@ -2406,7 +2407,7 @@ async def create_task(
         deal_id=deal_id,
         title=payload.title,
         kind=payload.kind,
-        assignee_id=payload.assignee_id,
+        assignee_id=require_owner_assignment(access, payload.assignee_id),
         due_at=payload.due_at,
     )
     session.add(task)
@@ -2436,6 +2437,8 @@ async def update_task(
         raise HTTPException(status_code=404, detail="Задача не найдена")
     await visible_deal_or_404(session, task.deal_id, access)
     data = payload.model_dump(exclude_unset=True)
+    if "assignee_id" in data:
+        data["assignee_id"] = require_owner_assignment(access, data["assignee_id"])
     becoming_done = data.get("status") == "done" and task.status != "done"
     for key, value in data.items():
         setattr(task, key, value)
@@ -3830,14 +3833,25 @@ async def create_message(
     _: CurrentUser = Depends(require_permission("sales.deal.write")),
     access: DealAccess = Depends(get_deal_access),
 ):
-    """Отправить/зафиксировать сообщение по сделке (канал + текст) — событие в шину."""
-    await visible_deal_or_404(session, deal_id, access)
+    """Записать историю; тот же ключ не создаёт второе сообщение или событие."""
+    deal = await session.scalar(scope_deals(select(Deal).where(Deal.id == deal_id), access)
+                                .with_for_update().execution_options(populate_existing=True))
+    if deal is None:
+        raise HTTPException(404, "Сделка не найдена")
+    if payload.request_key:
+        existing = await session.scalar(select(Message).where(
+            Message.deal_id == deal_id, Message.request_key == payload.request_key))
+        if existing is not None:
+            if any(getattr(existing, field) != getattr(payload, field) for field in ("channel", "direction", "author", "text")):
+                raise HTTPException(409, "Ключ запроса уже использован с другой записью")
+            return existing
     msg = Message(
         deal_id=deal_id,
         channel=payload.channel,
         direction=payload.direction,
         author=payload.author,
         text=payload.text,
+        request_key=payload.request_key,
     )
     session.add(msg)
     await session.flush()

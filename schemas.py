@@ -756,6 +756,7 @@ class MessageCreate(BaseModel):
     text: str
     author: str = ""
     direction: str = "out"  # out — от менеджера, in — от клиента
+    request_key: str | None = Field(default=None, min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
 
 
 class MessageOut(BaseModel):
@@ -866,8 +867,15 @@ class TaskUpdate(BaseModel):
     kind: str | None = None
     assignee_id: int | None = None
     due_at: datetime.datetime | None = None
-    status: str | None = None  # open|done|canceled
+    status: Literal["open", "done", "canceled"] | None = None
     result: str | None = None
+
+    @model_validator(mode="after")
+    def nonnull_task_fields(self):
+        for field in ("title", "kind", "status"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"Поле {field} не может быть null")
+        return self
 
 
 class TaskOut(BaseModel):

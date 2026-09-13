@@ -281,7 +281,7 @@ class Message(Base):
     """
 
     __tablename__ = "message"
-    __table_args__ = {"schema": "sales"}
+    __table_args__ = (UniqueConstraint("deal_id", "request_key", name="uq_message_deal_request"), {"schema": "sales"})
 
     id: Mapped[int] = mapped_column(primary_key=True)
     deal_id: Mapped[int] = mapped_column(ForeignKey("sales.deal.id"))
@@ -289,6 +289,7 @@ class Message(Base):
     direction: Mapped[str] = mapped_column(String(8), default="out", server_default="out")  # in|out
     author: Mapped[str] = mapped_column(String(128), default="", server_default="")
     text: Mapped[str] = mapped_column(Text)
+    request_key: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     read_at: Mapped[datetime | None] = mapped_column(DateTime)  # SALES-49: когда прочитано (входящее)
 

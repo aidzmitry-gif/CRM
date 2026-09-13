@@ -14,7 +14,8 @@ from core.runtime.deps import get_session
 from core.services.auth import CurrentUser, require_permission
 from core.services.crm_owners import list_crm_owners, resolve_crm_owner
 from modules.sales.access import DealAccess, get_deal_access, require_owner_assignment, scope_deals
-from modules.sales.models import CrmClient, Deal
+from modules.sales.models import CrmClient, Deal, DealDocument
+from modules.sales.schemas import DocumentOut
 
 router = APIRouter()
 
@@ -126,3 +127,19 @@ async def list_crm_client_deals(client_id: int, session: AsyncSession = Depends(
     rows = (await session.execute(scope_deals(select(Deal.id, Deal.number, Deal.title, Deal.amount).where(
         Deal.crm_client_id == client_id), access).order_by(Deal.id.desc()))).mappings().all()
     return [dict(row) for row in rows]
+
+
+class ClientDocumentOut(DocumentOut):
+    deal_id: int
+    deal_number: str
+
+
+@router.get("/clients/{client_id}/documents", response_model=list[ClientDocumentOut])
+async def list_crm_client_documents(client_id: int, session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")), access: DealAccess = Depends(get_deal_access)):
+    await visible_client(session, client_id, access)
+    rows = (await session.execute(scope_deals(select(DealDocument, Deal.number).join(
+        Deal, Deal.id == DealDocument.deal_id).where(Deal.crm_client_id == client_id), access)
+        .order_by(DealDocument.id.desc()))).all()
+    return [{**DocumentOut.model_validate(doc).model_dump(), "deal_id": doc.deal_id, "deal_number": number}
+            for doc, number in rows]
