@@ -24,6 +24,28 @@ from core.db.base import Base
 from modules.sales.mail_models import EmailAttempt, OutgoingEmail  # noqa: F401
 
 
+class CrmClient(Base):
+    """Independent CRM relationship; never grants write access to shared MDM."""
+
+    __tablename__ = "crm_client"
+    __table_args__ = (
+        UniqueConstraint("owner_id", "request_key", name="uq_crm_client_owner_request"),
+        UniqueConstraint("owner_id", "name_key", name="uq_crm_client_owner_name"),
+        UniqueConstraint("owner_id", "unp", name="uq_crm_client_owner_unp"),
+        {"schema": "sales"},
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    name_key: Mapped[str] = mapped_column(String(1024))
+    unp: Mapped[str | None] = mapped_column(String(9))
+    owner_id: Mapped[int] = mapped_column(index=True)  # Same employee identity as Deal.owner_id.
+    counterparty_id: Mapped[int | None] = mapped_column(ForeignKey("counterparty.id"))
+    request_key: Mapped[str] = mapped_column(String(64))
+    request_hash: Mapped[str] = mapped_column(String(64))
+    created_by: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class Deal(Base):
     """Сделка CRM."""
 
@@ -34,6 +56,7 @@ class Deal(Base):
     number: Mapped[str] = mapped_column(String(64), unique=True)
     title: Mapped[str] = mapped_column(String(255))
     counterparty: Mapped[str] = mapped_column(String(255))
+    crm_client_id: Mapped[int | None] = mapped_column(ForeignKey("sales.crm_client.id"), index=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0"), server_default="0")
     priority: Mapped[str] = mapped_column(String(32), default="Средний", server_default="Средний")
     stage: Mapped[str] = mapped_column(String(32), default="new", server_default="new")

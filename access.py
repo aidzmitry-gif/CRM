@@ -92,7 +92,7 @@ def scope_counterparties(stmt, access: DealAccess):
     if not access.own_only:
         return stmt
     return stmt.where(
-        Counterparty.name.in_(scope_deals(select(Deal.counterparty), access)),
+        Counterparty.name.in_(scope_deals(select(Deal.counterparty).where(Deal.crm_client_id.is_(None)), access)),
         Counterparty.name.in_(unique_counterparty_names()),
     )
 
@@ -221,6 +221,7 @@ _OWN_ROUTE_NAMES = frozenset(
         "delete_deal_item",
         "list_contacts",
         "list_crm_clients",
+        "create_crm_client", "get_crm_client", "crm_client_owners",
         "list_crm_contacts",
         "add_contact",
         "set_primary_contact",

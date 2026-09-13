@@ -11,7 +11,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from sqlalchemy import case, delete, func, or_, select
+from sqlalchemy import case, delete, func, literal, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,6 +28,7 @@ from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
 from core.services.auth import CurrentUser, get_current_user, require_permission
 from core.services.price_cost import ItemPriceCost
+from modules.sales import clients as crm_clients
 from modules.sales import documents as originals
 from modules.sales._money_words import money_words
 from modules.sales.access import (
@@ -163,6 +164,7 @@ from modules.sales.stages import (
 )
 
 router = APIRouter(tags=["sales"], dependencies=[Depends(deny_unscoped_own_routes)])
+router.include_router(crm_clients.router)
 # Лиды (вход воронки) — отдельный роутер. Монтируется и на /leads (фронт бьёт туда), и на
 # /sales/leads (back-compat). Полный вынос в modules/leads — Шаг 2 ТЗ принятия выноса лидов.
 leads_router = APIRouter(tags=["leads"])
@@ -317,6 +319,13 @@ async def _counterparty_for_deal(
     session: AsyncSession, deal: Deal, create: bool = False
 ) -> Counterparty | None:
     """Однозначно найти контрагента по имени; при отсутствии опционально создать."""
+    if deal.crm_client_id is not None:
+        client = await session.get(crm_clients.CrmClient, deal.crm_client_id)
+        if client and client.counterparty_id is not None:
+            return await session.get(Counterparty, client.counterparty_id)
+        if create:
+            raise HTTPException(409, "CRM-клиент не связан с общим справочником контрагентов")
+        return None
     matches = (
         await session.execute(
             select(Counterparty).where(Counterparty.name == deal.counterparty).limit(2)
@@ -1268,6 +1277,12 @@ async def update_deal(
         # cannot claim a numeric identity: a changed unconfirmed name clears
         # the previous binding, while an unchanged form value preserves it.
         data["owner_id"] = None
+    if deal.crm_client_id is not None:
+        client = await crm_clients.visible_client(session, deal.crm_client_id, access, lock=True)
+        if data.get("owner_id", deal.owner_id) != client.owner_id:
+            raise HTTPException(422, "Владелец сделки должен совпадать с владельцем CRM-клиента")
+        if data.get("counterparty", client.name) != client.name:
+            raise HTTPException(422, "Клиент сделки связан по ID; изменение названия здесь недоступно")
     new_stage = data.pop("stage", None)
     new_funnel = data.pop("funnel", None)
     # R5-3: нельзя двинуть сделку в стадию ЧУЖОЙ воронки — иначе сделка выпадает с обеих досок
@@ -2446,6 +2461,11 @@ async def create_deal(
         data.owner_id, owner_name = await resolve_owner_assignment(session, access, data.owner_id)
         if owner_name is not None:
             data.owner = owner_name
+        if data.crm_client_id is not None:
+            client = await crm_clients.visible_client(session, data.crm_client_id, access, lock=True)
+            if data.owner_id != client.owner_id:
+                raise HTTPException(422, "Владелец сделки должен совпадать с владельцем CRM-клиента")
+            data.counterparty = client.name
         deal = await DealRepository(session).create(data)
         core.event_bus.emit(session, "sales.deal.created", {"number": deal.number, "title": deal.title})
         if deal.ship_deadline:
@@ -2540,10 +2560,14 @@ async def repeat_last_order(
     prior_stmt = (
         select(DealItem.deal_id)
         .join(Deal, Deal.id == DealItem.deal_id)
-        .where(Deal.counterparty == deal.counterparty, Deal.id < deal_id)
+        .where(Deal.id < deal_id)
         .order_by(Deal.created_at.desc(), Deal.id.desc())
         .limit(1)
     )
+    if deal.crm_client_id is not None:
+        prior_stmt = prior_stmt.where(Deal.crm_client_id == deal.crm_client_id)
+    else:
+        prior_stmt = prior_stmt.where(Deal.crm_client_id.is_(None), Deal.counterparty == deal.counterparty)
     if access.own_only:
         prior_stmt = prior_stmt.where(Deal.owner_id == access.employee_id)
     prior_id = (await session.execute(prior_stmt)).scalar()
@@ -2628,6 +2652,7 @@ def _directory_deal_id(access: DealAccess):
         (Counterparty.name.in_(unique_counterparty_names()),
          scope_deals(select(func.min(Deal.id)).where(
              Deal.counterparty == Counterparty.name,
+             Deal.crm_client_id.is_(None),
          ), access).correlate(Counterparty).scalar_subquery()),
         else_=None,
     ).label("deal_id")
@@ -2642,19 +2667,21 @@ async def list_crm_clients(
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
     access: DealAccess = Depends(get_deal_access),
 ) -> dict:
-    stmt = scope_counterparties(select(
+    legacy = scope_counterparties(select(
         Counterparty.id, Counterparty.name, Counterparty.unp, Counterparty.is_active,
-        _directory_deal_id(access),
+        _directory_deal_id(access), literal("mdm").label("source"),
     ), access)
+    combined = legacy.union_all(crm_clients.client_rows(access)).subquery()
+    stmt = select(combined)
     if query := q.strip():
         stmt = stmt.where(or_(
-            Counterparty.name.icontains(query, autoescape=True),
-            Counterparty.unp.icontains(query, autoescape=True),
+            combined.c.name.icontains(query, autoescape=True),
+            combined.c.unp.icontains(query, autoescape=True),
         ))
     total = await session.scalar(select(func.count()).select_from(stmt.subquery()))
-    rows = (await session.execute(stmt.order_by(Counterparty.name, Counterparty.id)
+    rows = (await session.execute(stmt.order_by(combined.c.name, combined.c.source, combined.c.id)
                                   .offset(offset).limit(limit))).mappings().all()
-    return {"rows": [dict(row) for row in rows], "total": total}
+    return {"rows": [{k: v for k, v in row.items() if k != "source" or v != "mdm"} for row in rows], "total": total}
 
 
 @router.get("/contacts")

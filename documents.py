@@ -14,13 +14,14 @@ from decimal import ROUND_HALF_UP, Decimal
 from html.parser import HTMLParser
 
 from fastapi import HTTPException
-from sqlalchemy import select, update
+from sqlalchemy import case, select, update
 from sqlalchemy.exc import IntegrityError
 
 from core.domain.models import Counterparty, Sku
 from modules.sales.models import (
     CompanyBranding,
     ContractTemplate,
+    CrmClient,
     Deal,
     DealDocument,
     DealItem,
@@ -102,12 +103,14 @@ async def capture(session, core, doc):
     """Save the agreed candidate; called only on issue or submission, never GET."""
     from modules.sales import routes as r
 
-    buyer_id = (select(Counterparty.id).where(
+    legacy_buyer_id = (select(Counterparty.id).where(
         Counterparty.name == Deal.counterparty, Counterparty.is_active.is_(True),
     ).order_by(Counterparty.id).limit(1).correlate(Deal).scalar_subquery())
+    buyer_id = case((Deal.crm_client_id.is_(None), legacy_buyer_id), else_=CrmClient.counterparty_id)
     rows = (await session.execute(
-        select(Deal, DealItem, Sku, Counterparty, CompanyBranding, ContractTemplate)
+        select(Deal, DealItem, Sku, Counterparty, CompanyBranding, ContractTemplate, CrmClient)
         .select_from(Deal)
+        .outerjoin(CrmClient, CrmClient.id == Deal.crm_client_id)
         .outerjoin(DealItem, DealItem.deal_id == Deal.id)
         .outerjoin(Sku, Sku.id == DealItem.sku_id)
         .outerjoin(Counterparty, Counterparty.id == buyer_id)
@@ -118,9 +121,11 @@ async def capture(session, core, doc):
     )).all()
     if not rows:
         raise HTTPException(404, 'Сделка не найдена')
-    deal, _, _, cp, branding, template = rows[0]
+    deal, _, _, cp, branding, template, client = rows[0]
     seller = r._seller_with_facsimile(core, branding)
     buyer = {'name': deal.counterparty, 'unp': cp.unp or '' if cp else ''}
+    if cp is None and client is not None:
+        buyer['unp'] = client.unp or ''
     if cp:
         buyer.update(cp.requisites or {})
     buyer.update((doc.terms_json or {}).get('buyer') or {})

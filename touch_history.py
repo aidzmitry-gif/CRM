@@ -49,7 +49,7 @@ class SalesTouchHistory:
             return []
         return list(
             (
-                await session.execute(select(Deal.id).where(Deal.counterparty == name))
+                await session.execute(select(Deal.id).where(Deal.counterparty == name, Deal.crm_client_id.is_(None)))
             ).scalars()
         )
 
@@ -72,7 +72,7 @@ class SalesTouchHistory:
             deals = (
                 await session.execute(
                     select(Deal)
-                    .where(Deal.counterparty == name)
+                    .where(Deal.id.in_(deal_ids))
                     .order_by(Deal.created_at.desc())
                     .limit(limit)
                 )
@@ -142,9 +142,9 @@ class SalesTouchHistory:
         last_deal: datetime | None = None
         if name:
             deals_n = await _count(
-                select(func.count()).select_from(Deal).where(Deal.counterparty == name)
+                select(func.count()).select_from(Deal).where(Deal.id.in_(deal_ids))
             )
-            last_deal = await _max(Deal.created_at, Deal.counterparty == name)
+            last_deal = await _max(Deal.created_at, Deal.id.in_(deal_ids))
 
         msgs_n = 0
         last_msg: datetime | None = None

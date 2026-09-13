@@ -14,6 +14,7 @@ class DealCreate(BaseModel):
     number: str
     title: str
     counterparty: str
+    crm_client_id: int | None = Field(default=None, gt=0)
     amount: float = 0.0
     priority: str = "Средний"
     stage: str = "new"
@@ -73,6 +74,7 @@ class DealRead(BaseModel):
     number: str
     title: str
     counterparty: str
+    crm_client_id: int | None = None
     amount: float
     priority: str
     stage: str
