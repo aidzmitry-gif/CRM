@@ -141,9 +141,11 @@ async def locked_call_for_write(
 
 
 async def visible_deal_or_404(
-    session: AsyncSession, deal_id: int, access: DealAccess
+    session: AsyncSession, deal_id: int, access: DealAccess, *, lock: bool = False
 ) -> Deal:
     stmt = select(Deal).where(Deal.id == deal_id)
+    if lock:
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
     deal = (await session.execute(scope_deals(stmt, access))).scalar_one_or_none()
     if deal is None:
         # 404 deliberately does not reveal that another department member owns it.

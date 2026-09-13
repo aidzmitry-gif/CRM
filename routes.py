@@ -1225,13 +1225,13 @@ async def _stage_kind_map(session: AsyncSession, funnel: str) -> dict[str, str]:
     """
     rows = (
         await session.execute(
-            select(Stage.code, Stage.kind)
-            .where(Stage.funnel == funnel, Stage.is_active)
+            select(Stage.code, Stage.kind, Stage.is_active)
+            .where(Stage.funnel == funnel)
             .order_by(Stage.sort_order)
         )
     ).all()
     if rows:
-        return {code: kind for code, kind in rows}
+        return {code: kind for code, kind, active in rows if active}
     return {s["code"]: s["kind"] for s in canonical_stages() if s["funnel"] == funnel}
 
 
@@ -1261,7 +1261,7 @@ async def update_deal(
     """Частично обновить сделку. Смена стадии (drag&drop) пишется в историю и
     обновляет ``stage_changed_at`` через единый хелпер ``record_stage`` (SALES-43)."""
     repo = DealRepository(session)
-    deal = await visible_deal_or_404(session, deal_id, access)
+    deal = await visible_deal_or_404(session, deal_id, access, lock=True)
     data = payload.model_dump(exclude_unset=True)
     if access.own_only:
         # Check a supplied value before overwriting it with self: otherwise a
@@ -1293,6 +1293,15 @@ async def update_deal(
     # (funnel=new_clients + stage=rp_won не существует ни в одной колонке). Валидируем против
     # стадий целевой воронки (новой, если меняем; иначе текущей).
     target_funnel = new_funnel if new_funnel is not None else deal.funnel
+    if access.own_only or deal.crm_client_id is not None:
+        if "closed_date" in data:
+            raise HTTPException(422, "Дата закрытия управляется переходами /win и /lose")
+        kinds = await _stage_kind_map(session, target_funnel)
+        effective_stage = new_stage if new_stage is not None else deal.stage
+        if effective_stage not in kinds:
+            raise HTTPException(422, "Нужна активная стадия целевой воронки")
+        if new_stage is not None and kinds[effective_stage] in {"won", "lost"}:
+            raise HTTPException(422, "Для закрытия сделки используйте /win или /lose с причиной")
     if new_stage is not None and new_stage != deal.stage:
         kind_by_code = await _stage_kind_map(session, target_funnel)
         if new_stage not in kind_by_code:
@@ -2290,18 +2299,19 @@ async def lose_deal(
     Как и в win_deal (Фикс 1, цикл 18): lost-код резолвится по воронке сделки, а не
     литералом "lost" — для repeat_clients/tenders это rp_lost/tn_lost; литерал "lost"
     не входит ни в одну их колонку и сделка пропадала бы с доски."""
-    deal = await visible_deal_or_404(session, deal_id, access)
+    deal = await visible_deal_or_404(session, deal_id, access, lock=True)
     kind_map = await _stage_kind_map(session, deal.funnel)
-    lost_code = next((code for code, kind in kind_map.items() if kind == "lost"), "lost")
+    lost_code = next((code for code, kind in kind_map.items() if kind == "lost"), None)
+    if lost_code is None:
+        raise HTTPException(422, "В воронке нет активной стадии отказа")
     if deal.stage == lost_code:
         raise HTTPException(status_code=409, detail="Сделка уже закрыта в отказ")
     code = (payload.reason_code or "").strip()
     if not code:
         raise HTTPException(status_code=422, detail="Нужна причина отказа")
-    active_codes = set(
-        (await session.execute(select(LossReason.code).where(LossReason.active))).scalars().all()
-    )
-    if active_codes and code not in active_codes:
+    reason_rows = (await session.execute(select(LossReason.code, LossReason.active))).all()
+    active_codes = {row.code for row in reason_rows if row.active}
+    if reason_rows and code not in active_codes:
         raise HTTPException(status_code=422, detail="Неизвестная причина отказа")
 
     deal.lost_reason_code = code
@@ -2336,9 +2346,11 @@ async def win_deal(
     "won" — для repeat_clients/tenders это rp_won/tn_won; литерал "won" не входит ни в одну
     их колонку и после перезагрузки сделка пропадала с доски.
     """
-    deal = await visible_deal_or_404(session, deal_id, access)
+    deal = await visible_deal_or_404(session, deal_id, access, lock=True)
     kind_map = await _stage_kind_map(session, deal.funnel)
-    won_code = next((code for code, kind in kind_map.items() if kind == "won"), "won")
+    won_code = next((code for code, kind in kind_map.items() if kind == "won"), None)
+    if won_code is None:
+        raise HTTPException(422, "В воронке нет активной стадии успеха")
     if deal.stage == won_code:
         raise HTTPException(status_code=409, detail="Сделка уже выиграна")
     deal.closed_date = date.today().strftime("%d.%m.%Y")
@@ -2467,6 +2479,12 @@ async def create_deal(
         data.owner_id, owner_name = await resolve_owner_assignment(session, access, data.owner_id)
         if owner_name is not None:
             data.owner = owner_name
+        if access.own_only or data.crm_client_id is not None:
+            kinds = await _stage_kind_map(session, data.funnel)
+            if data.stage not in kinds:
+                raise HTTPException(422, "Нужна активная стадия целевой воронки")
+            if kinds[data.stage] in {"won", "lost"} or data.closed_date is not None:
+                raise HTTPException(422, "Создайте открытую сделку; закрытие выполняется через /win или /lose")
         if data.crm_client_id is not None:
             client = await crm_clients.visible_client(session, data.crm_client_id, access, lock=True)
             if data.owner_id != client.owner_id:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import select
 
@@ -228,31 +229,20 @@ async def on_deal_won_handoff(payload: dict, ctx) -> None:
     gross_profit: float | None = None
     facade = getattr(ctx.services, "landed_cost", None)
     if facade is not None and items:
-        # Бюджет: тянем landed по уникальным кодам, цену клиенту из PriceQuote.
+        # Цена принадлежит строке сделки; история котировок не подтверждает её.
         codes = sorted({it["sku_code"] for it in items if it["sku_code"]})
         landed = await facade.last_landed_cost_batch(ctx.session, codes)
-        from modules.sales.models import PriceQuote
-
-        quotes = (
-            await ctx.session.execute(
-                select(PriceQuote)
-                .where(PriceQuote.counterparty == deal.counterparty, PriceQuote.sku_code.in_(codes))
-                .order_by(PriceQuote.id)
-            )
-        ).scalars().all()
-        last_price: dict[str, float] = {}
-        for q in quotes:
-            last_price[q.sku_code] = float(q.price)
-        gp = 0.0
-        any_priced = False
-        for it in items:
-            code = it["sku_code"]
-            price = last_price.get(code)
+        gp = Decimal("0")
+        for row in items_rows:
+            sku = sku_map.get(row.sku_id)
+            code = sku.code if sku is not None else ""
             cost_row = landed.get(code)
-            if price is not None and cost_row is not None:
-                any_priced = True
-                gp += (price - float(cost_row["unit_landed_cost_byn"])) * it["qty"]
-        gross_profit = round(gp, 2) if any_priced else None
+            cost = cost_row.get("unit_landed_cost_byn") if cost_row is not None else None
+            if row.unit_price is None or cost is None:
+                break  # DTO не умеет маркировать частичный итог: неизвестное остаётся None.
+            gp += (Decimal(str(row.unit_price)) - Decimal(str(cost))) * Decimal(str(row.qty))
+        else:
+            gross_profit = float(gp.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
     ctx.services.event_bus.emit(
         ctx.session,
