@@ -75,6 +75,7 @@ class DealRead(BaseModel):
     title: str
     counterparty: str
     crm_client_id: int | None = None
+    crm_contact_id: int | None = None
     amount: float
     priority: str
     stage: str

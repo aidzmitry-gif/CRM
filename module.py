@@ -17,6 +17,7 @@ from modules.sales.calls import (
     on_call_transfer,
     on_incoming_call,
 )
+from modules.sales.crm_client_lookup import SalesCrmClientLookup
 from modules.sales.events import (
     on_deal_created,
     on_deal_won_handoff,
@@ -80,6 +81,7 @@ class SalesModule(ModuleContract):
         # (звонки/сообщения/сделки). Без этого core.services.touch_history=None → карточка
         # без истории (graceful). Реализация не лезет в схему ядра — только читает свою.
         core.services.touch_history = SalesTouchHistory()
+        core.services.crm_clients = SalesCrmClientLookup()
         core.on_startup(self._on_startup)
         # SALES-51: периодический шаг — срок/напоминание/аннулирование резерва под счёт
         core.on_tick(tick_invoice_reserve)

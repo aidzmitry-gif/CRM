@@ -49,10 +49,10 @@ def client_rows(access):
                                 literal("crm").label("source")), access)
 
 
-async def visible_client(session, client_id, access, *, lock=False):
+async def visible_client(session, client_id, access, *, lock=False, shared=False):
     stmt = scope_clients(select(CrmClient).where(CrmClient.id == client_id), access)
     if lock:
-        stmt = stmt.with_for_update().execution_options(populate_existing=True)
+        stmt = stmt.with_for_update(read=shared).execution_options(populate_existing=True)
     client = (await session.execute(stmt)).scalar_one_or_none()
     if client is None:
         raise HTTPException(404, "Клиент не найден")

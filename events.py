@@ -36,14 +36,40 @@ async def on_lead_converted(payload: dict, ctx) -> None:
     if not lead_id:
         return
     from modules.sales.models import Deal, DealItem, PriceQuote
+    strict = payload.get("crm_link_version") == 1
+    if strict:
+        from datetime import datetime, timezone
+
+        from core.services.crm_access import CrmAccess
+        gateway = ctx.services.crm_clients
+        if gateway is None:
+            raise RuntimeError("CRM client lookup unavailable")
+        await gateway.resolve_link(ctx.session, actor=CrmAccess("own", payload["owner_id"]),
+                                   client_id=payload["crm_client_id"], contact_id=payload.get("crm_contact_id"),
+                                   expected_owner_id=payload["owner_id"], lock="shared")
+        for raw in payload.get("items") or []:
+            qty, price = Decimal(str(raw["qty"])), Decimal(str(raw["price"]))
+            if not qty.is_finite() or not price.is_finite() or qty <= 0 or price < 0:
+                raise ValueError("Invalid confirmed CRM lead money")
+        stamp = payload.get("next_step_at")
+        next_at = datetime.fromisoformat(stamp) if stamp else None
+        if next_at is not None and next_at.tzinfo is not None:
+            next_at = next_at.astimezone(timezone.utc).replace(tzinfo=None)
+        if len(payload.get("next_step") or "") > 128:
+            raise ValueError("CRM next step exceeds deal limit")
 
     # Идемпотентность (B2): шина at-least-once + синхронный relay_once в convert_lead → событие
     # может прийти дважды; Deal.number unique → повтор вставки = IntegrityError на commit ВНУТРИ
     # relay_once = poison ВСЕЙ шины на тике. Гард по существующей сделке (как в on_deal_won_handoff).
     number = f"CRM-LEAD-{lead_id}"
-    if (
-        await ctx.session.execute(select(Deal.id).where(Deal.number == number))
-    ).scalars().first() is not None:
+    def check_replay(existing):
+        if strict and (existing.owner_id, existing.crm_client_id, existing.crm_contact_id) != (
+            payload["owner_id"], payload["crm_client_id"], payload.get("crm_contact_id")):
+            raise ValueError("Conflicting numeric lead conversion")
+
+    existing = (await ctx.session.execute(select(Deal).where(Deal.number == number))).scalar_one_or_none()
+    if existing is not None:
+        check_replay(existing)
         return
 
     deal = Deal(
@@ -55,19 +81,39 @@ async def on_lead_converted(payload: dict, ctx) -> None:
         # Keep its assignment snapshot if the account changes before delivery.
         # Legacy events have no numeric identity and retain display-only ownership.
         owner_id=payload.get("owner_id"),
+        crm_client_id=payload.get("crm_client_id") if strict else None,
+        crm_contact_id=payload.get("crm_contact_id") if strict else None,
+        next_step=payload.get("next_step") if strict else None,
+        next_step_at=next_at if strict else None,
+        funnel=payload.get("funnel") or "new_clients",
         stage="new",
         priority=payload.get("priority", "Средний"),
     )
-    ctx.session.add(deal)
-    await ctx.session.flush()
+    if strict and ctx.session.get_bind().dialect.name == "postgresql":
+        from sqlalchemy.exc import IntegrityError
+        try:
+            async with ctx.session.begin_nested():
+                ctx.session.add(deal)
+                await ctx.session.flush()
+        except IntegrityError:
+            existing = (await ctx.session.execute(select(Deal).where(Deal.number == number))).scalar_one_or_none()
+            if existing is None:
+                raise
+            check_replay(existing)
+            return
+    else:
+        ctx.session.add(deal)
+        await ctx.session.flush()
 
     total = Decimal("0")
     for raw in payload.get("items") or []:
         try:
             sku_id = int(raw["sku_id"])
-            qty = Decimal(str(raw.get("qty") or 1))
-            price = Decimal(str(raw.get("price") or 0))
+            qty = Decimal(str(raw["qty"])) if strict else Decimal(str(raw.get("qty") or 1))
+            price = Decimal(str(raw["price"])) if strict else Decimal(str(raw.get("price") or 0))
         except (KeyError, TypeError, ValueError, InvalidOperation):
+            if strict:
+                raise
             continue
         if qty <= 0:
             continue

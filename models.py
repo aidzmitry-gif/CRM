@@ -79,6 +79,7 @@ class Deal(Base):
     title: Mapped[str] = mapped_column(String(255))
     counterparty: Mapped[str] = mapped_column(String(255))
     crm_client_id: Mapped[int | None] = mapped_column(ForeignKey("sales.crm_client.id"), index=True)
+    crm_contact_id: Mapped[int | None] = mapped_column()
     amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0"), server_default="0")
     priority: Mapped[str] = mapped_column(String(32), default="Средний", server_default="Средний")
     stage: Mapped[str] = mapped_column(String(32), default="new", server_default="new")
