@@ -28,6 +28,7 @@ from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
 from core.services.auth import CurrentUser, get_current_user, require_permission
 from core.services.price_cost import ItemPriceCost
+from modules.sales import client_contacts as crm_contacts
 from modules.sales import clients as crm_clients
 from modules.sales import documents as originals
 from modules.sales._money_words import money_words
@@ -100,6 +101,7 @@ from modules.sales.schemas import (
     ContractTemplateCreate,
     ContractTemplateOut,
     CounterpartyRef,
+    CrmContactOut,
     DealCreate,
     DealDetailOut,
     DealHandoffOut,
@@ -165,6 +167,7 @@ from modules.sales.stages import (
 
 router = APIRouter(tags=["sales"], dependencies=[Depends(deny_unscoped_own_routes)])
 router.include_router(crm_clients.router)
+router.include_router(crm_contacts.router)
 # Лиды (вход воронки) — отдельный роутер. Монтируется и на /leads (фронт бьёт туда), и на
 # /sales/leads (back-compat). Полный вынос в modules/leads — Шаг 2 ТЗ принятия выноса лидов.
 leads_router = APIRouter(tags=["leads"])
@@ -2693,25 +2696,30 @@ async def list_crm_contacts(
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
     access: DealAccess = Depends(get_deal_access),
 ) -> dict:
-    stmt = scope_counterparties(select(
+    legacy = scope_counterparties(select(
         Contact.id, Contact.full_name, Contact.phone, Contact.email, Contact.is_primary,
         Counterparty.id.label("counterparty_id"), Counterparty.name.label("counterparty_name"),
-        _directory_deal_id(access),
+        _directory_deal_id(access), literal("mdm").label("source"), literal(None).label("crm_client_id"),
     ).join(Counterparty, Counterparty.id == Contact.counterparty_id), access)
+    client = crm_clients.client_rows(access).subquery()
+    contact = crm_contacts.CrmClientContact
+    owned = select(contact.id, contact.full_name, contact.phone, contact.email, contact.is_primary,
+                   literal(None).label("counterparty_id"), client.c.name.label("counterparty_name"),
+                   client.c.deal_id, literal("crm").label("source"), contact.crm_client_id
+                   ).join(client, client.c.id == contact.crm_client_id)
+    combined = legacy.union_all(owned).subquery()
+    stmt = select(combined)
     if query := q.strip():
-        stmt = stmt.where(or_(
-            Contact.full_name.icontains(query, autoescape=True),
-            Contact.phone.icontains(query, autoescape=True),
-            Contact.email.icontains(query, autoescape=True),
-            Counterparty.name.icontains(query, autoescape=True),
-        ))
+        stmt = stmt.where(or_(*(combined.c[name].icontains(query, autoescape=True)
+                               for name in ("full_name", "phone", "email", "counterparty_name"))))
     total = await session.scalar(select(func.count()).select_from(stmt.subquery()))
-    rows = (await session.execute(stmt.order_by(Contact.full_name, Contact.id)
+    rows = (await session.execute(stmt.order_by(combined.c.full_name, combined.c.source, combined.c.id)
                                   .offset(offset).limit(limit))).mappings().all()
-    return {"rows": [dict(row) for row in rows], "total": total}
+    return {"rows": [{k: v for k, v in row.items() if row["source"] == "crm" or k not in {"source", "crm_client_id"}}
+                     for row in rows], "total": total}
 
 
-@router.get("/deals/{deal_id}/contacts", response_model=list[ContactOut])
+@router.get("/deals/{deal_id}/contacts", response_model=list[CrmContactOut | ContactOut])
 async def list_contacts(
     deal_id: int,
     session: AsyncSession = Depends(get_session),
@@ -2724,6 +2732,8 @@ async def list_contacts(
         if access.own_only:
             raise HTTPException(status_code=404, detail="Сделка не найдена")
         return []
+    if deal.crm_client_id is not None:
+        return await crm_contacts.contact_list(session, deal.crm_client_id, access)
     cp = await _counterparty_for_deal(session, deal)
     if cp is None:
         return []
@@ -2736,7 +2746,7 @@ async def list_contacts(
     ).scalars().all()
 
 
-@router.post("/deals/{deal_id}/contacts", response_model=ContactOut, status_code=201)
+@router.post("/deals/{deal_id}/contacts", response_model=CrmContactOut | ContactOut, status_code=201)
 async def add_contact(
     deal_id: int,
     payload: ContactCreate,
@@ -2746,6 +2756,13 @@ async def add_contact(
 ):
     """Добавить контакт контрагенту сделки (контрагент создаётся по имени при нужде)."""
     deal = await visible_deal_or_404(session, deal_id, access)
+    if deal.crm_client_id is not None:
+        from pydantic import ValidationError
+        try:
+            contact_payload = crm_contacts.CrmContactCreate.model_validate(payload.model_dump())
+        except ValidationError:
+            raise HTTPException(422, "Проверьте данные контакта и ключ повторного сохранения") from None
+        return await crm_contacts.create_contact(session, deal.crm_client_id, access, contact_payload)
     cp = await _counterparty_for_deal(session, deal, create=True)
     assert cp is not None
     if payload.is_primary:

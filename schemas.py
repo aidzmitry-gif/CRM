@@ -186,6 +186,10 @@ class ContactOut(BaseModel):
     is_primary: bool
 
 
+class CrmContactOut(ContactOut):
+    crm_client_id: int
+
+
 class ContactCreate(BaseModel):
     """Добавить контакт контрагенту сделки."""
 
@@ -193,6 +197,7 @@ class ContactCreate(BaseModel):
     phone: str | None = None
     email: str | None = None
     is_primary: bool = False
+    request_key: str | None = Field(default=None, min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
 
 
 class ChatOut(BaseModel):

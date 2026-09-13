@@ -10,6 +10,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Numeric,
     String,
     Text,
@@ -17,6 +18,7 @@ from sqlalchemy import (
     event,
     func,
     inspect,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -44,6 +46,26 @@ class CrmClient(Base):
     request_hash: Mapped[str] = mapped_column(String(64))
     created_by: Mapped[str] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class CrmClientContact(Base):
+    __tablename__ = "crm_client_contact"
+    __table_args__ = (
+        UniqueConstraint("crm_client_id", "request_key", name="uq_crm_contact_request"),
+        UniqueConstraint("crm_client_id", "contact_key", name="uq_crm_contact_exact"),
+        Index("uq_crm_contact_primary", "crm_client_id", unique=True,
+              postgresql_where=text("is_primary"), sqlite_where=text("is_primary")),
+        {"schema": "sales"},
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    crm_client_id: Mapped[int] = mapped_column(ForeignKey("sales.crm_client.id"), index=True)
+    full_name: Mapped[str] = mapped_column(String(255))
+    phone: Mapped[str | None] = mapped_column(String(64))
+    email: Mapped[str | None] = mapped_column(String(255))
+    is_primary: Mapped[bool] = mapped_column(default=False, server_default="false")
+    contact_key: Mapped[str] = mapped_column(String(64))
+    request_key: Mapped[str] = mapped_column(String(64))
+    request_hash: Mapped[str] = mapped_column(String(64))
 
 
 class Deal(Base):

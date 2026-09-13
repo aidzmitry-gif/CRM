@@ -117,3 +117,12 @@ async def create_crm_client(
         raise HTTPException(409, "Клиент с таким названием или УНП уже есть у этого менеджера") from None
     await session.commit()
     return client_out(client)
+
+
+@router.get("/clients/{client_id}/deals")
+async def list_crm_client_deals(client_id: int, session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")), access: DealAccess = Depends(get_deal_access)):
+    await visible_client(session, client_id, access)
+    rows = (await session.execute(scope_deals(select(Deal.id, Deal.number, Deal.title, Deal.amount).where(
+        Deal.crm_client_id == client_id), access).order_by(Deal.id.desc()))).mappings().all()
+    return [dict(row) for row in rows]
