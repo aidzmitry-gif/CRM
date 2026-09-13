@@ -79,6 +79,7 @@ from modules.sales.models import (
     PriceQuote,
     Stage,
 )
+from modules.sales.party_identity import party_for_deal, prepare_party_change
 from modules.sales.repository import DealRepository, record_stage
 from modules.sales.schemas import (
     ActivityCreate,
@@ -323,15 +324,8 @@ async def _build_item_out(session: AsyncSession, item: DealItem, counterparty: s
 async def _counterparty_for_deal(
     session: AsyncSession, deal: Deal, create: bool = False
 ) -> Counterparty | None:
-    """Найти контрагента сделки по имени (связь по названию); опц. создать."""
-    cp = (
-        await session.execute(select(Counterparty).where(Counterparty.name == deal.counterparty))
-    ).scalars().first()
-    if cp is None and create:
-        cp = Counterparty(name=deal.counterparty)
-        session.add(cp)
-        await session.flush()
-    return cp
+    """Resolve the stable party, with an unambiguous legacy fallback."""
+    return await party_for_deal(session, deal, create=create)
 
 
 async def _counterparty_ref(session: AsyncSession, deal: Deal) -> CounterpartyRef | None:
@@ -358,7 +352,7 @@ async def _clear_primary(session: AsyncSession, counterparty_id: int) -> None:
     """Снять признак основного со всех контактов контрагента."""
     rows = (
         await session.execute(
-            select(Contact).where(Contact.counterparty_id == counterparty_id, Contact.is_primary)
+            select(Contact).where(Contact.counterparty_id == counterparty_id, Contact.branch_id.is_(None), Contact.is_primary)
         )
     ).scalars().all()
     for contact in rows:
@@ -1258,6 +1252,7 @@ async def update_deal(
     deal, access, user = await lock_mutation(session, deal_id, access, core, user)
     data = payload.model_dump(exclude_unset=True)
     await guard_patch(session, deal, data)
+    await prepare_party_change(session, data, deal=deal)
     if access.own_only:
         # Check a supplied value before overwriting it with self: otherwise a
         # client could attempt reassignment and receive a misleading success.
@@ -2448,6 +2443,9 @@ async def create_deal(
         raise HTTPException(409, "Create an open deal before requesting loss")
     try:
         data = payload.model_copy(deep=True)
+        party_data = data.model_dump()
+        await prepare_party_change(session, party_data)
+        data = DealCreate.model_validate(party_data)
         data.owner_id, owner_name = await resolve_owner_assignment(session, access, data.owner_id)
         if owner_name is not None:
             data.owner = owner_name
@@ -2542,10 +2540,13 @@ async def repeat_last_order(
     deal = await visible_deal_or_404(session, deal_id, access)
     # Одним запросом: последний (по дате, tie-break по id) предыдущий заказ С позициями —
     # join к DealItem отсекает пустые сделки, limit 1 берёт самый свежий (без N+1-скана).
+    if deal.counterparty_id is None:
+        return []
     prior_stmt = (
         select(DealItem.deal_id)
         .join(Deal, Deal.id == DealItem.deal_id)
-        .where(Deal.counterparty == deal.counterparty, Deal.id < deal_id)
+        .where(Deal.counterparty_id == deal.counterparty_id,
+               Deal.branch_id == deal.branch_id, Deal.id < deal_id)
         .order_by(Deal.created_at.desc(), Deal.id.desc())
         .limit(1)
     )
@@ -2674,7 +2675,7 @@ async def list_contacts(
     return (
         await session.execute(
             select(Contact)
-            .where(Contact.counterparty_id == cp.id)
+            .where(Contact.counterparty_id == cp.id, Contact.branch_id == deal.branch_id)
             .order_by(Contact.is_primary.desc(), Contact.id)
         )
     ).scalars().all()
@@ -2690,6 +2691,8 @@ async def add_contact(
 ):
     """Добавить контакт контрагенту сделки (контрагент создаётся по имени при нужде)."""
     deal = await visible_deal_or_404(session, deal_id, access)
+    if deal.branch_id is not None:
+        raise HTTPException(status_code=422, detail="Добавьте контакт в карточке выбранного филиала: там проверяются версии и принадлежность")
     cp = await _counterparty_for_deal(session, deal, create=True)
     assert cp is not None
     if payload.is_primary:
@@ -2798,11 +2801,16 @@ async def list_chats(
 
 
 @router.patch("/contacts/{contact_id}/primary", response_model=ContactOut)
-async def set_primary_contact(contact_id: int, session: AsyncSession = Depends(get_session)):
+async def set_primary_contact(
+    contact_id: int, session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.write")),
+):
     """Назначить контакт основным (снимая признак с остальных контактов контрагента)."""
     contact = await session.get(Contact, contact_id)
     if contact is None:
         raise HTTPException(status_code=404, detail="Контакт не найден")
+    if contact.branch_id is not None:
+        raise HTTPException(status_code=422, detail="Основной контакт филиала меняется в карточке филиала с проверкой версии")
     if contact.counterparty_id is not None:
         await _clear_primary(session, contact.counterparty_id)
     contact.is_primary = True

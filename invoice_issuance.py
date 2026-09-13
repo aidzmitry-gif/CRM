@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db.base import Base
-from core.domain.models import Counterparty, Sku
+from core.domain.models import Counterparty, CounterpartyBranch, Sku
 from modules.sales import documents
 from modules.sales.access import visible_deal_or_404
 from modules.sales.accounting_ownership import DealOwnership
@@ -186,6 +186,15 @@ async def candidate(session, core, user, deal, data, doc_id=None):
     )
     if buyer is None or not buyer.is_active or buyer.merged_into_id is not None:
         raise HTTPException(409, "Buyer must be an active, unmerged bound client")
+    if deal.counterparty_id is not None and deal.counterparty_id != buyer.id:
+        raise HTTPException(409, "Selected CRM party differs from the confirmed invoice buyer")
+    branch = None
+    if deal.branch_id is not None:
+        branch = await session.scalar(select(CounterpartyBranch).where(
+            CounterpartyBranch.id == deal.branch_id,
+        ).with_for_update().execution_options(populate_existing=True))
+        if branch is None or not branch.is_active or branch.legal_entity_id != buyer.id:
+            raise HTTPException(409, "Selected branch does not belong to the active invoice buyer")
     seller = await service(core, "accounting", "invoice_seller").invoice_seller(
         session, data.organization_id, user, on=data.document_date, currency=data.currency
     )
@@ -197,7 +206,12 @@ async def candidate(session, core, user, deal, data, doc_id=None):
     buyer_facts = {
         "counterparty_id": buyer.id,
         "revision": buyer.revision,
-        "name": buyer.name,
+        "name": buyer.legal_name or buyer.name,
+        "display_name": buyer.display_name or buyer.name,
+        "branch": ({"id": branch.id, "revision": branch.revision,
+                    "legal_entity_id": branch.legal_entity_id, "name": branch.name,
+                    "address": branch.address, "tax_mode": branch.tax_mode,
+                    "portal_branch_code": branch.portal_branch_code} if branch else None),
         "unp": buyer.unp,
         "requisites": buyer.requisites or {},
     }

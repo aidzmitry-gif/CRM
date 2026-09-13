@@ -15,10 +15,11 @@ from decimal import ROUND_HALF_UP, Decimal
 from html.parser import HTMLParser
 
 from fastapi import HTTPException
-from sqlalchemy import select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 
-from core.domain.models import Counterparty, Sku
+from core.domain.models import Counterparty, CounterpartyBranch, Sku
 from modules.sales.models import (
     CompanyBranding,
     ContractTemplate,
@@ -108,16 +109,19 @@ async def capture(session, core, doc):
         PriceQuote.sku_code == Sku.code, PriceQuote.counterparty == Deal.counterparty,
     ).order_by(PriceQuote.created_at.desc(), PriceQuote.id.desc()).limit(1)
         .correlate(Deal, Sku).scalar_subquery())
-    buyer_id = (select(Counterparty.id).where(
-        Counterparty.name == Deal.counterparty, Counterparty.is_active.is_(True),
-    ).order_by(Counterparty.id).limit(1).correlate(Deal).scalar_subquery())
+    other_party = aliased(Counterparty)
+    competing_names = (select(func.count()).select_from(other_party).where(
+        other_party.id != Deal.counterparty_id,
+        or_(other_party.name == Deal.counterparty, other_party.display_name == Deal.counterparty),
+    ).correlate(Deal).scalar_subquery())
     rows = (await session.execute(
-        select(Deal, DealItem, Sku, PriceQuote, Counterparty, CompanyBranding, ContractTemplate)
+        select(Deal, DealItem, Sku, PriceQuote, Counterparty, CompanyBranding, ContractTemplate, CounterpartyBranch, competing_names)
         .select_from(Deal)
         .outerjoin(DealItem, DealItem.deal_id == Deal.id)
         .outerjoin(Sku, Sku.id == DealItem.sku_id)
         .outerjoin(PriceQuote, PriceQuote.id == quote_id)
-        .outerjoin(Counterparty, Counterparty.id == buyer_id)
+        .outerjoin(Counterparty, Counterparty.id == Deal.counterparty_id)
+        .outerjoin(CounterpartyBranch, CounterpartyBranch.id == Deal.branch_id)
         .outerjoin(CompanyBranding, CompanyBranding.id == 1)
         .outerjoin(ContractTemplate, ContractTemplate.id == doc.template_id)
         .where(Deal.id == doc.deal_id).order_by(DealItem.id)
@@ -125,12 +129,34 @@ async def capture(session, core, doc):
     )).all()
     if not rows:
         raise HTTPException(404, 'Сделка не найдена')
-    deal, _, _, _, cp, branding, template = rows[0]
+    deal, _, _, _, cp, branding, template, branch, name_conflicts = rows[0]
+    if cp is None:
+        raise HTTPException(409, 'Выберите контрагента по ID перед выпуском нового документа')
+    if not cp.is_active or cp.merged_into_id is not None:
+        raise HTTPException(409, 'Сторона сделки недоступна; выберите актуального контрагента')
+    if deal.branch_id is not None and (branch is None or branch.legal_entity_id != cp.id or not branch.is_active):
+        raise HTTPException(409, 'Филиал недоступен или не принадлежит стороне сделки')
+    if doc.kind == 'invoice' and name_conflicts and any(row[1] is not None for row in rows):
+        raise HTTPException(409, 'История цен неоднозначна для одинаковых названий; требуется сверка цены по контрагенту')
     seller = r._seller_with_facsimile(core, branding)
-    buyer = {'name': deal.counterparty, 'unp': cp.unp or '' if cp else ''}
-    if cp:
-        buyer.update(cp.requisites or {})
+    buyer = dict(cp.requisites or {})
     buyer.update((doc.terms_json or {}).get('buyer') or {})
+    buyer.update(name=cp.legal_name or cp.name, unp=cp.unp or '')
+    party = {
+        'legal_entity_id': cp.id,
+        'legal_entity_revision': cp.revision,
+        'display_name': cp.display_name or cp.name,
+        'legal_name': cp.legal_name,
+        'legal_entity_unp': cp.unp,
+        'branch_id': branch.id if branch else None,
+        'branch_revision': branch.revision if branch else None,
+        'branch_legal_entity_id': branch.legal_entity_id if branch else None,
+        'branch_name': branch.name if branch else None,
+        'branch_address': branch.address if branch else None,
+        'branch_tax_mode': branch.tax_mode if branch else None,
+        'portal_branch_code': branch.portal_branch_code if branch else None,
+        'identity_status': 'selected',
+    }
     lines = []
     for _, item, sku, quote, *_ in rows:
         if item is None:
@@ -169,7 +195,7 @@ async def capture(session, core, doc):
         'schema_version': 1, 'document_id': doc.id, 'version': doc.version,
         'number': doc.number, 'kind': doc.kind, 'deal_id': deal.id,
         'deal': {'number': deal.number, 'title': deal.title, 'counterparty': deal.counterparty},
-        'seller': seller, 'buyer': buyer, 'items': lines,
+        'seller': seller, 'buyer': buyer, 'party': party, 'items': lines,
         'currency': 'BYN', 'amount': str(doc.amount),
         'amount_basis': 'line_gross_total' if doc.kind == 'invoice' else 'agreed_unpriced_specification',
         'template': {'id': template.id, 'code': template.code, 'body': template.body} if template else None,

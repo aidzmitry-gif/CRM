@@ -120,6 +120,8 @@ async def exact_client(session, client_id, *, for_claim=False):
 
 
 async def preview_snapshot(session, org_id, deal, client_id):
+    if deal.counterparty_id is not None and deal.counterparty_id != client_id:
+        raise HTTPException(409, "Selected CRM party differs from the client binding")
     cp = await exact_client(session, client_id, for_claim=True)
     rows = (await session.scalars(select(DealDocument).where(DealDocument.deal_id == deal.id)
                                  .order_by(DealDocument.id).with_for_update()
