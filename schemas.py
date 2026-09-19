@@ -18,6 +18,7 @@ class DealCreate(BaseModel):
     counterparty: str
     counterparty_id: int | None = Field(default=None, ge=1)
     branch_id: int | None = Field(default=None, ge=1)
+    crm_client_id: int | None = Field(default=None, gt=0)
     amount: float = 0.0
     priority: str = "Средний"
     stage: str = "new"
@@ -81,6 +82,8 @@ class DealRead(BaseModel):
     counterparty: str
     counterparty_id: int | None = None
     branch_id: int | None = None
+    crm_client_id: int | None = None
+    crm_contact_id: int | None = None
     amount: float
     priority: str
     stage: str
@@ -149,6 +152,7 @@ class DealItemOut(BaseModel):
     title: str
     unit: str
     qty: float
+    unit_price: float | None = None  # подтверждённая цена этой строки, без НДС
     last_price: float | None = None  # последняя цена клиенту (Price Engine)
     min_price: float | None = None  # минимальная цена клиенту
 
@@ -159,12 +163,14 @@ class DealItemCreate(BaseModel):
     sku_id: int = Field(gt=0, strict=True)
     qty: Decimal = Field(default=Decimal("1.00"), gt=0, max_digits=14, decimal_places=2, allow_inf_nan=False)
     request_key: UUID | None = None
+    unit_price: Decimal | None = Field(default=None, ge=0, max_digits=14, decimal_places=2)
 
 
 class DealItemUpdate(BaseModel):
-    """Изменить позицию (количество)."""
+    """Изменить количество или явно подтвердить/снять цену строки."""
 
-    qty: float
+    qty: float = Field(default=None)
+    unit_price: Decimal | None = Field(default=None, ge=0, max_digits=14, decimal_places=2)
 
 
 class SkuOut(BaseModel):
@@ -190,6 +196,10 @@ class ContactOut(BaseModel):
     is_primary: bool
 
 
+class CrmContactOut(ContactOut):
+    crm_client_id: int
+
+
 class ContactCreate(BaseModel):
     """Добавить контакт контрагенту сделки."""
 
@@ -197,6 +207,7 @@ class ContactCreate(BaseModel):
     phone: str | None = None
     email: str | None = None
     is_primary: bool = False
+    request_key: str | None = Field(default=None, min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
 
 
 class ChatOut(BaseModel):
@@ -236,8 +247,15 @@ class DocumentCreate(BaseModel):
     """Запрос на формирование документа сделки (счёт/договор/заказ)."""
 
     kind: Literal["contract", "order"]
+    reserve_mode: Literal["stock", "on_order"] = "stock"
     request_key: str | None = Field(default=None, min_length=8, max_length=64)
     requested_by: str = ""  # инициатор (для согласования договора)
+
+    @model_validator(mode="after")
+    def invoice_reserve_mode(self):
+        if self.reserve_mode == "on_order" and self.kind != "invoice":
+            raise ValueError("Режим «под заказ» доступен только для счёта")
+        return self
 
 
 class InvoicePrice(BaseModel):
@@ -319,6 +337,7 @@ class InvoiceCreate(InvoiceIssueInput):
 class DocumentRevision(BaseModel):
     reason: str = Field(min_length=3, max_length=500)
     request_key: str = Field(min_length=8, max_length=64)
+    reserve_mode: Literal["stock", "on_order"] | None = None  # None inherits the original.
 
 
     @model_validator(mode="after")
@@ -358,7 +377,7 @@ class DocumentOut(BaseModel):
     onec_ref: str | None = None
     amount: float
     valid_until: datetime.date | None = None  # SALES-51: срок действия счёта (резерв)
-    reserve_status: str = "none"  # none | reserved | consumed | released
+    reserve_status: str = "none"  # none | unreserved | reserved | consumed | released
     reserve_mode: Literal["stock", "on_order"] | None = None
     version: int = 1
     supersedes_id: int | None = None
@@ -619,7 +638,7 @@ class MarginLine(BaseModel):
     """Маржа позиции сделки: цена клиенту × кол-во минус landed себестоимость × кол-во.
 
     ``status`` — honest-разбивка: ``priced`` (есть цена И landed → попадает в gross);
-    ``no_price`` (нет последней котировки клиенту); ``no_cost`` (нет закрытого landed по SKU).
+    ``no_price`` (нет подтверждённой цены строки сделки); ``no_cost`` (нет закрытого landed по SKU).
     Позиции без обоих в gross НЕ попадают (не маскируем дыру нулём — [[landed_cost]]).
     """
 
@@ -637,7 +656,7 @@ class MarginLine(BaseModel):
     cost_fixed_at: datetime.datetime | None = None
     cost_fx_rate: float | None = None
     # Провенанс источника (PC3) — для честной пометки в UI, «откуда цифра».
-    # cost_source: "onec"|"demo"|"landed"|None; price_source: "quote" (КП клиента)|"onec"|"demo"|None.
+    # cost_source: "onec"|"demo"|"landed"|None; price_source: "quote" (подтверждённая цена строки)|None.
     cost_source: str | None = None
     price_source: str | None = None
 
@@ -824,6 +843,7 @@ class MessageCreate(BaseModel):
     text: str
     author: str = ""
     direction: str = "out"  # out — от менеджера, in — от клиента
+    request_key: str | None = Field(default=None, min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
 
 
 class MessageOut(BaseModel):
@@ -939,8 +959,15 @@ class TaskUpdate(BaseModel):
     kind: str | None = None
     assignee_id: int | None = None
     due_at: datetime.datetime | None = None
-    status: str | None = None  # open|done|canceled
+    status: Literal["open", "done", "canceled"] | None = None
     result: str | None = None
+
+    @model_validator(mode="after")
+    def nonnull_task_fields(self):
+        for field in ("title", "kind", "status"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"Поле {field} не может быть null")
+        return self
 
 
 class TaskOut(BaseModel):

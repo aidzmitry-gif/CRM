@@ -6,81 +6,18 @@ to the whole CRM department or only the employee's own deals.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from fastapi import Depends, HTTPException, Request
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config.access import is_super
-from config.settings import get_settings
-from core.domain.models import User
-from core.runtime.deps import get_session
-from core.services.auth import CurrentUser, get_current_user
-from modules.sales.models import Deal
-
-# ``Deal.owner_id`` stores ``hr.employee.id`` (via this soft link), never the
-# primary key of app_user.  Only a current CRM employee may become a confirmed
-# numeric owner; a legacy text owner remains display-only.
-CRM_OWNER_ROLES = frozenset({"sales_head", "sales", "sales_manager", "sales_cli"})
-
-
-@dataclass(frozen=True)
-class DealAccess:
-    """Resolved, request-scoped visibility. ``employee_id`` is required for own."""
-
-    visibility: str
-    employee_id: int | None = None
-
-    @property
-    def own_only(self) -> bool:
-        return self.visibility == "own"
-
-
-async def get_deal_access(
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-    user: CurrentUser = Depends(get_current_user),
-) -> DealAccess:
-    """Resolve a user's persistent scope without trusting client filters.
-
-    A signed OIDC subject is the authoritative identity: never fall back to a
-    renameable username for it. Header/test authentication without a subject
-    may use username. Unlinked legacy directors remain supported only through
-    the explicit super-role bypass above.
-    """
-    # Operational liveness is intentionally identity-independent. It exposes
-    # no CRM data and must stay usable before the database is reachable.
-    if request.url.path == "/sales/ping":
-        return DealAccess("all")
-    return await get_deal_access_for_user(session, user)
-
-
-async def get_deal_access_for_user(session: AsyncSession, user: CurrentUser) -> DealAccess:
-    """The existing persistent scope, without HTTP liveness bypass."""
-    if is_super(user.roles):
-        return DealAccess("all")
-
-    identity_filter = (
-        User.keycloak_user_id == user.keycloak_user_id
-        if user.keycloak_user_id
-        else User.username == user.username
-    )
-    app_user = (await session.execute(select(User).where(identity_filter)
-        .execution_options(populate_existing=True))).scalar_one_or_none()
-    if app_user is None:
-        if not user.keycloak_user_id and get_settings().auth_mode == "dev":
-            return DealAccess("all")
-        raise HTTPException(status_code=403, detail="Учётная запись сотрудника не связана с CRM")
-    if app_user.status != "active":
-        raise HTTPException(status_code=403, detail="Учётная запись сотрудника не активна")
-
-    visibility = getattr(app_user, "deal_visibility", "all")
-    if visibility == "all":
-        return DealAccess("all", app_user.employee_id)
-    if visibility != "own" or app_user.employee_id is None:
-        raise HTTPException(status_code=403, detail="Не настроен безопасный доступ к сделкам")
-    return DealAccess("own", app_user.employee_id)
+from core.domain.models import Counterparty
+from core.services.crm_access import CrmAccess as DealAccess
+from core.services.crm_access import get_crm_access as get_deal_access
+from core.services.crm_access import (
+    get_crm_access_for_user as get_deal_access_for_user,  # noqa: F401 - command API
+)
+from core.services.crm_owners import resolve_crm_owner
+from modules.sales.models import CallLog, Deal
 
 
 def scope_deals(stmt, access: DealAccess):
@@ -88,10 +25,71 @@ def scope_deals(stmt, access: DealAccess):
     return stmt.where(Deal.owner_id == access.employee_id) if access.own_only else stmt
 
 
+def unique_counterparty_names():
+    """Keep the same fail-closed name resolution as deal contact endpoints."""
+    return select(Counterparty.name).group_by(Counterparty.name).having(
+        func.count(Counterparty.id) == 1,
+    ).correlate(None)
+
+
+def scope_counterparties(stmt, access: DealAccess):
+    if not access.own_only:
+        return stmt
+    return stmt.where(
+        Counterparty.name.in_(scope_deals(select(Deal.counterparty).where(Deal.crm_client_id.is_(None)), access)),
+        Counterparty.name.in_(unique_counterparty_names()),
+    )
+
+
+def scope_calls(stmt, access: DealAccess):
+    """Linked calls follow deal scope; unlinked calls require a confirmed owner."""
+    if not access.own_only:
+        return stmt
+    own_deals = scope_deals(select(Deal.id), access)
+    return stmt.where(or_(
+        CallLog.deal_id.in_(own_deals),
+        and_(CallLog.deal_id.is_(None), CallLog.owner_id == access.employee_id),
+    ))
+
+
+async def visible_call_or_404(session: AsyncSession, call_id: int, access: DealAccess) -> CallLog:
+    call = (await session.execute(scope_calls(select(CallLog).where(CallLog.id == call_id), access))).scalar_one_or_none()
+    if call is None:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    return call
+
+
+async def locked_call_for_write(
+    session: AsyncSession, call_id: int, access: DealAccess, target_deal_id: int | None = None,
+) -> CallLog:
+    """Keep call assignment and both deal owners stable until the caller commits."""
+    call = (await session.execute(
+        select(CallLog).where(CallLog.id == call_id).with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if call is None:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    deal_ids = {value for value in (call.deal_id, target_deal_id) if value is not None}
+    if deal_ids:
+        await session.execute(
+            select(Deal).where(Deal.id.in_(deal_ids)).order_by(Deal.id).with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    if call.deal_id is not None:
+        await visible_deal_or_404(session, call.deal_id, access)
+    elif access.own_only and call.owner_id != access.employee_id:
+        raise HTTPException(status_code=404, detail="Звонок не найден")
+    if target_deal_id is not None:
+        await visible_deal_or_404(session, target_deal_id, access)
+    return call
+
+
 async def visible_deal_or_404(
-    session: AsyncSession, deal_id: int, access: DealAccess
+    session: AsyncSession, deal_id: int, access: DealAccess, *, lock: bool = False
 ) -> Deal:
     stmt = select(Deal).where(Deal.id == deal_id)
+    if lock:
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
     deal = (await session.execute(scope_deals(stmt, access))).scalar_one_or_none()
     if deal is None:
         # 404 deliberately does not reveal that another department member owns it.
@@ -134,18 +132,7 @@ async def resolve_owner_assignment(
     assigned_id = require_owner_assignment(access, owner_id)
     if assigned_id is None:
         return None, None
-    assigned = (
-        await session.execute(
-            select(User).where(
-                User.employee_id == assigned_id,
-                User.status == "active",
-                User.department == "Продажи",
-                User.role.in_(CRM_OWNER_ROLES),
-            )
-        )
-    ).scalar_one_or_none()
-    if assigned is None:
-        raise HTTPException(status_code=422, detail="Владелец сделки не является активным сотрудником CRM")
+    assigned = await resolve_crm_owner(session, employee_id=assigned_id)
     return assigned.employee_id, assigned.full_name
 
 
@@ -159,6 +146,7 @@ _OWN_ROUTE_NAMES = frozenset(
         "pipeline_analytics",
         "pipeline_stage_metrics",
         "list_deals",
+        "list_funnels",
         "get_deal",
         "update_deal",
         "create_deal",
@@ -172,13 +160,19 @@ _OWN_ROUTE_NAMES = frozenset(
         "deal_history",
         "list_tasks",
         "create_task",
+        "update_task",
         "list_deal_items",
         "repeat_last_order",
         "add_deal_item",
         "update_deal_item",
         "delete_deal_item",
         "list_contacts",
+        "list_crm_clients",
+        "create_crm_client", "get_crm_client", "crm_client_owners",
+        "list_crm_client_contacts", "add_crm_client_contact", "primary_crm_client_contact", "list_crm_client_deals", "list_crm_client_documents",
+        "list_crm_contacts",
         "add_contact",
+        "set_primary_contact",
         "list_chats",
         "list_documents",
         "create_document",
@@ -187,6 +181,7 @@ _OWN_ROUTE_NAMES = frozenset(
         "decide_document", "render_document", "document_snapshot", "render_package",
         "render_saved_package", "send_package", "preview_document",
         "list_messages",
+        "list_calls", "get_call", "call_comment", "call_result", "call_link_deal",
         "create_message",
         "mark_messages_read",
         "ai_draft_reply",

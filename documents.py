@@ -15,18 +15,17 @@ from decimal import ROUND_HALF_UP, Decimal
 from html.parser import HTMLParser
 
 from fastapi import HTTPException
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import aliased
 
 from core.domain.models import Counterparty, CounterpartyBranch, Sku
 from modules.sales.models import (
     CompanyBranding,
     ContractTemplate,
+    CrmClient,
     Deal,
     DealDocument,
     DealItem,
-    PriceQuote,
 )
 
 
@@ -105,21 +104,12 @@ async def capture(session, core, doc):
     """Save the agreed candidate; called only on issue or submission, never GET."""
     from modules.sales import routes as r
 
-    quote_id = (select(PriceQuote.id).where(
-        PriceQuote.sku_code == Sku.code, PriceQuote.counterparty == Deal.counterparty,
-    ).order_by(PriceQuote.created_at.desc(), PriceQuote.id.desc()).limit(1)
-        .correlate(Deal, Sku).scalar_subquery())
-    other_party = aliased(Counterparty)
-    competing_names = (select(func.count()).select_from(other_party).where(
-        other_party.id != Deal.counterparty_id,
-        or_(other_party.name == Deal.counterparty, other_party.display_name == Deal.counterparty),
-    ).correlate(Deal).scalar_subquery())
     rows = (await session.execute(
-        select(Deal, DealItem, Sku, PriceQuote, Counterparty, CompanyBranding, ContractTemplate, CounterpartyBranch, competing_names)
+        select(Deal, DealItem, Sku, Counterparty, CompanyBranding, ContractTemplate, CounterpartyBranch, CrmClient)
         .select_from(Deal)
+        .outerjoin(CrmClient, CrmClient.id == Deal.crm_client_id)
         .outerjoin(DealItem, DealItem.deal_id == Deal.id)
         .outerjoin(Sku, Sku.id == DealItem.sku_id)
-        .outerjoin(PriceQuote, PriceQuote.id == quote_id)
         .outerjoin(Counterparty, Counterparty.id == Deal.counterparty_id)
         .outerjoin(CounterpartyBranch, CounterpartyBranch.id == Deal.branch_id)
         .outerjoin(CompanyBranding, CompanyBranding.id == 1)
@@ -129,15 +119,15 @@ async def capture(session, core, doc):
     )).all()
     if not rows:
         raise HTTPException(404, 'Сделка не найдена')
-    deal, _, _, _, cp, branding, template, branch, name_conflicts = rows[0]
+    deal, _, _, cp, branding, template, branch, client = rows[0]
     if cp is None:
         raise HTTPException(409, 'Выберите контрагента по ID перед выпуском нового документа')
     if not cp.is_active or cp.merged_into_id is not None:
         raise HTTPException(409, 'Сторона сделки недоступна; выберите актуального контрагента')
     if deal.branch_id is not None and (branch is None or branch.legal_entity_id != cp.id or not branch.is_active):
         raise HTTPException(409, 'Филиал недоступен или не принадлежит стороне сделки')
-    if doc.kind == 'invoice' and name_conflicts and any(row[1] is not None for row in rows):
-        raise HTTPException(409, 'История цен неоднозначна для одинаковых названий; требуется сверка цены по контрагенту')
+    if deal.crm_client_id is not None and (client is None or client.counterparty_id != cp.id):
+        raise HTTPException(409, 'CRM-клиент не связан с выбранным контрагентом документа')
     seller = r._seller_with_facsimile(core, branding)
     buyer = dict(cp.requisites or {})
     buyer.update((doc.terms_json or {}).get('buyer') or {})
@@ -158,7 +148,7 @@ async def capture(session, core, doc):
         'identity_status': 'selected',
     }
     lines = []
-    for _, item, sku, quote, *_ in rows:
+    for _, item, sku, *_ in rows:
         if item is None:
             continue
         if item.qty <= 0:
@@ -166,13 +156,15 @@ async def capture(session, core, doc):
         line = {'item_id': item.id, 'sku_id': item.sku_id, 'sku_code': sku.code if sku else None,
                 'name': sku.title if sku else f'позиция #{item.sku_id}',
                 'unit': sku.unit if sku else 'шт', 'qty': str(item.qty), 'currency': 'BYN',
-                'discount': None, 'quote_id': quote.id if quote else None}
+                'discount': None, 'quote_id': None}
         if doc.kind == 'invoice':
-            if quote is None or quote.price < 0:
-                raise HTTPException(422, 'Для выпуска счёта нужна неотрицательная цена каждой позиции')
-            net, tax, gross = r._invoice_line(item.qty, quote.price)
-            line.update(price=str(quote.price), net=str(net), tax=str(tax), total=str(gross),
-                        vat_rate=str(r._INVOICE_VAT_RATE))
+            if sku is None:
+                raise HTTPException(422, 'Номенклатура позиции счёта не найдена')
+            if item.unit_price is None or not item.unit_price.is_finite() or item.unit_price < 0:
+                raise HTTPException(422, 'Для выпуска счёта подтвердите неотрицательную цену каждой позиции')
+            net, tax, gross = r._invoice_line(item.qty, item.unit_price)
+            line.update(price=str(item.unit_price), net=str(net), tax=str(tax), total=str(gross),
+                        vat_rate=str(r._INVOICE_VAT_RATE), basis='confirmed_deal_item_price')
         else:
             # Existing contract model is an unpriced specification with one agreed total.
             line.update(price=None, net=None, tax=None, total=None, vat_rate=None)
@@ -194,6 +186,7 @@ async def capture(session, core, doc):
     source = {
         'schema_version': 1, 'document_id': doc.id, 'version': doc.version,
         'number': doc.number, 'kind': doc.kind, 'deal_id': deal.id,
+        'reserve_mode': doc.reserve_mode,
         'deal': {'number': deal.number, 'title': deal.title, 'counterparty': deal.counterparty},
         'seller': seller, 'buyer': buyer, 'party': party, 'items': lines,
         'currency': 'BYN', 'amount': str(doc.amount),

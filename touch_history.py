@@ -32,7 +32,11 @@ class SalesTouchHistory:
         ).limit(1)) is not None
 
     async def _deal_ids(self, session: AsyncSession, counterparty_id: int) -> list[int]:
-        return list(await session.scalars(select(Deal.id).where(Deal.counterparty_id == counterparty_id)))
+        # Shared MDM history must not expose an independently owned CRM client.
+        return list(await session.scalars(select(Deal.id).where(
+            Deal.counterparty_id == counterparty_id,
+            Deal.crm_client_id.is_(None),
+        )))
 
     def _call_filter(self, counterparty_id: int, deal_ids: list[int]):
         # Звонок принадлежит контрагенту, если у него его counterparty_id ИЛИ он привязан

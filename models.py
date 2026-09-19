@@ -6,9 +6,11 @@ from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Numeric,
     String,
     Text,
@@ -17,12 +19,55 @@ from sqlalchemy import (
     func,
     inspect,
     select,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.db.base import Base
 from modules.sales.invoice_notifications import InvoiceNotification  # noqa: F401
 from modules.sales.mail_models import EmailAttempt, OutgoingEmail  # noqa: F401
+
+
+class CrmClient(Base):
+    """Independent CRM relationship; never grants write access to shared MDM."""
+
+    __tablename__ = "crm_client"
+    __table_args__ = (
+        UniqueConstraint("owner_id", "request_key", name="uq_crm_client_owner_request"),
+        UniqueConstraint("owner_id", "name_key", name="uq_crm_client_owner_name"),
+        UniqueConstraint("owner_id", "unp", name="uq_crm_client_owner_unp"),
+        {"schema": "sales"},
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    name_key: Mapped[str] = mapped_column(String(1024))
+    unp: Mapped[str | None] = mapped_column(String(9))
+    owner_id: Mapped[int] = mapped_column(index=True)  # Same employee identity as Deal.owner_id.
+    counterparty_id: Mapped[int | None] = mapped_column(ForeignKey("counterparty.id"))
+    request_key: Mapped[str] = mapped_column(String(64))
+    request_hash: Mapped[str] = mapped_column(String(64))
+    created_by: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class CrmClientContact(Base):
+    __tablename__ = "crm_client_contact"
+    __table_args__ = (
+        UniqueConstraint("crm_client_id", "request_key", name="uq_crm_contact_request"),
+        UniqueConstraint("crm_client_id", "contact_key", name="uq_crm_contact_exact"),
+        Index("uq_crm_contact_primary", "crm_client_id", unique=True,
+              postgresql_where=text("is_primary"), sqlite_where=text("is_primary")),
+        {"schema": "sales"},
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    crm_client_id: Mapped[int] = mapped_column(ForeignKey("sales.crm_client.id"), index=True)
+    full_name: Mapped[str] = mapped_column(String(255))
+    phone: Mapped[str | None] = mapped_column(String(64))
+    email: Mapped[str | None] = mapped_column(String(255))
+    is_primary: Mapped[bool] = mapped_column(default=False, server_default="false")
+    contact_key: Mapped[str] = mapped_column(String(64))
+    request_key: Mapped[str] = mapped_column(String(64))
+    request_hash: Mapped[str] = mapped_column(String(64))
 
 
 class Deal(Base):
@@ -38,6 +83,8 @@ class Deal(Base):
     # Shared-kernel soft references; legacy text remains the original display label.
     counterparty_id: Mapped[int | None] = mapped_column(index=True)
     branch_id: Mapped[int | None] = mapped_column(index=True)
+    crm_client_id: Mapped[int | None] = mapped_column(ForeignKey("sales.crm_client.id"), index=True)
+    crm_contact_id: Mapped[int | None] = mapped_column()
     amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0"), server_default="0")
     priority: Mapped[str] = mapped_column(String(32), default="Средний", server_default="Средний")
     stage: Mapped[str] = mapped_column(String(32), default="new", server_default="new")
@@ -115,12 +162,17 @@ class DealItem(Base):
     """
 
     __tablename__ = "deal_item"
-    __table_args__ = {"schema": "sales"}
+    __table_args__ = (
+        CheckConstraint("unit_price >= 0", name="unit_price_nonnegative"),
+        {"schema": "sales"},
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     deal_id: Mapped[int] = mapped_column(ForeignKey("sales.deal.id"))
     sku_id: Mapped[int] = mapped_column()
     qty: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("1"), server_default="1")
+    # Confirmed net unit price for this line; NULL requires explicit pricing.
+    unit_price: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
 
 
 class DealItemRequest(Base):
@@ -167,6 +219,7 @@ class DealDocument(Base):
     posted_at: Mapped[datetime | None] = mapped_column(DateTime)
     # SALES-51: резерв под счёт/заказ + срок действия счёта (valid_until = +AIOS_INVOICE_VALID_DAYS дн.).
     # reserve_status: none → reserved → consumed (отгрузка) | released (истёк/снят).
+    # Explicit on-order invoices issue as unreserved without changing stock.
     valid_until: Mapped[date | None] = mapped_column(Date)
     reserve_status: Mapped[str] = mapped_column(String(16), default="none", server_default="none")
     reserved_at: Mapped[datetime | None] = mapped_column(DateTime)
@@ -193,6 +246,16 @@ class DealDocument(Base):
     issued_by: Mapped[str | None] = mapped_column(String(200))
 
     @property
+    def reserve_mode(self) -> str:
+        # A captured original owns its mode. Legacy originals without this field
+        # are always stock, even if mutable draft terms are subsequently changed.
+        if self.snapshot_json is not None:
+            return self.snapshot_json.get("reserve_mode", "stock")
+        if self.issued_at or self.original_html or self.status in {"posted", "paid", "cancelled"}:
+            return "stock"
+        return (self.terms_json or {}).get("reserve_mode", "stock")
+
+    @property
     def original_state(self) -> str:
         if self.issued_at and self.original_html:
             return "issued"
@@ -202,12 +265,6 @@ class DealDocument(Base):
             return "legacy_unavailable"
         return "draft"
 
-    @property
-    def reserve_mode(self) -> str | None:
-        snapshot = self.snapshot_json
-        if self.kind == "invoice" and isinstance(snapshot, dict) and snapshot.get("issuance_mode") == "erp_issuance_v1":
-            return snapshot.get("reserve_mode", "stock")
-        return None
 
 
 class DocumentPackage(Base):
@@ -252,7 +309,7 @@ class Message(Base):
     """
 
     __tablename__ = "message"
-    __table_args__ = {"schema": "sales"}
+    __table_args__ = (UniqueConstraint("deal_id", "request_key", name="uq_message_deal_request"), {"schema": "sales"})
 
     id: Mapped[int] = mapped_column(primary_key=True)
     deal_id: Mapped[int] = mapped_column(ForeignKey("sales.deal.id"))
@@ -260,6 +317,7 @@ class Message(Base):
     direction: Mapped[str] = mapped_column(String(8), default="out", server_default="out")  # in|out
     author: Mapped[str] = mapped_column(String(128), default="", server_default="")
     text: Mapped[str] = mapped_column(Text)
+    request_key: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     read_at: Mapped[datetime | None] = mapped_column(DateTime)  # SALES-49: когда прочитано (входящее)
 

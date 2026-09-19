@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import select
 
@@ -29,20 +30,46 @@ async def on_lead_converted(payload: dict, ctx) -> None:
     """
     if ctx is None:
         return
-    from decimal import Decimal, InvalidOperation
+    from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
     lead_id = payload.get("lead_id")
     if not lead_id:
         return
     from modules.sales.models import Deal, DealItem, PriceQuote
+    strict = payload.get("crm_link_version") == 1
+    if strict:
+        from datetime import datetime, timezone
+
+        from core.services.crm_access import CrmAccess
+        gateway = ctx.services.crm_clients
+        if gateway is None:
+            raise RuntimeError("CRM client lookup unavailable")
+        await gateway.resolve_link(ctx.session, actor=CrmAccess("own", payload["owner_id"]),
+                                   client_id=payload["crm_client_id"], contact_id=payload.get("crm_contact_id"),
+                                   expected_owner_id=payload["owner_id"], lock="shared")
+        for raw in payload.get("items") or []:
+            qty, price = Decimal(str(raw["qty"])), Decimal(str(raw["price"]))
+            if not qty.is_finite() or not price.is_finite() or qty <= 0 or price < 0:
+                raise ValueError("Invalid confirmed CRM lead money")
+        stamp = payload.get("next_step_at")
+        next_at = datetime.fromisoformat(stamp) if stamp else None
+        if next_at is not None and next_at.tzinfo is not None:
+            next_at = next_at.astimezone(timezone.utc).replace(tzinfo=None)
+        if len(payload.get("next_step") or "") > 128:
+            raise ValueError("CRM next step exceeds deal limit")
 
     # Идемпотентность (B2): шина at-least-once + синхронный relay_once в convert_lead → событие
     # может прийти дважды; Deal.number unique → повтор вставки = IntegrityError на commit ВНУТРИ
     # relay_once = poison ВСЕЙ шины на тике. Гард по существующей сделке (как в on_deal_won_handoff).
     number = f"CRM-LEAD-{lead_id}"
-    if (
-        await ctx.session.execute(select(Deal.id).where(Deal.number == number))
-    ).scalars().first() is not None:
+    def check_replay(existing):
+        if strict and (existing.owner_id, existing.crm_client_id, existing.crm_contact_id) != (
+            payload["owner_id"], payload["crm_client_id"], payload.get("crm_contact_id")):
+            raise ValueError("Conflicting numeric lead conversion")
+
+    existing = (await ctx.session.execute(select(Deal).where(Deal.number == number))).scalar_one_or_none()
+    if existing is not None:
+        check_replay(existing)
         return
 
     deal = Deal(
@@ -50,37 +77,58 @@ async def on_lead_converted(payload: dict, ctx) -> None:
         title=payload.get("title") or "Лид",
         counterparty=payload.get("counterparty") or "Новый лид",
         owner=payload.get("owner", ""),
+        # The producer validated this employee ID before committing conversion.
+        # Keep its assignment snapshot if the account changes before delivery.
+        # Legacy events have no numeric identity and retain display-only ownership.
+        owner_id=payload.get("owner_id"),
+        crm_client_id=payload.get("crm_client_id") if strict else None,
+        crm_contact_id=payload.get("crm_contact_id") if strict else None,
+        next_step=payload.get("next_step") if strict else None,
+        next_step_at=next_at if strict else None,
+        funnel=payload.get("funnel") or "new_clients",
         stage="new",
         priority=payload.get("priority", "Средний"),
     )
-    ctx.session.add(deal)
-    await ctx.session.flush()
+    if strict and ctx.session.get_bind().dialect.name == "postgresql":
+        from sqlalchemy.exc import IntegrityError
+        try:
+            async with ctx.session.begin_nested():
+                ctx.session.add(deal)
+                await ctx.session.flush()
+        except IntegrityError:
+            existing = (await ctx.session.execute(select(Deal).where(Deal.number == number))).scalar_one_or_none()
+            if existing is None:
+                raise
+            check_replay(existing)
+            return
+    else:
+        ctx.session.add(deal)
+        await ctx.session.flush()
 
     total = Decimal("0")
     for raw in payload.get("items") or []:
         try:
             sku_id = int(raw["sku_id"])
-            qty = Decimal(str(raw.get("qty") or 1))
-            price = Decimal(str(raw.get("price") or 0))
-            disc = Decimal(str(raw.get("discount_pct") or 0))
+            qty = Decimal(str(raw["qty"])) if strict else Decimal(str(raw.get("qty") or 1))
+            price = Decimal(str(raw["price"])) if strict else Decimal(str(raw.get("price") or 0))
         except (KeyError, TypeError, ValueError, InvalidOperation):
+            if strict:
+                raise
             continue
         if qty <= 0:
             continue
-        ctx.session.add(DealItem(deal_id=deal.id, sku_id=sku_id, qty=qty))
-        # Котировка клиенту (S3): печать счёта берёт цену из PriceQuote(sku_code, counterparty)
-        # (routes._invoice_items) — без записи счёт печатается с НУЛЯМИ при верной сумме сделки.
-        # Цена-за-единицу ПОСЛЕ скидки: unit×qty == сумма позиции == Deal.amount; счёт скидку
-        # повторно не применяет (net=qty×price), поэтому цена ДО скидки завысила бы счёт клиенту.
-        # Пишем только при непустом sku_code и цене >0 (disc=100 / price=0 → без котировки).
-        unit_price = (price * (Decimal("1") - disc / Decimal("100"))).quantize(Decimal("0.01"))
+        # LeadItem.price уже учитывает скидку; discount_pct — только справочная метка.
+        # Строка сохраняет переданную подтверждённую цену, включая явный ноль.
+        # PriceQuote пополняет историю клиента, но не задаёт цену уже созданной строки.
+        unit_price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        ctx.session.add(DealItem(deal_id=deal.id, sku_id=sku_id, qty=qty, unit_price=unit_price))
         sku_code = (raw.get("sku_code") or "").strip()
         if unit_price > 0 and sku_code:
             ctx.session.add(
                 PriceQuote(sku_code=sku_code, counterparty=deal.counterparty, price=unit_price)
             )
-        # линия = price×qty×(1−скидка%); деньги Decimal, не float
-        line = (price * qty * (Decimal("1") - disc / Decimal("100"))).quantize(Decimal("0.01"))
+        # Сумма сделки совпадает с сохранёнными ценами строк и нетто будущего счёта.
+        line = (unit_price * qty).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         total += line
     deal.amount = total
 
@@ -231,31 +279,20 @@ async def on_deal_won_handoff(payload: dict, ctx) -> None:
     gross_profit: float | None = None
     facade = getattr(ctx.services, "landed_cost", None)
     if facade is not None and items:
-        # Бюджет: тянем landed по уникальным кодам, цену клиенту из PriceQuote.
+        # Цена принадлежит строке сделки; история котировок не подтверждает её.
         codes = sorted({it["sku_code"] for it in items if it["sku_code"]})
         landed = await facade.last_landed_cost_batch(ctx.session, codes)
-        from modules.sales.models import PriceQuote
-
-        quotes = (
-            await ctx.session.execute(
-                select(PriceQuote)
-                .where(PriceQuote.counterparty == deal.counterparty, PriceQuote.sku_code.in_(codes))
-                .order_by(PriceQuote.id)
-            )
-        ).scalars().all()
-        last_price: dict[str, float] = {}
-        for q in quotes:
-            last_price[q.sku_code] = float(q.price)
-        gp = 0.0
-        any_priced = False
-        for it in items:
-            code = it["sku_code"]
-            price = last_price.get(code)
+        gp = Decimal("0")
+        for row in items_rows:
+            sku = sku_map.get(row.sku_id)
+            code = sku.code if sku is not None else ""
             cost_row = landed.get(code)
-            if price is not None and cost_row is not None:
-                any_priced = True
-                gp += (price - float(cost_row["unit_landed_cost_byn"])) * it["qty"]
-        gross_profit = round(gp, 2) if any_priced else None
+            cost = cost_row.get("unit_landed_cost_byn") if cost_row is not None else None
+            if row.unit_price is None or cost is None:
+                break  # DTO не умеет маркировать частичный итог: неизвестное остаётся None.
+            gp += (Decimal(str(row.unit_price)) - Decimal(str(cost))) * Decimal(str(row.qty))
+        else:
+            gross_profit = float(gp.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
     ctx.services.event_bus.emit(
         ctx.session,
