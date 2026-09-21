@@ -8,7 +8,7 @@
 ## Назначение
 CRM-модуль: ведёт сделки по воронке (канбан-доска), вход воронки через лиды
 (приём → квалификация → распределение → конвертация в сделку), позиции номенклатуры
-со ссылкой на SKU shared-kernel, документы сделки с записью в 1С и согласованием
+со ссылкой на SKU shared-kernel, локальные документы сделки и согласование
 договоров, омниканальную переписку, KPI «План/Факт», ценовой движок (история котировок)
 и AI-ассистента (черновики ответов, резюме, квалификация лидов) за feature-flag.
 
@@ -47,7 +47,7 @@ CRM-модуль: ведёт сделки по воронке (канбан-до
   - `sales.deal.created` (создание сделки и конвертация лида)
   - `sales.item.changed` (добавлена позиция)
   - `sales.document.created` (договор отправлен на согласование)
-  - `sales.document.posted` (документ записан в 1С)
+  - `sales.document.posted` (документ выпущен в ERP; исходящая связь 1С отражена в payload)
   - `sales.document.rejected` (договор отклонён)
   - `sales.stock.reserved` (резерв остатков под заказ)
   - `sales.package.sent` (отправлен пакет «счёт + договор», SALES-53)
@@ -94,13 +94,13 @@ CRM-модуль: ведёт сделки по воронке (канбан-до
 
 ## Межмодульные связи и зависимости
 - Реагирует на события: `marketing.campaign.launched` (создаёт лиды в приёме), `finance.payment.paid` (счёт → paid по `number == ref`), `logistics.shipment.delivered` (сделка → `won` по `deal_id`).
-- Сервисы ядра (`core.services`): `onec` (запись документов в 1С — `post_document`), `stock` (резерв остатков под заказ — `reserve`), `approvals` (согласование договоров/сделок — `request`/`decide`), `llm` (AI-шлюз, `enabled`/`model`/`complete`), `event_bus` (outbox), `auth` (`require_permission`).
+- Сервисы ядра (`core.services`): `onec` (опциональный проверенный исходящий адаптер — `post_document`), `stock` (резерв остатков под заказ — `reserve`), `approvals` (согласование договоров/сделок — `request`/`decide`), `llm` (AI-шлюз, `enabled`/`model`/`complete`), `event_bus` (outbox), `auth` (`require_permission`).
 - Shared kernel: `Sku`, `Counterparty`, `Contact`, `Approval` из `core.domain.models`.
 
 ## Подводные камни / важные детали
 - **Стадии воронки** (`stages.py`, id): `new`, `qual`, `prop`, `appr`, `won`. Модели по умолчанию `stage="new"`. Логистика закрывает в `won`.
 - **Лид-воронка**: статусы `new → qualified → routed → converted` (или `rejected`). Конвертация требует статус `routed` (иначе 409); создаёт сделку `CRM-LEAD-{id}` со стадией `new`.
-- **Документы**: счёт/заказ пишутся в 1С сразу (`draft→posted`); договор (`REQUIRES_APPROVAL={"contract"}`) идёт через согласование (`pending_approval`), запись в 1С — после `POST /documents/{id}/decide`. Заказ (`RESERVES_STOCK={"order"}`) резервирует остатки. Отсутствие интеграции 1С → 503.
+- **Документы**: `draft→posted` означает выпуск в ERP; договор (`REQUIRES_APPROVAL={"contract"}`) сначала идёт на согласование (`pending_approval`). Проверенный исходящий 1С-адаптер может добавить `onec_ref`; его отсутствие не блокирует локальный выпуск. Заказ (`RESERVES_STOCK={"order"}`) резервирует остатки.
 - **KPI план/факт**: факт — сумма `Activity.value` в окне `PERIOD_DAYS` от последней даты активности; план — `target * PERIOD_MULT` (рабочие дни периода).
 - **AI за feature-flag** `AIOS_AI_ENABLED`: при выкл AI-эндпоинты возвращают 503, квалификация лида падает на детерминированный скоринг (`leads.score_lead`, порог `QUALIFY_THRESHOLD=50`), эмитит `sales.lead.qualified` вместо `ai.lead.qualified`.
 - **AI-агент реактивно**: `on_incoming_message_ai` срабатывает на `sales.message.sent` только для `direction == "in"` и при включённом AI (обработчик с `(payload, ctx)`).

@@ -190,7 +190,7 @@ leads_router = APIRouter(tags=["leads"])
 # Префикс номера и человекочитаемое название документа по типу.
 DOC_NUMBER_PREFIX = {"invoice": "СЧ", "contract": "ДГ", "order": "ЗК"}
 DOC_TITLES = {"invoice": "Счёт", "contract": "Договор", "order": "Заказ"}
-# Типы документов, требующие согласования до записи в 1С (договор → юрист, ч.4).
+# Типы документов, требующие согласования до выпуска в ERP (договор → юрист, ч.4).
 REQUIRES_APPROVAL = {"contract"}
 # Типы документов, резервирующие складские остатки при проведении (счёт и заказ, SALES-51).
 RESERVES_STOCK = {"invoice", "order"}
@@ -288,7 +288,7 @@ def _task_out(task: DealTask) -> TaskOut:
 
 
 async def _deal_stock_items(session: AsyncSession, deal_id: int) -> list[dict]:
-    """Позиции сделки как ``[{sku_code, qty}]`` (для резервирования остатков в 1С)."""
+    """Позиции сделки как ``[{sku_code, qty}]`` для резервирования через складской фасад."""
     rows = (
         await session.execute(select(DealItem).where(DealItem.deal_id == deal_id))
     ).scalars().all()
@@ -386,18 +386,40 @@ async def _clear_primary(session: AsyncSession, counterparty_id: int) -> None:
 async def _post_document_to_1c(
     core: Core, session: AsyncSession, doc: DealDocument, counterparty: str
 ) -> None:
-    """Записать документ в 1С через фасад ядра и пометить проведённым (posted).
+    """Выпустить документ в ERP и при наличии подтвердить исходящую связь с 1С.
 
-    Событие ``sales.document.posted`` уходит в шину (→ audit). Используется и при
-    мгновенной записи счёта, и при проведении договора после согласования.
+    ``posted`` означает завершённый локальный lifecycle ERP, а не успех 1С.
+    Событие ``sales.document.posted`` уходит в шину (→ audit, finance, logistics).
+    Внешняя ссылка попадает в него только от gateway, который явно объявил
+    проверенную исходящую возможность.
     """
-    result = await core.services.onec.post_document(
-        doc.kind,
-        {"number": doc.number, "counterparty": counterparty, "amount": str(doc.amount)},
-    )
-    if not result.get("posted"):
-        raise HTTPException(502, "Шлюз не подтвердил проведение документа")
-    doc.onec_ref = result.get("ref")
+    gateway = getattr(core.services, "onec", None)
+    sync_state = "unavailable"
+    sync_reason = "Интеграция 1С не подключена"
+    doc.onec_ref = None
+    if gateway is not None:
+        declared_reason = getattr(
+            gateway,
+            "outbound_document_source_reason",
+            "Исходящий адаптер 1С не подтверждён",
+        )
+        sync_reason = declared_reason.strip() if isinstance(declared_reason, str) and declared_reason.strip() else (
+            "Исходящий адаптер 1С не подтверждён"
+        )
+        if bool(getattr(gateway, "outbound_document_source_available", False)):
+            try:
+                result = await gateway.post_document(
+                    doc.kind,
+                    {"number": doc.number, "counterparty": counterparty, "amount": str(doc.amount)},
+                )
+            except Exception as exc:  # noqa: BLE001 -- fail closed at an external boundary
+                raise HTTPException(502, "Внешний адаптер 1С не подтвердил выпуск документа") from exc
+            external_ref = result.get("ref") if isinstance(result, dict) else None
+            if not isinstance(result, dict) or not result.get("posted") or not isinstance(external_ref, str) or not external_ref.strip():
+                raise HTTPException(502, "Внешний адаптер 1С не подтвердил выпуск документа")
+            doc.onec_ref = external_ref.strip()
+            sync_state = "synced"
+            sync_reason = None
     doc.status = "posted"
     doc.posted_at = _utcnow()
     core.event_bus.emit(
@@ -409,6 +431,8 @@ async def _post_document_to_1c(
             "kind": doc.kind,
             "number": doc.number,
             "onec_ref": doc.onec_ref,
+            "onec_sync_state": sync_state,
+            "onec_sync_reason": sync_reason,
             "counterparty": counterparty,
             "amount": str(doc.amount),
             "currency": "BYN",
@@ -1736,7 +1760,7 @@ async def sales_journal(
     deal_ids = [d.id for d in deals]
 
     # Оплата: один запрос по всем сделкам разом — счета (kind=invoice), paid побеждает
-    # posted; posted ("записан в 1С") — НЕ оплата, это уже ловили на ревью.
+    # posted означает выпуск в ERP и НЕ оплату, это уже ловили на ревью.
     paid_number: dict[int, str] = {}
     posted_number: dict[int, str] = {}
     if deal_ids:
@@ -2974,7 +2998,7 @@ async def list_documents(
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
     access: DealAccess = Depends(get_deal_access),
 ):
-    """Документы сделки (счета/договоры/заказы) с их состоянием и номерами в 1С."""
+    """Документы сделки с локальным состоянием и внешней ссылкой 1С, если она есть."""
     await visible_deal_or_404(session, deal_id, access)
     return (
         await session.execute(
@@ -2986,8 +3010,6 @@ async def list_documents(
 async def _issue_original(core, session, doc, actor):
     if doc.kind == "invoice":
         raise HTTPException(409, "Invoices require explicit ERP preview and issuance payload")
-    if core.services.onec is None:
-        raise HTTPException(503, "Интеграция 1С не подключена")
     if not doc.original_html:
         if doc.kind in RESERVES_STOCK:
             doc.valid_until = _utcnow().date() + timedelta(days=int(os.getenv("AIOS_INVOICE_VALID_DAYS", "5")))
@@ -3219,8 +3241,6 @@ async def decide_document(
     doc = await originals.locked_document(session, doc_id, access)
     if doc.status != "pending_approval":
         raise HTTPException(409, "Документ не на согласовании")
-    if payload.approved and core.services.onec is None:
-        raise HTTPException(503, "Интеграция 1С не подключена")
     approval = (await session.execute(select(Approval).where(
         Approval.entity_ref == f"document:{doc_id}", Approval.status == "pending",
     ))).scalars().first()
@@ -3684,8 +3704,8 @@ async def prepare_contract(
 
     Реквизиты покупателя подтягиваются из ЕГР по УНП (graceful при выкл реестра),
     Counterparty обогащается УНП, условия частично предзаполнены из сделки. Договор
-    создаётся как DealDocument(kind=contract) и уходит на согласование; запись в 1С —
-    после одобрения (/documents/{id}/decide), поэтому шлюз 1С здесь не требуется.
+    создаётся как DealDocument(kind=contract) и уходит на согласование; локальный выпуск
+    выполняется после одобрения (/documents/{id}/decide), поэтому шлюз 1С здесь не требуется.
     """
     deal = await visible_deal_or_404(session, deal_id, access)
     await originals.lock_deal(session, deal_id)

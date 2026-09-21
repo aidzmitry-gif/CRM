@@ -366,7 +366,7 @@ class DocumentDecision(BaseModel):
 
 
 class DocumentOut(BaseModel):
-    """Документ сделки: тип, состояние и номер/ссылка в 1С после записи."""
+    """Документ сделки: локальное состояние и внешняя ссылка 1С, если она подтверждённо получена."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -727,7 +727,7 @@ class JournalRowOut(BaseModel):
 
     ``revenue``/``gross_profit``/``margin_pct`` — как в ``DealMarginOut`` (по ``priced``-позициям,
     ``None`` = честная деградация, НЕ 0); ``margin_reason`` — те же формулировки, что там же.
-    ``payment`` — "paid" ТОЛЬКО по статусу счёта ``paid`` (``posted`` = записан в 1С, не оплачен).
+    ``payment`` — "paid" ТОЛЬКО по статусу счёта ``paid`` (``posted`` = выпущен в ERP, не оплачен).
     """
 
     deal_id: int
