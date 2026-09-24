@@ -16,6 +16,7 @@ from modules.sales.access import get_deal_access, visible_deal_or_404
 from modules.sales.accounting_ownership import DealOwnership
 from modules.sales.client_document_register import client_identity_for_deal
 from modules.sales.models import DealDocument
+from modules.sales.schemas import document_draft_token
 
 router = APIRouter(tags=["Реестр документов сделки по юрлицу"])
 
@@ -71,6 +72,9 @@ def serialize(row, org_id):
         "id": row.id, "deal_id": row.deal_id, "organization_id": org_id,
         "kind": row.kind, "number": row.number, "version": row.version,
         "status": row.status, "amount": str(row.amount),
+        "payment_terms": row.payment_terms, "delivery_terms": row.delivery_terms,
+        "draft_edit_token": (document_draft_token(row.id, row.payment_terms, row.delivery_terms)
+                             if row.status == "draft" and not row.original_html else None),
         "currency": currency if isinstance(currency, str) and currency else None,
         "created_at": row.created_at, "issued_at": row.issued_at,
         "valid_until": row.valid_until, "reserve_status": row.reserve_status,
