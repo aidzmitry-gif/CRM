@@ -44,6 +44,7 @@ class DealCreate(BaseModel):
 class DealUpdate(BaseModel):
     """Частичное обновление сделки (все поля опциональны)."""
 
+    expected_edit_token: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     title: str | None = None
     counterparty: str | None = None
     counterparty_id: int | None = Field(default=None, ge=1)
@@ -454,6 +455,7 @@ class CounterpartyRef(BaseModel):
 class DealDetailOut(DealRead):
     """Сделка с позициями номенклатуры и документами (для экрана карточки)."""
 
+    edit_token: str
     items: list[DealItemOut] = []
     documents: list[DocumentOut] = []
     # Контрагент из MDM (резолв по имени на чтении); None — нет в витрине (honest-empty).

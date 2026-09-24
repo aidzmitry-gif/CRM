@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import calendar
+import hashlib
 import html
+import json
 import os
 import re
 from collections import defaultdict
@@ -1204,6 +1206,7 @@ async def get_deal(
 
     return DealDetailOut(
         **DealRead.model_validate(deal).model_dump(),
+        edit_token=deal_edit_token(deal),
         items=items,
         documents=documents,
         counterparty_ref=await _counterparty_ref(session, deal),
@@ -1290,6 +1293,17 @@ async def _won_pairs(session: AsyncSession) -> set[tuple[str, str]]:
     return pairs
 
 
+def deal_edit_token(deal: Deal) -> str:
+    """Fingerprint the fields in the card editor, without changing old PATCH clients."""
+    fields = ("title", "amount", "next_step", "deal_date", "ship_deadline",
+              "penalty_rate_pct", "penalty_cap_pct", "penalty_terms")
+    snapshot = {key: format(value, "f") if isinstance(value := getattr(deal, key), Decimal)
+                else value for key in fields}
+    raw = json.dumps({"version": 1, "deal_id": deal.id, "fields": snapshot},
+                     sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
 @router.patch("/deals/{deal_id}", response_model=DealRead)
 async def update_deal(
     deal_id: int,
@@ -1305,6 +1319,12 @@ async def update_deal(
     from modules.sales.deal_loss import guard_patch, lock_mutation
     deal, access, user = await lock_mutation(session, deal_id, access, core, user)
     data = payload.model_dump(exclude_unset=True)
+    expected_token = data.pop("expected_edit_token", None)
+    if "expected_edit_token" in payload.model_fields_set:
+        if expected_token is None:
+            raise HTTPException(422, "An edit token is required when supplied")
+        if expected_token != deal_edit_token(deal):
+            raise HTTPException(409, "Deal fields changed; refresh before saving")
     await guard_patch(session, deal, data)
     await prepare_party_change(session, data, deal=deal)
     if access.own_only:
