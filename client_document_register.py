@@ -17,6 +17,7 @@ from sqlalchemy import (
     String,
     event,
     func,
+    or_,
     select,
 )
 from sqlalchemy.exc import IntegrityError
@@ -151,6 +152,32 @@ async def client_identity_for_deal(session, org_id, deal_id):
         raise HTTPException(409, "Client binding organization requires reconciliation")
     return {"status": "confirmed", "counterparty_id": row.counterparty_id,
             "snapshot": row.snapshot["client"]}
+
+
+@router.get("/organizations/{org_id}/deals/{deal_id}/client-options")
+async def client_options(org_id: int, deal_id: int, q: str = Query("", max_length=100),
+                         ctx=Depends(chief_context, scope="function")):
+    session, _, deal = ctx
+    term = q.strip()
+    if not term:
+        return {"organization_id": org_id, "deal_id": deal_id, "items": [], "truncated": False}
+    statement = select(Counterparty).where(Counterparty.is_active.is_(True),
+        Counterparty.merged_into_id.is_(None))
+    if deal.counterparty_id is not None:
+        statement = statement.where(Counterparty.id == deal.counterparty_id)
+    else:
+        filters = [Counterparty.name.icontains(term, autoescape=True),
+                   Counterparty.display_name.icontains(term, autoescape=True),
+                   Counterparty.legal_name.icontains(term, autoescape=True),
+                   Counterparty.unp.icontains(term, autoescape=True)]
+        if term.isdecimal() and int(term) <= 2147483647:
+            filters.append(Counterparty.id == int(term))
+        statement = statement.where(or_(*filters))
+    rows = (await session.scalars(statement.order_by(Counterparty.name, Counterparty.id).limit(51))).all()
+    return {"organization_id": org_id, "deal_id": deal_id,
+            "items": [{"id": row.id, "name": row.display_name or row.name,
+                       "unp": row.unp, "revision": row.revision} for row in rows[:50]],
+            "truncated": len(rows) > 50}
 
 
 @router.get("/organizations/{org_id}/deals/{deal_id}/client-binding-preview")
