@@ -151,6 +151,36 @@ async def lock_context(session, core, user, access, deal_id, org):
     return deal, actor
 
 
+async def require_replacement_source(session, doc, organization_id):
+    """A replacement can follow only an exact, completed ERP cancellation."""
+    if doc.supersedes_id is None:
+        return
+    old = await session.scalar(select(DealDocument).where(
+        DealDocument.id == doc.supersedes_id,
+    ).with_for_update().execution_options(populate_existing=True))
+    if (old is None or old.deal_id != doc.deal_id or old.kind != "invoice"
+            or old.status != "cancelled" or old.reserve_status != "released"
+            or old.superseded_by_id is not None):
+        raise HTTPException(409, "Cancel and reconcile the original invoice before replacement")
+    from modules.sales.invoice_cancellation import InvoiceCancellationReceipt, orm_cancellation_receipt
+
+    cancellation = await session.scalar(select(InvoiceCancellationReceipt).where(
+        InvoiceCancellationReceipt.document_id == old.id,
+    ))
+    if cancellation is None or cancellation.organization_id != organization_id:
+        raise HTTPException(409, "Original invoice has no exact cancellation receipt")
+    try:
+        if await verified_receipt(session, old, organization_id) is None:
+            raise ValueError("Original invoice has no ERP issuance receipt")
+        confirmed = await session.run_sync(
+            lambda sync: orm_cancellation_receipt(sync.connection(), old)
+        )
+    except (ValueError, KeyError, TypeError, HTTPException) as exc:
+        raise HTTPException(409, "Original invoice cancellation requires reconciliation") from exc
+    if not confirmed:
+        raise HTTPException(409, "Original invoice release requires reconciliation")
+
+
 async def candidate(session, core, user, deal, data, doc_id=None):
     doc = None
     if doc_id is not None:
@@ -162,12 +192,11 @@ async def candidate(session, core, user, deal, data, doc_id=None):
         )
         if doc is None or doc.deal_id != deal.id or doc.kind != "invoice":
             raise HTTPException(404, "Invoice draft not found")
-        if doc.supersedes_id is not None:
-            raise HTTPException(
-                409, "Invoice replacement requires exact reservation release; not implemented"
-            )
         if doc.status != "draft" or doc.original_html:
             raise HTTPException(409, "Only an uncaptured invoice draft can be issued")
+        if doc.reserve_mode != data.reserve_mode:
+            raise HTTPException(409, "Draft supply mode changed; reopen its exact version")
+        await require_replacement_source(session, doc, data.organization_id)
     else:
         if await session.scalar(
             select(DealDocument.id).where(
@@ -449,6 +478,9 @@ async def issue(session, core, user, access, deal_id, data, doc_id=None):
         )
         session.add(receipt)
         await session.flush()
+        if doc.supersedes_id is not None:
+            old = await session.get(DealDocument, doc.supersedes_id)
+            old.superseded_by_id = doc.id
         payload = {
             "schema_version": 1,
             "issuance_mode": MODE,
