@@ -3254,10 +3254,54 @@ async def update_document_draft(
     doc = await originals.locked_document(session, doc_id, access)
     if doc.status != "draft" or doc.original_html:
         raise HTTPException(409, "Редактируется только черновик; для выпущенного документа нужна новая версия")
-    for key, value in payload.model_dump(exclude_unset=True).items():
+    data = payload.model_dump(exclude_unset=True)
+    expected = data.pop("expected_edit_token", None)
+    if expected is None:
+        raise HTTPException(428, "Откройте актуальную версию черновика перед сохранением")
+    from modules.sales.schemas import document_draft_token
+    if expected != document_draft_token(doc.id, doc.payment_terms, doc.delivery_terms):
+        raise HTTPException(409, "Условия черновика изменились; обновите документ")
+    previous = {key: getattr(doc, key) for key in ("payment_terms", "delivery_terms")}
+    for key, value in data.items():
         setattr(doc, key, value)
+    changes = {key: {"before": previous[key], "after": getattr(doc, key)}
+               for key in data if previous[key] != getattr(doc, key)}
+    if changes:
+        ownership = await session.get(DealOwnership, doc.deal_id)
+        session.add(AuditLog(actor=user.username, action="sales.document.draft_updated",
+                             entity_ref=f"sales:document:{doc.id}", detail={"schema_version": 1,
+                             "deal_id": doc.deal_id, "document_number": doc.number,
+                             "document_version": doc.version,
+                             "organization_id": ownership.organization_id if ownership else None,
+                             "changes": changes}))
     await session.commit()
     return doc
+
+
+@router.get("/documents/{doc_id}/field-history")
+async def document_field_history(
+    doc_id: int, before_id: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=50, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
+    doc = await session.get(DealDocument, doc_id)
+    if doc is None:
+        raise HTTPException(404, "Документ не найден")
+    await visible_deal_or_404(session, doc.deal_id, access)
+    query = select(AuditLog).where(AuditLog.action == "sales.document.draft_updated",
+                                   AuditLog.entity_ref == f"sales:document:{doc_id}")
+    if before_id is not None:
+        query = query.where(AuditLog.id < before_id)
+    rows = (await session.scalars(query.order_by(AuditLog.id.desc()).limit(limit + 1))).all()
+    page = rows[:limit]
+    return {"document_id": doc_id, "items": [{"id": row.id, "actor": row.actor,
+            "changed_at": row.ts, "document_number": row.detail.get("document_number"),
+            "document_version": row.detail.get("document_version"),
+            "organization_id": row.detail.get("organization_id"),
+            "changes": row.detail.get("changes", {})} for row in page],
+            "next_before_id": page[-1].id if len(rows) > limit else None}
 
 
 @router.post("/documents/{doc_id}/issue", response_model=DocumentOut | dict)

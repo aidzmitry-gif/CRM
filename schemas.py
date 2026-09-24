@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
+import json
 import re
 from decimal import Decimal
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 
 class DealCreate(BaseModel):
@@ -350,6 +352,7 @@ class DocumentRevision(BaseModel):
 
 
 class DocumentDraftUpdate(BaseModel):
+    expected_edit_token: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     payment_terms: str | None = Field(default=None, max_length=255)
     delivery_terms: str | None = Field(default=None, max_length=255)
 
@@ -377,6 +380,8 @@ class DocumentOut(BaseModel):
     status: str
     onec_ref: str | None = None
     amount: float
+    payment_terms: str | None = None
+    delivery_terms: str | None = None
     valid_until: datetime.date | None = None  # SALES-51: срок действия счёта (резерв)
     reserve_status: str = "none"  # none | unreserved | reserved | consumed | released
     reserve_mode: Literal["stock", "on_order"] | None = None
@@ -387,6 +392,18 @@ class DocumentOut(BaseModel):
     original_state: str = "legacy_unavailable"
     content_sha256: str | None = None
     issued_at: datetime.datetime | None = None
+
+    @computed_field
+    @property
+    def draft_edit_token(self) -> str:
+        return document_draft_token(self.id, self.payment_terms, self.delivery_terms)
+
+
+def document_draft_token(doc_id: int, payment_terms: str | None, delivery_terms: str | None) -> str:
+    raw = json.dumps({"version": 1, "document_id": doc_id, "payment_terms": payment_terms,
+                      "delivery_terms": delivery_terms}, sort_keys=True, ensure_ascii=False,
+                     separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 class ContractTemplateOut(BaseModel):
