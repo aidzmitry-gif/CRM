@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.domain.models import (
     Approval,
+    AuditLog,
     Contact,
     Counterparty,
     CounterpartyAlias,
@@ -49,6 +50,7 @@ from modules.sales.access import (
     visible_deal_or_404,
     visible_deal_or_none,
 )
+from modules.sales.accounting_ownership import DealOwnership
 from modules.sales.ai import (
     call_script_hint,
     classify_objection,
@@ -1329,6 +1331,14 @@ async def update_deal(
             raise HTTPException(422, "Владелец сделки должен совпадать с владельцем CRM-клиента")
         if data.get("counterparty", client.name) != client.name:
             raise HTTPException(422, "Клиент сделки связан по ID; изменение названия здесь недоступно")
+    audited_fields = sorted((set(data) | {"stage", "funnel", "closed_date"}) & set(Deal.__table__.columns.keys()))
+    def audit_value(value):
+        if isinstance(value, Decimal):
+            return format(value, "f")
+        if isinstance(value, (date, datetime)):
+            return value.isoformat()
+        return value
+    previous = {name: audit_value(getattr(deal, name)) for name in audited_fields}
     new_stage = data.pop("stage", None)
     new_funnel = data.pop("funnel", None)
     # R5-3: нельзя двинуть сделку в стадию ЧУЖОЙ воронки — иначе сделка выпадает с обеих досок
@@ -1369,11 +1379,43 @@ async def update_deal(
         record_stage(session, deal, new_stage, by=user.username)
     old_deadline = deal.ship_deadline
     await repo.update(deal, data)
+    await session.refresh(deal)
+    changes = {name: {"before": previous[name], "after": audit_value(getattr(deal, name))}
+               for name in audited_fields if previous[name] != audit_value(getattr(deal, name))}
+    if changes:
+        ownership = await session.get(DealOwnership, deal.id)
+        session.add(AuditLog(actor=user.username, action="sales.deal.fields_updated",
+                             entity_ref=f"deal:{deal.id}", detail={"schema_version": 1,
+                             "deal_number": deal.number,
+                             "organization_id": ownership.organization_id if ownership else None,
+                             "changes": changes}))
     # Крайняя дата отгрузки выставлена/изменена → сигнал в закупки (ребро sales→procurement).
     if "ship_deadline" in data and deal.ship_deadline and deal.ship_deadline != old_deadline:
         await _emit_ship_deadline(session, core, deal)
     await session.commit()
     return deal
+
+
+@router.get("/deals/{deal_id}/field-history")
+async def deal_field_history(
+    deal_id: int, before_id: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=50, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
+    await visible_deal_or_404(session, deal_id, access)
+    query = select(AuditLog).where(AuditLog.action == "sales.deal.fields_updated",
+                                   AuditLog.entity_ref == f"deal:{deal_id}")
+    if before_id is not None:
+        query = query.where(AuditLog.id < before_id)
+    rows = (await session.scalars(query.order_by(AuditLog.id.desc()).limit(limit + 1))).all()
+    page = rows[:limit]
+    return {"deal_id": deal_id, "items": [{"id": row.id, "actor": row.actor,
+            "changed_at": row.ts, "deal_number": row.detail.get("deal_number"),
+            "organization_id": row.detail.get("organization_id"),
+            "changes": row.detail.get("changes", {})} for row in page],
+            "next_before_id": page[-1].id if len(rows) > limit else None}
 
 
 async def _deal_margin(
