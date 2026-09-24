@@ -159,6 +159,21 @@ class DealItemOut(BaseModel):
     last_price: float | None = None  # последняя цена клиенту (Price Engine)
     min_price: float | None = None  # минимальная цена клиенту
 
+    @computed_field
+    @property
+    def edit_token(self) -> str:
+        return deal_item_edit_token(self.id, self.sku_id, self.qty, self.unit_price)
+
+
+def deal_item_edit_token(item_id: int, sku_id: int, qty: Decimal | float,
+                         unit_price: Decimal | float | None) -> str:
+    raw = json.dumps({"version": 1, "item_id": item_id, "sku_id": sku_id,
+                      "qty": format(Decimal(str(qty)), ".2f"),
+                      "unit_price": (format(Decimal(str(unit_price)), ".2f")
+                                     if unit_price is not None else None)},
+                     sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
 
 class DealItemCreate(BaseModel):
     """Добавить позицию номенклатуры в сделку."""
@@ -172,8 +187,15 @@ class DealItemCreate(BaseModel):
 class DealItemUpdate(BaseModel):
     """Изменить количество или явно подтвердить/снять цену строки."""
 
-    qty: float = Field(default=None)
+    qty: Decimal | None = Field(default=None, gt=0, max_digits=14, decimal_places=2, allow_inf_nan=False)
     unit_price: Decimal | None = Field(default=None, ge=0, max_digits=14, decimal_places=2)
+    expected_edit_token: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def quantity_if_supplied(self) -> DealItemUpdate:
+        if "qty" in self.model_fields_set and self.qty is None:
+            raise ValueError("qty must be a positive number")
+        return self
 
 
 class SkuOut(BaseModel):

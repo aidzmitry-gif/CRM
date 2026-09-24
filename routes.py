@@ -172,6 +172,7 @@ from modules.sales.schemas import (
     TaskOut,
     TaskUpdate,
     TelephonyEventIn,
+    deal_item_edit_token,
 )
 from modules.sales.shipping_producer import router as shipping_router
 from modules.sales.stages import (
@@ -335,6 +336,32 @@ async def _build_item_out(session: AsyncSession, item: DealItem, counterparty: s
         last_price=price.last_price,
         min_price=price.min_price,
     )
+
+
+def _item_values(item: DealItem) -> dict[str, str | int | None]:
+    return {"sku_id": item.sku_id, "qty": format(item.qty, ".2f"),
+            "unit_price": format(item.unit_price, ".2f") if item.unit_price is not None else None}
+
+
+async def _record_item_change(session: AsyncSession, deal: Deal, item: DealItem,
+                              actor: str, action: str, before: dict | None,
+                              after: dict | None, sku: Sku | None) -> None:
+    fields = ("sku_id", "qty", "unit_price")
+    changes = {field: {"before": before.get(field) if before else None,
+                       "after": after.get(field) if after else None}
+               for field in fields if (before.get(field) if before else None) !=
+               (after.get(field) if after else None)}
+    if not changes:
+        return
+    ownership = await session.get(DealOwnership, deal.id)
+    session.add(AuditLog(actor=actor, action="sales.deal.item_changed",
+                         entity_ref=f"deal:{deal.id}", detail={
+                             "schema_version": 1, "deal_number": deal.number,
+                             "organization_id": ownership.organization_id if ownership else None,
+                             "item_id": item.id, "sku_code": sku.code if sku else None,
+                             "sku_title": sku.title if sku else None, "item_action": action,
+                             "changes": changes,
+                         }))
 
 
 async def _counterparty_for_deal(
@@ -1425,7 +1452,7 @@ async def deal_field_history(
     access: DealAccess = Depends(get_deal_access),
 ):
     await visible_deal_or_404(session, deal_id, access)
-    query = select(AuditLog).where(AuditLog.action == "sales.deal.fields_updated",
+    query = select(AuditLog).where(AuditLog.action.in_(("sales.deal.fields_updated", "sales.deal.item_changed")),
                                    AuditLog.entity_ref == f"deal:{deal_id}")
     if before_id is not None:
         query = query.where(AuditLog.id < before_id)
@@ -1434,6 +1461,9 @@ async def deal_field_history(
     return {"deal_id": deal_id, "items": [{"id": row.id, "actor": row.actor,
             "changed_at": row.ts, "deal_number": row.detail.get("deal_number"),
             "organization_id": row.detail.get("organization_id"),
+            "event_type": row.action, "item_id": row.detail.get("item_id"),
+            "sku_code": row.detail.get("sku_code"),
+            "item_action": row.detail.get("item_action"),
             "changes": row.detail.get("changes", {})} for row in page],
             "next_before_id": page[-1].id if len(rows) > limit else None}
 
@@ -2729,14 +2759,23 @@ async def add_deal_item(
         if prior is not None:
             if prior.deal_id != deal_id or prior.request_hash != request_hash:
                 raise HTTPException(409, "Item request key is already used for another command")
+            prior_price = prior.result.get("unit_price")
+            if ((Decimal(str(prior_price)) if prior_price is not None else None)
+                    != payload.unit_price):
+                raise HTTPException(409, "Item request key is already used with another price")
             return DealItemOut.model_validate(prior.result)
-    if await session.get(Sku, payload.sku_id) is None:
+    sku = await session.get(Sku, payload.sku_id)
+    if sku is None:
         raise HTTPException(status_code=404, detail="Номенклатура не найдена")
+    if not sku.is_active:
+        raise HTTPException(409, "Номенклатура недоступна для новой позиции")
     item = DealItem(deal_id=deal_id, sku_id=payload.sku_id,
                     qty=Decimal(str(payload.qty)), unit_price=payload.unit_price)
     session.add(item)
     await session.flush()
     result = await _build_item_out(session, item, deal.counterparty)
+    await _record_item_change(session, deal, item, _.username, "added",
+                              None, _item_values(item), sku)
     if payload.request_key is not None:
         session.add(DealItemRequest(request_key=str(payload.request_key), deal_id=deal_id,
                                     request_hash=request_hash, result=result.model_dump(mode="json"),
@@ -2755,6 +2794,27 @@ async def add_deal_item(
     return result
 
 
+async def _locked_visible_item(session: AsyncSession, item_id: int,
+                               user: CurrentUser, access: DealAccess) -> tuple[Deal, DealItem]:
+    item = await session.get(DealItem, item_id)
+    if item is None:
+        raise HTTPException(404, "Позиция не найдена")
+    deal_id = item.deal_id
+    await visible_deal_or_404(session, deal_id, access)
+    await originals.lock_deal(session, deal_id)
+    from modules.sales.access import get_deal_access_for_user, scope_deals
+
+    current_access = await get_deal_access_for_user(session, user)
+    deal = await session.scalar(scope_deals(select(Deal).where(Deal.id == deal_id), current_access)
+                                .execution_options(populate_existing=True))
+    item = await session.scalar(select(DealItem).where(
+        DealItem.id == item_id, DealItem.deal_id == deal_id,
+    ).execution_options(populate_existing=True))
+    if deal is None or item is None:
+        raise HTTPException(404, "Позиция не найдена")
+    return deal, item
+
+
 @router.patch("/deal-items/{item_id}", response_model=DealItemOut)
 async def update_deal_item(
     item_id: int,
@@ -2764,34 +2824,38 @@ async def update_deal_item(
     access: DealAccess = Depends(get_deal_access),
 ):
     """Изменить количество/подтверждённую цену; пропущенные поля сохраняются."""
-    item = await session.get(DealItem, item_id)
-    if item is None:
-        raise HTTPException(status_code=404, detail="Позиция не найдена")
-    await visible_deal_or_404(session, item.deal_id, access)
-    await originals.lock_deal(session, item.deal_id)
-    await session.refresh(item)
+    deal, item = await _locked_visible_item(session, item_id, _, access)
+    if "expected_edit_token" in payload.model_fields_set:
+        if payload.expected_edit_token != deal_item_edit_token(
+                item.id, item.sku_id, item.qty, item.unit_price):
+            raise HTTPException(409, "Позиция изменилась; обновите сделку перед сохранением")
+    before = _item_values(item)
     if "qty" in payload.model_fields_set:
         item.qty = Decimal(str(payload.qty))
     if "unit_price" in payload.model_fields_set:
         item.unit_price = payload.unit_price
-    deal = await DealRepository(session).get(item.deal_id)
+    await session.flush()
+    await _record_item_change(session, deal, item, _.username, "updated",
+                              before, _item_values(item), await session.get(Sku, item.sku_id))
     await session.commit()
-    return await _build_item_out(session, item, deal.counterparty if deal else "")
+    return await _build_item_out(session, item, deal.counterparty)
 
 
 @router.delete("/deal-items/{item_id}", status_code=204)
 async def delete_deal_item(
     item_id: int,
+    if_match: str | None = Header(default=None),
     session: AsyncSession = Depends(get_session),
     _: CurrentUser = Depends(require_permission("sales.deal.write")),
     access: DealAccess = Depends(get_deal_access),
 ):
     """Удалить позицию номенклатуры из сделки."""
-    item = await session.get(DealItem, item_id)
-    if item is None:
-        raise HTTPException(status_code=404, detail="Позиция не найдена")
-    await visible_deal_or_404(session, item.deal_id, access)
-    await originals.lock_deal(session, item.deal_id)
+    deal, item = await _locked_visible_item(session, item_id, _, access)
+    if if_match is not None and if_match != deal_item_edit_token(
+            item.id, item.sku_id, item.qty, item.unit_price):
+        raise HTTPException(409, "Позиция изменилась; обновите сделку перед удалением")
+    await _record_item_change(session, deal, item, _.username, "deleted",
+                              _item_values(item), None, await session.get(Sku, item.sku_id))
     await session.delete(item)
     await session.commit()
 
