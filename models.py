@@ -6,11 +6,14 @@ from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
+    Boolean,
     CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     Numeric,
     String,
     Text,
@@ -159,11 +162,14 @@ class DealItem(Base):
     __tablename__ = "deal_item"
     __table_args__ = (
         CheckConstraint("unit_price >= 0", name="unit_price_nonnegative"),
+        UniqueConstraint("source_ref", name="uq_deal_item_source_ref"),
         {"schema": "sales"},
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     deal_id: Mapped[int] = mapped_column(ForeignKey("sales.deal.id"))
+    # Nullable for locally created lines; imported Bitrix rows retain their stable source ID.
+    source_ref: Mapped[str | None] = mapped_column(String(128))
     sku_id: Mapped[int] = mapped_column()
     qty: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("1"), server_default="1")
     # Confirmed net unit price for this line; NULL requires explicit pricing.
@@ -355,14 +361,84 @@ class DealStageEvent(Base):
     """История смены стадий сделки (SALES-43): из стадии → в стадию, кто и когда."""
 
     __tablename__ = "deal_stage_event"
-    __table_args__ = {"schema": "sales"}
+    __table_args__ = (
+        UniqueConstraint("source_ref", name="uq_deal_stage_event_source_ref"),
+        {"schema": "sales"},
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     deal_id: Mapped[int] = mapped_column(ForeignKey("sales.deal.id"))
+    # Nullable for local events; imported Bitrix history keeps its stable source ID.
+    source_ref: Mapped[str | None] = mapped_column(String(128))
+    source_stage_id: Mapped[str | None] = mapped_column(String(128))
+    source_category_id: Mapped[str | None] = mapped_column(String(32))
+    source_type_id: Mapped[int | None] = mapped_column()
+    source_semantic_id: Mapped[str | None] = mapped_column(String(8))
     from_stage: Mapped[str | None] = mapped_column(String(32))
     to_stage: Mapped[str] = mapped_column(String(32))
     changed_by: Mapped[str] = mapped_column(String(128), default="", server_default="")
     changed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class CrmTimelineComment(Base):
+    """Bitrix or local timeline comment linked to exactly one CRM owner.
+
+    Deal and lead references are database-enforced. A source reference is
+    unique across owner types, while local comments may leave it null.
+    """
+
+    __tablename__ = "crm_timeline_comment"
+    __table_args__ = (
+        UniqueConstraint("source_ref", name="uq_crm_timeline_comment_source_ref"),
+        CheckConstraint(
+            "(entity_type = 'deal' AND deal_id IS NOT NULL AND lead_id IS NULL) "
+            "OR (entity_type = 'lead' AND lead_id IS NOT NULL AND deal_id IS NULL)",
+            name="crm_timeline_comment_owner",
+        ),
+        Index("ix_crm_timeline_comment_deal_time", "deal_id", "created_at"),
+        Index("ix_crm_timeline_comment_lead_time", "lead_id", "created_at"),
+        {"schema": "sales"},
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    entity_type: Mapped[str] = mapped_column(String(16))
+    deal_id: Mapped[int | None] = mapped_column(ForeignKey("sales.deal.id"))
+    lead_id: Mapped[int | None] = mapped_column(ForeignKey("leads.lead.id"))
+    source_ref: Mapped[str | None] = mapped_column(String(128))
+    source_entity_id: Mapped[str | None] = mapped_column(String(64))
+    author_source_id: Mapped[str | None] = mapped_column(String(64))
+    author_display: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class CrmTimelineAttachment(Base):
+    """Durable content-addressed binary attached to an imported timeline comment."""
+
+    __tablename__ = "crm_timeline_attachment"
+    __table_args__ = (
+        UniqueConstraint("source_ref", name="uq_crm_timeline_attachment_source_ref"),
+        CheckConstraint(
+            "size_bytes >= 0 AND size_bytes <= 2147483648",
+            name="ck_crm_timeline_attachment_size",
+        ),
+        CheckConstraint("length(sha256) = 64", name="ck_crm_timeline_attachment_sha256_length"),
+        CheckConstraint("length(source_ref) > 0", name="ck_crm_timeline_attachment_source_ref"),
+        Index("ix_crm_timeline_attachment_comment", "comment_id"),
+        {"schema": "sales"},
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # Deliberately no ON DELETE CASCADE: comment cleanup must not silently erase
+    # the database reference to a retained historical source file.
+    comment_id: Mapped[int] = mapped_column(ForeignKey("sales.crm_timeline_comment.id"))
+    source_ref: Mapped[str] = mapped_column(String(255), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    storage_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class DealTask(Base):
@@ -372,18 +448,49 @@ class DealTask(Base):
     вычисляется на лету: ``status == open`` и ``due_at < now``."""
 
     __tablename__ = "deal_task"
-    __table_args__ = {"schema": "sales"}
+    __table_args__ = (
+        UniqueConstraint("source_ref", name="uq_deal_task_source_ref"),
+        {"schema": "sales"},
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    deal_id: Mapped[int] = mapped_column(ForeignKey("sales.deal.id"))
+    deal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("sales.deal.id"), nullable=True
+    )
     title: Mapped[str] = mapped_column(String(255))
     kind: Mapped[str] = mapped_column(String(16), default="other", server_default="other")
+    description: Mapped[str | None] = mapped_column(Text)
+    description_in_bbcode: Mapped[bool | None] = mapped_column(Boolean)
+    source_responsible_id: Mapped[str | None] = mapped_column(String(64))
+    source_status_code: Mapped[str | None] = mapped_column(String(16))
     assignee_id: Mapped[int | None] = mapped_column()
     due_at: Mapped[datetime | None] = mapped_column(DateTime)
     status: Mapped[str] = mapped_column(String(16), default="open", server_default="open")
     result: Mapped[str | None] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     done_at: Mapped[datetime | None] = mapped_column(DateTime)
+    source_ref: Mapped[str | None] = mapped_column(String(128))
+
+
+class DealTaskCrmLink(Base):
+    """A source task's ordered CRM bindings; manual historical links may be null."""
+
+    __tablename__ = "deal_task_crm_link"
+    __table_args__ = (
+        UniqueConstraint("task_id", "ordinal", name="uq_deal_task_crm_link_task_ordinal"),
+        {"schema": "sales"},
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("sales.deal_task.id"), nullable=False
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Preserve the source binding verbatim; its shape is parsed by a later importer slice.
+    raw_binding: Mapped[str | None] = mapped_column(Text)
+    entity_type: Mapped[str | None] = mapped_column(String(32))
+    source_id: Mapped[str | None] = mapped_column(String(64))
+    deal_id: Mapped[int | None] = mapped_column(ForeignKey("sales.deal.id"))
 
 
 class CallLog(Base):

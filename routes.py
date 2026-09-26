@@ -1,6 +1,7 @@
 """HTTP-API модуля Sales. Монтируется ядром под префиксом ``/sales``."""
 from __future__ import annotations
 
+import asyncio
 import calendar
 import html
 import os
@@ -8,9 +9,10 @@ import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from sqlalchemy import case, delete, func, literal, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,6 +33,7 @@ from core.services.price_cost import ItemPriceCost
 from modules.sales import client_contacts as crm_contacts
 from modules.sales import clients as crm_clients
 from modules.sales import documents as originals
+from modules.sales import timeline_storage
 from modules.sales._money_words import money_words
 from modules.sales.access import (
     DealAccess,
@@ -42,6 +45,7 @@ from modules.sales.access import (
     scope_calls,
     scope_counterparties,
     scope_deals,
+    scope_tasks,
     unique_counterparty_names,
     visible_call_or_404,
     visible_deal_or_404,
@@ -65,11 +69,14 @@ from modules.sales.models import (
     Activity,
     CompanyBranding,
     ContractTemplate,
+    CrmTimelineAttachment,
+    CrmTimelineComment,
     Deal,
     DealDocument,
     DealItem,
     DealStageEvent,
     DealTask,
+    DealTaskCrmLink,
     DocumentPackage,
     KpiTarget,
     LossReason,
@@ -153,9 +160,12 @@ from modules.sales.schemas import (
     StageOut,
     StageUpdate,
     TaskCreate,
+    TaskCrmLinkOut,
     TaskOut,
     TaskUpdate,
     TelephonyEventIn,
+    TimelineAttachmentOut,
+    TimelineCommentOut,
 )
 from modules.sales.stages import (
     DEFAULT_FUNNEL,
@@ -169,6 +179,27 @@ from modules.sales.stages import (
 router = APIRouter(tags=["sales"], dependencies=[Depends(deny_unscoped_own_routes)])
 router.include_router(crm_clients.router)
 router.include_router(crm_contacts.router)
+
+
+class _TimelineAttachmentStreamingResponse(StreamingResponse):
+    """Stream one already-verified private snapshot and always close its handle."""
+
+    def __init__(self, snapshot, **kwargs):
+        self._snapshot = snapshot
+        super().__init__(self._chunks(snapshot), **kwargs)
+
+    @staticmethod
+    def _chunks(snapshot):
+        while chunk := snapshot.read(timeline_storage.STREAM_CHUNK_BYTES):
+            yield chunk
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._snapshot.close()
+
+
 # Лиды (вход воронки) — отдельный роутер. Монтируется и на /leads (фронт бьёт туда), и на
 # /sales/leads (back-compat). Полный вынос в modules/leads — Шаг 2 ТЗ принятия выноса лидов.
 leads_router = APIRouter(tags=["leads"])
@@ -235,6 +266,12 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _task_naive_utc(value: datetime | None) -> datetime | None:
+    if value is None or value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def _month_bounds(month: str) -> tuple[date, date]:
     """Валидировать ``month`` ("YYYY-MM") и вернуть (первый, последний день месяца).
 
@@ -257,20 +294,75 @@ def _parse_ddmmyyyy(value: str | None) -> date | None:
         return None
 
 
-def _task_out(task: DealTask) -> TaskOut:
+def _task_out(
+    task: DealTask,
+    links: list[DealTaskCrmLink] | None = None,
+    visible_deal_ids: set[int] | None = None,
+) -> TaskOut:
     """Представление задачи с вычисляемым флагом просрочки (SALES-41)."""
-    overdue = task.status == "open" and task.due_at is not None and task.due_at < _utcnow()
+    all_links = links or []
+    safe_links = [
+        link for link in all_links
+        if visible_deal_ids is None or link.deal_id in visible_deal_ids
+    ]
+    overdue = (
+        task.status in {"open", "in_progress", "awaiting_control", "postponed"}
+        and task.due_at is not None and _task_naive_utc(task.due_at) < _utcnow()
+    )
     return TaskOut(
         id=task.id,
-        deal_id=task.deal_id,
+        deal_id=(task.deal_id if visible_deal_ids is None or task.deal_id in visible_deal_ids else None),
         title=task.title,
         kind=task.kind,
+        description=task.description,
+        description_in_bbcode=task.description_in_bbcode,
+        source_responsible_id=task.source_responsible_id,
+        source_status_code=task.source_status_code,
         assignee_id=task.assignee_id,
         due_at=task.due_at,
         status=task.status,
         result=task.result,
         overdue=overdue,
+        imported=task.source_ref is not None,
+        crm_links=[TaskCrmLinkOut.model_validate({
+            "ordinal": link.ordinal,
+            "raw_binding": link.raw_binding,
+            "entity_type": link.entity_type,
+            "source_id": link.source_id,
+            "deal_id": link.deal_id,
+        }) for link in safe_links],
+        hidden_link_count=len(all_links) - len(safe_links),
     )
+
+
+async def _task_out_many(
+    session: AsyncSession, tasks: list[DealTask], access: DealAccess
+) -> list[TaskOut]:
+    if not tasks:
+        return []
+    links = (
+        await session.execute(
+            select(DealTaskCrmLink)
+            .where(DealTaskCrmLink.task_id.in_([task.id for task in tasks]))
+            .order_by(DealTaskCrmLink.task_id, DealTaskCrmLink.ordinal)
+        )
+    ).scalars().all()
+    by_task: dict[int, list[DealTaskCrmLink]] = defaultdict(list)
+    for link in links:
+        by_task[link.task_id].append(link)
+    visible_deal_ids = None
+    if access.own_only:
+        candidate_ids = (
+            {task.deal_id for task in tasks if task.deal_id is not None}
+            | {link.deal_id for link in links if link.deal_id is not None}
+        )
+        visible_deal_ids = set((await session.execute(
+            scope_deals(select(Deal.id).where(Deal.id.in_(candidate_ids)), access)
+        )).scalars()) if candidate_ids else set()
+    return [
+        _task_out(task, by_task.get(task.id, []), visible_deal_ids)
+        for task in tasks
+    ]
 
 
 async def _deal_stock_items(session: AsyncSession, deal_id: int) -> list[dict]:
@@ -2380,9 +2472,119 @@ async def deal_history(
         await session.execute(
             select(DealStageEvent)
             .where(DealStageEvent.deal_id == deal_id)
-            .order_by(DealStageEvent.id)
+            .order_by(DealStageEvent.changed_at, DealStageEvent.id)
         )
     ).scalars().all()
+
+
+@router.get("/deals/{deal_id}/timeline/comments", response_model=list[TimelineCommentOut])
+async def deal_timeline_comments(
+    deal_id: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
+    """Comments for this visible deal, ordered by source time."""
+    await visible_deal_or_404(session, deal_id, access)
+    return (
+        await session.execute(
+            select(CrmTimelineComment)
+            .where(CrmTimelineComment.deal_id == deal_id,
+                   CrmTimelineComment.entity_type == "deal")
+            .order_by(CrmTimelineComment.created_at, CrmTimelineComment.id)
+        )
+    ).scalars().all()
+
+
+@router.get(
+    "/deals/{deal_id}/timeline/comments/{comment_id}/attachments",
+    response_model=list[TimelineAttachmentOut],
+)
+async def list_deal_timeline_comment_attachments(
+    deal_id: int,
+    comment_id: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
+    """List private-file metadata only after checking the visible deal/comment chain."""
+    await visible_deal_or_404(session, deal_id, access)
+    comment = await session.scalar(
+        select(CrmTimelineComment.id).where(
+            CrmTimelineComment.id == comment_id,
+            CrmTimelineComment.entity_type == "deal",
+            CrmTimelineComment.deal_id == deal_id,
+        )
+    )
+    if comment is None:
+        raise HTTPException(status_code=404, detail="Комментарий не найден")
+    rows = (
+        await session.execute(
+            select(CrmTimelineAttachment)
+            .where(CrmTimelineAttachment.comment_id == comment_id)
+            .order_by(CrmTimelineAttachment.id)
+        )
+    ).scalars().all()
+    return [
+        TimelineAttachmentOut(
+            id=row.id,
+            filename=timeline_storage.safe_download_filename(row.filename),
+            content_type=timeline_storage.safe_content_type(row.content_type),
+            size_bytes=row.size_bytes,
+        )
+        for row in rows
+    ]
+
+
+@router.get(
+    "/deals/{deal_id}/timeline/comments/{comment_id}/attachments/{attachment_id}/download",
+    name="download_deal_timeline_comment_attachment",
+)
+async def download_deal_timeline_comment_attachment(
+    deal_id: int,
+    comment_id: int,
+    attachment_id: int,
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
+    """Download a verified attachment through the same visible deal/comment owner chain."""
+    await visible_deal_or_404(session, deal_id, access)
+    comment = await session.scalar(
+        select(CrmTimelineComment.id).where(
+            CrmTimelineComment.id == comment_id,
+            CrmTimelineComment.entity_type == "deal",
+            CrmTimelineComment.deal_id == deal_id,
+        )
+    )
+    if comment is None:
+        raise HTTPException(status_code=404, detail="Вложение не найдено")
+    attachment = await session.scalar(
+        select(CrmTimelineAttachment).where(
+            CrmTimelineAttachment.id == attachment_id,
+            CrmTimelineAttachment.comment_id == comment_id,
+        )
+    )
+    if attachment is None:
+        raise HTTPException(status_code=404, detail="Вложение не найдено")
+    try:
+        snapshot = await asyncio.to_thread(timeline_storage.snapshot_attachment, attachment)
+    except (timeline_storage.AttachmentRejected, OSError, ValueError):
+        raise HTTPException(status_code=404, detail="Вложение не найдено") from None
+    filename = timeline_storage.safe_download_filename(attachment.filename)
+    try:
+        return _TimelineAttachmentStreamingResponse(
+            snapshot,
+            media_type=timeline_storage.safe_content_type(attachment.content_type),
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Disposition": f"attachment; filename*=utf-8''{quote(filename, safe='')}",
+            },
+        )
+    except BaseException:
+        snapshot.close()
+        raise
 
 
 @router.get("/deals/{deal_id}/tasks", response_model=list[TaskOut])
@@ -2397,11 +2599,33 @@ async def list_tasks(
     rows = (
         await session.execute(
             select(DealTask)
-            .where(DealTask.deal_id == deal_id)
-            .order_by((DealTask.status == "open").desc(), DealTask.due_at, DealTask.id)
+            .where(or_(
+                DealTask.deal_id == deal_id,
+                DealTask.id.in_(select(DealTaskCrmLink.task_id).where(
+                    DealTaskCrmLink.deal_id == deal_id
+                )),
+            ))
+            .order_by((DealTask.status.in_({"open", "in_progress", "awaiting_control", "postponed"})).desc(), DealTask.due_at, DealTask.id)
         )
     ).scalars().all()
-    return [_task_out(t) for t in rows]
+    return await _task_out_many(session, rows, access)
+
+
+@router.get("/tasks", response_model=list[TaskOut])
+async def list_all_tasks(
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
+    """Browse tasks, including source tasks without a deal, within CRM visibility."""
+    stmt = scope_tasks(select(DealTask), access)
+    rows = (await session.execute(
+        stmt.order_by(DealTask.created_at.desc(), DealTask.id.desc())
+        .limit(limit).offset(offset)
+    )).scalars().all()
+    return await _task_out_many(session, rows, access)
 
 
 @router.post("/deals/{deal_id}/tasks", response_model=TaskOut, status_code=201)
@@ -2420,17 +2644,18 @@ async def create_task(
         title=payload.title,
         kind=payload.kind,
         assignee_id=require_owner_assignment(access, payload.assignee_id),
-        due_at=payload.due_at,
+        due_at=_task_naive_utc(payload.due_at),
     )
     session.add(task)
     await session.flush()
+    session.add(DealTaskCrmLink(task_id=task.id, ordinal=0, deal_id=deal_id))
     core.event_bus.emit(
         session,
         "sales.task.created",
         {"task_id": task.id, "deal_id": deal_id, "entity_ref": f"deal:{deal_id}"},
     )
     await session.commit()
-    return _task_out(task)
+    return (await _task_out_many(session, [task], access))[0]
 
 
 @router.patch("/tasks/{task_id}", response_model=TaskOut)
@@ -2444,11 +2669,17 @@ async def update_task(
 ):
     """Изменить задачу: перенос срока / исполнение / отмена. При закрытии (``done``)
     ставит ``done_at`` и публикует ``sales.task.completed`` (→ audit, SALES-41)."""
-    task = await session.get(DealTask, task_id)
+    task = (await session.execute(
+        scope_tasks(select(DealTask).where(DealTask.id == task_id), access)
+    )).scalar_one_or_none()
     if task is None:
         raise HTTPException(status_code=404, detail="Задача не найдена")
+    if task.source_ref is not None:
+        raise HTTPException(status_code=409, detail="Импортированная задача доступна только для чтения")
     await visible_deal_or_404(session, task.deal_id, access)
     data = payload.model_dump(exclude_unset=True)
+    if "due_at" in data:
+        data["due_at"] = _task_naive_utc(data["due_at"])
     if "assignee_id" in data:
         data["assignee_id"] = require_owner_assignment(access, data["assignee_id"])
     becoming_done = data.get("status") == "done" and task.status != "done"
@@ -2462,7 +2693,7 @@ async def update_task(
             {"task_id": task.id, "deal_id": task.deal_id, "entity_ref": f"deal:{task.deal_id}"},
         )
     await session.commit()
-    return _task_out(task)
+    return (await _task_out_many(session, [task], access))[0]
 
 
 @router.post("/deals", response_model=DealRead, status_code=201)
