@@ -4397,11 +4397,13 @@ async def list_calls(
     owner: str | None = None,
     date: str | None = None,
     deal_id: int | None = None,
+    counterparty_id: int | None = Query(default=None, gt=0, le=2_147_483_647),
+    unlinked: bool = False,
     session: AsyncSession = Depends(get_session),
     access: DealAccess = Depends(get_deal_access),
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
 ):
-    """Журнал звонков: статус / продавец / дата / сделка (``deal_id`` — лента карточки)."""
+    """Журнал звонков, в том числе звонки контрагента и очередь без сделки."""
     from modules.sales.models import CallLog
 
     stmt = scope_calls(select(CallLog), access).order_by(CallLog.started_at.desc())
@@ -4409,6 +4411,10 @@ async def list_calls(
         stmt = stmt.where(CallLog.status == status)
     if owner:
         stmt = stmt.where(CallLog.owner == owner)
+    if counterparty_id is not None:
+        stmt = stmt.where(CallLog.counterparty_id == counterparty_id)
+    if unlinked:
+        stmt = stmt.where(CallLog.deal_id.is_(None))
     if deal_id is not None:
         if access.own_only:
             await visible_deal_or_404(session, deal_id, access)
@@ -4420,7 +4426,25 @@ async def list_calls(
             raise HTTPException(status_code=400, detail="date: ожидается YYYY-MM-DD")
         start = datetime(day.year, day.month, day.day)
         stmt = stmt.where(CallLog.started_at >= start, CallLog.started_at < start + timedelta(days=1))
-    return (await session.execute(stmt)).scalars().all()
+    calls = (await session.execute(stmt)).scalars().all()
+    counterparty_ids = {call.counterparty_id for call in calls if call.counterparty_id is not None}
+    client_ids_by_counterparty: dict[int, set[int]] = defaultdict(set)
+    if counterparty_ids:
+        visible_clients = await session.execute(crm_clients.scope_clients(
+            select(crm_clients.CrmClient.id, crm_clients.CrmClient.counterparty_id).where(
+                crm_clients.CrmClient.counterparty_id.in_(counterparty_ids)
+            ), access
+        ))
+        for client_id, linked_counterparty_id in visible_clients:
+            client_ids_by_counterparty[linked_counterparty_id].add(client_id)
+    return [
+        CallOut.model_validate(call).model_copy(update={
+            "crm_client_id": next(iter(client_ids_by_counterparty[call.counterparty_id]))
+            if call.counterparty_id is not None
+            and len(client_ids_by_counterparty[call.counterparty_id]) == 1 else None,
+        })
+        for call in calls
+    ]
 
 
 @router.get("/calls/{cid}", response_model=CallOut)

@@ -945,6 +945,7 @@ class CallOut(BaseModel):
     owner_id: int | None = None
     counterparty_id: int | None = None
     contact_id: int | None = None
+    crm_client_id: int | None = None
     deal_id: int | None = None
     status: str
     result: str | None = None
