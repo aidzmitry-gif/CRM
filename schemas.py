@@ -115,6 +115,12 @@ class DealRead(BaseModel):
     supply_arrived_sku: str | None = None
 
 
+class DealEditResult(DealRead):
+    """Saved deal fields plus the exact next editor token."""
+
+    edit_token: str
+
+
 class StageBoard(BaseModel):
     """Колонка канбана: стадия + её сделки и агрегаты."""
 

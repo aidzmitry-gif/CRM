@@ -118,6 +118,7 @@ from modules.sales.schemas import (
     CrmContactOut,
     DealCreate,
     DealDetailOut,
+    DealEditResult,
     DealHandoffOut,
     DealItemCreate,
     DealItemOut,
@@ -1331,7 +1332,7 @@ def deal_edit_token(deal: Deal) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-@router.patch("/deals/{deal_id}", response_model=DealRead)
+@router.patch("/deals/{deal_id}", response_model=DealEditResult)
 async def update_deal(
     deal_id: int,
     payload: DealUpdate,
@@ -1440,7 +1441,7 @@ async def update_deal(
     if "ship_deadline" in data and deal.ship_deadline and deal.ship_deadline != old_deadline:
         await _emit_ship_deadline(session, core, deal)
     await session.commit()
-    return deal
+    return {**DealRead.model_validate(deal).model_dump(), "edit_token": deal_edit_token(deal)}
 
 
 @router.get("/deals/{deal_id}/field-history")
