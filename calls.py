@@ -16,10 +16,13 @@ import re
 from collections import defaultdict
 from datetime import datetime, timezone
 
+from fastapi import HTTPException
 from sqlalchemy import select
 
-from core.domain.models import Contact, Counterparty
-from modules.sales.models import CallLog, Deal
+from core.domain.models import Contact
+from core.services.crm_owners import resolve_crm_owner
+from modules.integrations.telephony import normalize_e164
+from modules.sales.models import CallLog, CrmClient, CrmClientContact, Deal
 from modules.sales.stages import TERMINAL_STAGES
 
 logger = logging.getLogger("aios.sales.calls")
@@ -96,46 +99,13 @@ def _push_card(call: CallLog, ctx=None) -> bool:
     return bool(ctx.after_commit(lambda: _publish_card(card)))
 
 
-# --- Резолв продавца по номеру (A.2) ----------------------------------------------
-def _digits_tail(phone: str | None, length: int = 9) -> str:
-    """Значащий хвост номера для матчинга (последние ``length`` цифр)."""
-    return re.sub(r"\D", "", phone or "")[-length:]
-
-
-async def _deal_context(session, cp_name: str) -> tuple[str, int | None]:
-    """Owner и сделка по контрагенту.
-
-    Открытая (не терминальная) сделка → ``(owner, deal_id)`` — звонок вешаем на неё.
-    Только закрытые → ``(owner, None)``: история клиента остаётся через
-    ``counterparty_id``, в сделку не пишем.
-    """
-    active = (
-        await session.execute(
-            select(Deal)
-            .where(Deal.counterparty == cp_name, Deal.owner != "", Deal.stage.notin_(TERMINAL_STAGES))
-            .order_by(Deal.created_at.desc())
-        )
-    ).scalars().first()
-    if active is not None:
-        return active.owner, active.id
-    closed = (
-        await session.execute(
-            select(Deal).where(Deal.counterparty == cp_name, Deal.owner != "").order_by(Deal.created_at.desc())
-        )
-    ).scalars().first()
-    return (closed.owner if closed is not None else ""), None
-
-
+# --- Резолв ответственного по номеру ----------------------------------------------
 async def resolve_owner(session, phone_e164: str | None) -> dict:
-    """Резолв продавца/сделки по номеру (A.2): контакт → контрагент → сделки.
+    """Resolve a caller through an exact CRM contact and stable CRM IDs.
 
-    Возвращает ``{owner, owner_id, counterparty_id, contact_id, deal_id}``.
-    ``deal_id`` — только открытая сделка в воронке; иначе ``None`` (звонок всё равно
-    в истории клиента через ``counterparty_id``). Матч номера — по хвосту 9 цифр.
-    ponytail: при росте базы — нормализованная колонка + индекс вместо LIKE-скана.
-
-    Неизвестный номер → пустой owner / без deal (дежурный пул); лид создаёт модуль
-    leads по ``sales.call.logged``.
+    CRM contact/client IDs are authoritative. A legacy shared contact is used only
+    when its full normalized number uniquely identifies the CRM client through its
+    stable ``counterparty_id``. Ambiguous identities stay unassigned.
     """
     result: dict = {
         "owner": "",
@@ -144,27 +114,89 @@ async def resolve_owner(session, phone_e164: str | None) -> dict:
         "contact_id": None,
         "deal_id": None,
     }
-    tail = _digits_tail(phone_e164)
-    if not tail:
+    number = normalize_e164(phone_e164)
+    if not number:
         return result
 
-    contact = (
-        await session.execute(
-            select(Contact)
-            .where(Contact.phone.isnot(None), Contact.phone.like(f"%{tail}"))
-            .order_by(Contact.is_primary.desc(), Contact.id)
-        )
-    ).scalars().first()
-    if contact is not None:
-        result["contact_id"] = contact.id
-        result["counterparty_id"] = contact.counterparty_id
-        if contact.counterparty_id is not None:
-            cp = await session.get(Counterparty, contact.counterparty_id)
-            if cp is not None:
-                owner, deal_id = await _deal_context(session, cp.name)
-                result["deal_id"] = deal_id
-                if owner:
-                    result["owner"] = owner
+    async def confirmed_owner(employee_id: int | None):
+        if employee_id is None:
+            return None
+        try:
+            return await resolve_crm_owner(session, employee_id=employee_id)
+        except HTTPException:
+            return None
+
+    async def route_client(client: CrmClient, matched_contact_ids: set[int]) -> None:
+        deals = (await session.execute(
+            select(Deal).where(
+                Deal.crm_client_id == client.id,
+                Deal.stage.notin_(TERMINAL_STAGES),
+            )
+        )).scalars().all()
+        contact_bound_deals = [deal for deal in deals if deal.crm_contact_id is not None]
+        matching_contact_deals = [
+            deal for deal in contact_bound_deals
+            if deal.crm_contact_id in matched_contact_ids
+        ]
+        if matching_contact_deals:
+            deals = matching_contact_deals
+        elif contact_bound_deals:
+            # Don't let an unbound deal mask an explicit link to another contact.
+            deals = []
+
+        deal_owner = None
+        deal_id = None
+        if len(deals) == 1:
+            deal_owner = await confirmed_owner(deals[0].owner_id)
+            if deal_owner is not None:
+                deal_id = deals[0].id
+        elif len(deals) > 1:
+            owner_ids = {deal.owner_id for deal in deals}
+            if len(owner_ids) == 1:
+                deal_owner = await confirmed_owner(next(iter(owner_ids)))
+
+        owner = deal_owner or await confirmed_owner(client.owner_id)
+        if owner is not None:
+            result["owner"] = owner.full_name
+            result["owner_id"] = owner.employee_id
+            result["deal_id"] = deal_id
+
+    # ponytail: these exact normalized lookups scan contact rows; add an indexed
+    # E.164 key when a measured lookup exceeds 50 ms or contact rows exceed 10,000.
+    crm_contacts = (await session.execute(
+        select(CrmClientContact).where(CrmClientContact.phone.isnot(None))
+    )).scalars().all()
+    matching_crm_contacts = [
+        contact for contact in crm_contacts if normalize_e164(contact.phone) == number
+    ]
+    crm_client_ids = {contact.crm_client_id for contact in matching_crm_contacts}
+    if len(crm_client_ids) > 1:
+        return result
+    if crm_client_ids:
+        client = await session.get(CrmClient, next(iter(crm_client_ids)))
+        if client is not None:
+            result["counterparty_id"] = client.counterparty_id
+            await route_client(client, {contact.id for contact in matching_crm_contacts})
+        return result
+
+    legacy_contacts = (await session.execute(
+        select(Contact).where(Contact.phone.isnot(None))
+    )).scalars().all()
+    exact_legacy = [contact for contact in legacy_contacts if normalize_e164(contact.phone) == number]
+    if len(exact_legacy) != 1:
+        return result
+
+    contact = exact_legacy[0]
+    result["contact_id"] = contact.id
+    result["counterparty_id"] = contact.counterparty_id
+    if contact.counterparty_id is None:
+        return result
+
+    clients = (await session.execute(
+        select(CrmClient).where(CrmClient.counterparty_id == contact.counterparty_id)
+    )).scalars().all()
+    if len(clients) == 1:
+        await route_client(clients[0], set())
 
     return result
 
