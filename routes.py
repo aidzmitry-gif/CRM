@@ -4354,12 +4354,11 @@ async def call_ai_objection(
 async def calls_stream(
     owner: str | None = None,
     user: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """SSE-поток карточек звонков продавца (всплывающее окно входящего звонка).
 
-    Подписка по ``owner`` (= ``Deal.owner``, ФИО продавца); по умолчанию — текущий
-    пользователь. ponytail: маппинг username↔Deal.owner закроется реальной
-    аутентификацией (Keycloak, P1); сейчас фронт передаёт ``?owner=<ФИО>``.
+    Подписка привязана к числовому ID сотрудника из текущего CRM-доступа.
     """
     import asyncio
     import json
@@ -4368,13 +4367,13 @@ async def calls_stream(
 
     from modules.sales import calls as calls_mod
 
-    # ponytail: остаточный IDOR (security-review HIGH) — ``owner`` самоназначаемый, любой
-    # с sales.deal.read подписывается на чужой поток (чужие звонки: номер/контрагент).
-    # Закрыть нечем, пока нет аутентифицированной идентичности продавца: в dev X-User не
-    # шлётся (user.username == "anonymous"), фича держится на ?owner=<ФИО>. Апгрейд —
-    # Keycloak P1 (username↔Deal.owner) → гейт «свой поток / sales.calls.read_all для РОП».
-    target = owner or user.username
-    queue = calls_mod.subscribe(target)
+    if owner is not None:
+        raise HTTPException(status_code=400, detail="Параметр owner для потока звонков не поддерживается")
+    if access.employee_id is None:
+        raise HTTPException(status_code=403, detail="Для потока звонков нужна связанная учётная запись сотрудника")
+
+    employee_id = access.employee_id
+    queue = calls_mod.subscribe(employee_id)
 
     async def _gen():
         try:
@@ -4386,7 +4385,7 @@ async def calls_stream(
                 except asyncio.TimeoutError:
                     yield ": ping\n\n"  # heartbeat против обрыва простаивающего соединения
         finally:
-            calls_mod.unsubscribe(target, queue)
+            calls_mod.unsubscribe(employee_id, queue)
 
     return StreamingResponse(_gen(), media_type="text/event-stream")
 

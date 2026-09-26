@@ -36,26 +36,26 @@ def _utcnow() -> datetime:
 # --- SSE-реестр подписок «owner → очереди карточек» (in-process) ------------------
 # ponytail: in-process реестр (один воркер). При масштабировании — Redis pub/sub
 # (заложено в ТЗ A.5), сейчас не реализуем.
-_subscribers: dict[str, set[asyncio.Queue]] = defaultdict(set)
+_subscribers: dict[int, set[asyncio.Queue]] = defaultdict(set)
 
 
-def subscribe(owner: str) -> asyncio.Queue:
-    """Подписать продавца на поток карточек звонков; вернуть его очередь."""
+def subscribe(employee_id: int) -> asyncio.Queue:
+    """Подписать сотрудника на поток карточек звонков; вернуть его очередь."""
     queue: asyncio.Queue = asyncio.Queue(maxsize=100)
-    _subscribers[owner].add(queue)
+    _subscribers[employee_id].add(queue)
     return queue
 
 
-def unsubscribe(owner: str, queue: asyncio.Queue) -> None:
-    subs = _subscribers.get(owner)
+def unsubscribe(employee_id: int, queue: asyncio.Queue) -> None:
+    subs = _subscribers.get(employee_id)
     if subs is not None:
         subs.discard(queue)
         if not subs:
-            _subscribers.pop(owner, None)
+            _subscribers.pop(employee_id, None)
 
 
-def has_subscriber(owner: str) -> bool:
-    return bool(_subscribers.get(owner))
+def has_subscriber(employee_id: int) -> bool:
+    return bool(_subscribers.get(employee_id))
 
 
 def _card(call: CallLog) -> dict:
@@ -77,26 +77,27 @@ def _card(call: CallLog) -> dict:
     }
 
 
-def _publish_card(card: dict) -> bool:
+def _publish_card(card: dict, employee_id: int | None) -> bool:
     """Publish a committed snapshot without retaining a mutable ORM object."""
-    if not card["owner"]:
+    if employee_id is None:
         return False  # новый номер / дежурный пул без подписки — карточка не пушится
     delivered = False
-    for queue in list(_subscribers.get(card["owner"], ())):
+    for queue in list(_subscribers.get(employee_id, ())):
         try:
             queue.put_nowait(card)
             delivered = True
         except asyncio.QueueFull:
-            logger.warning("calls: очередь подписки переполнена (owner=%s)", card["owner"])
+            logger.warning("calls: очередь подписки переполнена (employee_id=%s)", employee_id)
     return delivered
 
 
 def _push_card(call: CallLog, ctx=None) -> bool:
     """Relay publishes after commit; the direct fallback keeps immediate push."""
     card = _card(call)
+    employee_id = call.owner_id
     if ctx is None:
-        return _publish_card(card)
-    return bool(ctx.after_commit(lambda: _publish_card(card)))
+        return _publish_card(card, employee_id)
+    return bool(ctx.after_commit(lambda: _publish_card(card, employee_id)))
 
 
 # --- Резолв ответственного по номеру ----------------------------------------------

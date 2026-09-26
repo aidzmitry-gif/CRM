@@ -201,6 +201,7 @@ _OWN_ROUTE_NAMES = frozenset(
         "render_saved_package", "send_package", "preview_document",
         "list_messages",
         "list_calls", "get_call", "call_comment", "call_result", "call_link_deal",
+        "calls_stream",
         "create_message",
         "mark_messages_read",
         "ai_draft_reply",
