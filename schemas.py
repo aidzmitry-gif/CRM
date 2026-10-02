@@ -990,6 +990,28 @@ class StageEventOut(BaseModel):
     changed_at: datetime.datetime
 
 
+class TimelineCommentOut(BaseModel):
+    """Plain-text CRM timeline comment visible to the deal reader."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    body: str
+    author_display: str
+    created_at: datetime.datetime
+
+
+class TimelineAttachmentOut(BaseModel):
+    """Public metadata for a private timeline attachment; storage paths stay internal."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    filename: str
+    content_type: str
+    size_bytes: int = Field(ge=0, le=2 * 1024 * 1024 * 1024)
+
+
 class TaskCreate(BaseModel):
     """Новая задача по сделке (SALES-41)."""
 
@@ -1017,18 +1039,33 @@ class TaskUpdate(BaseModel):
         return self
 
 
+class TaskCrmLinkOut(BaseModel):
+    ordinal: int
+    raw_binding: str | None = None
+    entity_type: str | None = None
+    source_id: str | None = None
+    deal_id: int | None = None
+
+
 class TaskOut(BaseModel):
     """Задача по сделке (``overdue`` — вычисляемый флаг просрочки)."""
 
     id: int
-    deal_id: int
+    deal_id: int | None
     title: str
     kind: str
+    description: str | None = None
+    description_in_bbcode: bool | None = None
+    source_responsible_id: str | None = None
+    source_status_code: str | None = None
     assignee_id: int | None = None
     due_at: datetime.datetime | None = None
     status: str
     result: str | None = None
     overdue: bool = False
+    imported: bool = False
+    crm_links: list[TaskCrmLinkOut] = Field(default_factory=list)
+    hidden_link_count: int = 0
 
 
 class CallOut(BaseModel):
@@ -1046,6 +1083,7 @@ class CallOut(BaseModel):
     owner_id: int | None = None
     counterparty_id: int | None = None
     contact_id: int | None = None
+    crm_client_id: int | None = None
     deal_id: int | None = None
     status: str
     result: str | None = None

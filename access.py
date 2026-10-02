@@ -17,7 +17,7 @@ from core.services.crm_access import (
     get_crm_access_for_user as get_deal_access_for_user,  # noqa: F401 - command API
 )
 from core.services.crm_owners import resolve_crm_owner
-from modules.sales.models import CallLog, Deal
+from modules.sales.models import CallLog, Deal, DealTask, DealTaskCrmLink
 
 
 def scope_deals(stmt, access: DealAccess):
@@ -49,6 +49,26 @@ def scope_calls(stmt, access: DealAccess):
     return stmt.where(or_(
         CallLog.deal_id.in_(own_deals),
         and_(CallLog.deal_id.is_(None), CallLog.owner_id == access.employee_id),
+    ))
+
+
+def scope_tasks(stmt, access: DealAccess):
+    """Only own deals or truly unbound self-assigned tasks are visible."""
+    if not access.own_only:
+        return stmt
+    own_deals = scope_deals(select(Deal.id), access)
+    any_link = select(DealTaskCrmLink.task_id)
+    own_link = select(DealTaskCrmLink.task_id).where(
+        DealTaskCrmLink.deal_id.in_(own_deals)
+    )
+    return stmt.where(or_(
+        DealTask.deal_id.in_(own_deals),
+        DealTask.id.in_(own_link),
+        and_(
+            DealTask.deal_id.is_(None),
+            DealTask.assignee_id == access.employee_id,
+            ~DealTask.id.in_(any_link),
+        ),
     ))
 
 
@@ -158,7 +178,11 @@ _OWN_ROUTE_NAMES = frozenset(
         "lose_deal",
         "win_deal",
         "deal_history",
+        "deal_timeline_comments",
+        "list_deal_timeline_comment_attachments",
+        "download_deal_timeline_comment_attachment",
         "list_tasks",
+        "list_all_tasks",
         "create_task",
         "update_task",
         "list_deal_items",
@@ -182,6 +206,7 @@ _OWN_ROUTE_NAMES = frozenset(
         "render_saved_package", "send_package", "preview_document",
         "list_messages",
         "list_calls", "get_call", "call_comment", "call_result", "call_link_deal",
+        "calls_stream",
         "create_message",
         "mark_messages_read",
         "ai_draft_reply",

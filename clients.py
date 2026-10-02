@@ -5,15 +5,22 @@ import hashlib
 import json
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import func, literal, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.domain.models import Counterparty
 from core.runtime.deps import get_session
 from core.services.auth import CurrentUser, require_permission
 from core.services.crm_owners import list_crm_owners, resolve_crm_owner
-from modules.sales.access import DealAccess, get_deal_access, require_owner_assignment, scope_deals
+from modules.sales.access import (
+    DealAccess,
+    get_deal_access,
+    require_owner_assignment,
+    scope_counterparties,
+    scope_deals,
+)
 from modules.sales.models import CrmClient, Deal, DealDocument
 from modules.sales.schemas import DocumentOut
 
@@ -22,18 +29,27 @@ router = APIRouter()
 
 class ClientCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    name: str = Field(min_length=1, max_length=255)
+    name: str | None = Field(default=None, max_length=255)
     unp: str | None = Field(default=None, pattern=r"^[0-9]{9}$")
+    counterparty_id: int | None = Field(default=None, gt=0, strict=True)
     owner_id: int | None = Field(default=None, gt=0)
     request_key: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
 
     @field_validator("name")
     @classmethod
-    def normalized_name(cls, value: str) -> str:
+    def normalized_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         value = " ".join(value.split())
         if not value:
             raise ValueError("Введите название клиента")
         return value
+
+    @model_validator(mode="after")
+    def require_name_or_counterparty(self):
+        if self.name is None and self.counterparty_id is None:
+            raise ValueError("Введите название клиента или выберите контрагента")
+        return self
 
 
 def scope_clients(stmt, access):
@@ -94,8 +110,11 @@ async def create_crm_client(
 ):
     owner_id = require_owner_assignment(access, payload.owner_id)
     owner = await resolve_crm_owner(session, employee_id=owner_id, lock=True)
-    normalized = {"name": payload.name, "unp": payload.unp, "owner_id": owner.employee_id}
-    digest = hashlib.sha256(json.dumps(normalized, sort_keys=True).encode()).hexdigest()
+    if payload.counterparty_id is not None:
+        identity = {"counterparty_id": payload.counterparty_id, "owner_id": owner.employee_id}
+    else:
+        identity = {"name": payload.name, "unp": payload.unp, "owner_id": owner.employee_id}
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
     async def replay():
         old = await session.scalar(select(CrmClient).where(
@@ -106,7 +125,26 @@ async def create_crm_client(
 
     if old := await replay():
         return client_out(old)
-    client = CrmClient(**normalized, name_key=payload.name.casefold(),
+    if payload.counterparty_id is not None:
+        counterparty = await session.scalar(scope_counterparties(select(Counterparty).where(
+            Counterparty.id == payload.counterparty_id,
+            Counterparty.is_active.is_(True),
+            Counterparty.merged_into_id.is_(None),
+        ), access).with_for_update(read=True))
+        if counterparty is None:
+            raise HTTPException(422, "Активный контрагент не найден")
+        existing = await session.scalar(select(CrmClient).where(
+            CrmClient.owner_id == owner.employee_id,
+            CrmClient.counterparty_id == counterparty.id,
+        ).order_by(CrmClient.id))
+        if existing:
+            return client_out(existing)
+        name, unp = counterparty.name, counterparty.unp
+    else:
+        name, unp = payload.name, payload.unp
+    assert name is not None  # Guaranteed by ClientCreate for unlinked requests.
+    client = CrmClient(name=name, unp=unp, owner_id=owner.employee_id,
+                       counterparty_id=payload.counterparty_id, name_key=name.casefold(),
                        request_key=payload.request_key, request_hash=digest, created_by=user.username)
     try:
         async with session.begin_nested():
@@ -115,6 +153,13 @@ async def create_crm_client(
     except IntegrityError:
         if old := await replay():
             return client_out(old)
+        if payload.counterparty_id is not None:
+            existing = await session.scalar(select(CrmClient).where(
+                CrmClient.owner_id == owner.employee_id,
+                CrmClient.counterparty_id == payload.counterparty_id,
+            ).order_by(CrmClient.id))
+            if existing:
+                return client_out(existing)
         raise HTTPException(409, "Клиент с таким названием или УНП уже есть у этого менеджера") from None
     await session.commit()
     return client_out(client)
