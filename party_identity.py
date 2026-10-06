@@ -16,10 +16,11 @@ async def resolve_new_selection(session, name):
         raise HTTPException(409, "Несколько контрагентов с этим названием; выберите по ID")
     if rows:
         return rows[0]
-    cp = Counterparty(name=name)
-    session.add(cp)
-    await session.flush()
-    return cp
+    raise HTTPException(
+        422,
+        "Создайте карточку контрагента с УНП и юридическим адресом в справочнике "
+        "и выберите её по ID",
+    )
 
 
 async def party_for_deal(session, deal, *, create=False):
