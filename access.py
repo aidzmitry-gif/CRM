@@ -194,6 +194,7 @@ _OWN_ROUTE_NAMES = frozenset(
         "list_crm_clients",
         "create_crm_client", "get_crm_client", "crm_client_owners",
         "get_counterparty_responsible",
+        "counterparty_relationships",
         "list_crm_client_contacts", "add_crm_client_contact", "primary_crm_client_contact", "list_crm_client_deals", "list_crm_client_documents",
         "list_crm_contacts",
         "add_contact",
