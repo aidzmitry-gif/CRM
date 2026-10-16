@@ -19,8 +19,9 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from core.domain.models import Contact, Counterparty
+from core.domain.models import Contact, Counterparty, SyncLink
 from core.services.crm_owners import resolve_crm_owner
+from modules.hr.models import Employee
 from modules.integrations.telephony import normalize_e164
 from modules.sales.models import CallLog, CrmClient, CrmClientContact, Deal
 from modules.sales.stages import TERMINAL_STAGES
@@ -214,6 +215,32 @@ def _extension(value: object) -> str | None:
     return value if isinstance(value, str) and re.fullmatch(r"[0-9]{1,8}", value) else None
 
 
+async def resolve_agent(session, extension: str | None) -> tuple[str, int | None] | None:
+    """An explicitly confirmed external employee identity; never infer from a number.
+
+    Staff without a CRM account can be named in the call log. Numeric ownership
+    (and thus own-scope access) still requires an eligible active CRM account.
+    Duplicate links fail closed, including duplicates pointing at the same person.
+    """
+    if _extension(extension) is None:
+        return None
+    rows = (await session.execute(
+        select(Employee).join(SyncLink, SyncLink.entity_id == Employee.id).where(
+            SyncLink.entity_type == "employee", SyncLink.system == "telephony",
+            SyncLink.external_ref == extension, SyncLink.origin == "telephony",
+            SyncLink.direction == "in", SyncLink.state == "synced",
+        )
+    )).scalars().all()
+    if len(rows) != 1 or rows[0].status != "active" or not rows[0].full_name.strip():
+        return None
+    employee = rows[0]
+    try:
+        owner = await resolve_crm_owner(session, employee_id=employee.id)
+    except HTTPException:
+        return employee.full_name, None
+    return owner.full_name, owner.employee_id
+
+
 async def record_event(session, payload: dict, event_type: str) -> tuple[CallLog | None, bool]:
     """Применить событие телефонии к ``CallLog`` (апсерт по ``call_id``).
 
@@ -253,6 +280,9 @@ async def record_event(session, payload: dict, event_type: str) -> tuple[CallLog
     # дозаполнить поля, приходящие на более поздних этапах (дозвон/ответ несут code/did)
     if agent_ext and not call.agent_ext:
         call.agent_ext = agent_ext
+    agent = await resolve_agent(session, call.agent_ext)
+    if agent is not None:
+        call.owner, call.owner_id = agent
     if payload.get("did") and not call.did:
         call.did = payload["did"]
 
