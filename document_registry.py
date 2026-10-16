@@ -25,6 +25,14 @@ SALES_ENTITIES = frozenset('Document_'+name for name in (
     'ВозвратТоваровОтКлиента', 'ЗаявкаНаВозвратТоваровОтКлиента',
     'СчетФактураВыданный', 'ТранспортнаяНакладная', 'АктВыполненныхРабот',
 ))
+# Accounting calculations and journal operations are source observations, not
+# business documents. Keep them in the source store, outside this register.
+ACCOUNTING_OPERATIONS = frozenset('Document_'+name for name in (
+    'АмортизацияОС2_4', 'ОперацияБух', 'ОтражениеЗарплатыВФинансовомУчете',
+    'ПрочиеДоходыРасходы', 'РаспределениеДоходовПоНаправлениямДеятельности',
+    'РаспределениеПрочихЗатрат', 'РасчетКурсовыхРазниц',
+    'РасчетСебестоимостиТоваров', 'РегламентнаяОперация',
+))
 LINE_FIELDS = ('НомерСтроки', 'Количество', 'Цена', 'Сумма', 'СуммаНДС', 'СтавкаНДС',
                'Содержание', 'ЕдиницаИзмерения', 'СуммаВзаиморасчетов')
 
@@ -64,6 +72,7 @@ def source_query(guid, user):
     query = select(Source).where(
         Source.source_scope == 'BOUND_ORGANIZATION',
         Source.organization_sha256 == hashlib.sha256(guid.encode()).hexdigest(),
+        Source.entity.not_in(ACCOUNTING_OPERATIONS),
         ~exists(select(later.id).where(later.namespace == Source.namespace,
                                       later.entity == Source.entity,
                                       later.source_guid == Source.source_guid,
