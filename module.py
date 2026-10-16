@@ -15,6 +15,7 @@ from modules.sales import (
     client_document_register,
     deal_loss,
     document_register,
+    document_registry,
     invoice_cancellation,
     invoice_notification_routes,
     invoice_reconciliation,
@@ -68,6 +69,7 @@ class SalesModule(ModuleContract):
         core.include_router(routes.router, prefix=self.api_prefix)
         core.include_router(deal_loss.router, prefix=self.api_prefix)
         core.include_router(document_register.router, prefix=self.api_prefix)
+        core.include_router(document_registry.router, prefix=self.api_prefix)
         core.include_router(client_document_register.router, prefix=self.api_prefix)
         core.include_router(accounting_ownership.router, prefix=self.api_prefix)
         core.include_router(invoice_settlements.router, prefix=self.api_prefix)
