@@ -181,9 +181,9 @@ from modules.sales.schemas import (
     TaskOut,
     TaskUpdate,
     TelephonyEventIn,
-    deal_item_edit_token,
     TimelineAttachmentOut,
     TimelineCommentOut,
+    deal_item_edit_token,
 )
 from modules.sales.shipping_producer import router as shipping_router
 from modules.sales.stages import (
@@ -3128,7 +3128,8 @@ async def list_crm_clients(
     total = await session.scalar(select(func.count()).select_from(stmt.subquery()))
     rows = (await session.execute(stmt.order_by(combined.c.name, combined.c.source, combined.c.id)
                                   .offset(offset).limit(limit))).mappings().all()
-    return {"rows": [{k: v for k, v in row.items() if k != "source" or v != "mdm"} for row in rows], "total": total}
+    enriched = await crm_clients.enrich_client_managers(session, rows)
+    return {"rows": [{k: v for k, v in row.items() if k != "source" or v != "mdm"} for row in enriched], "total": total}
 
 
 @router.get("/contacts")
