@@ -3,14 +3,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+from typing import Annotated, Literal, Union
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import func, literal, select
+from sqlalchemy import and_, func, literal, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.domain.models import AuditLog, Counterparty, User
+from core.domain.models import AuditLog, Contact, Counterparty, User
 from core.runtime.deps import get_core, get_session
 from core.services.auth import CurrentUser, has_permission, require_permission
 from core.services.crm_owners import CRM_OWNER_ROLES, list_crm_owners, resolve_crm_owner
@@ -18,11 +19,12 @@ from modules.sales.access import (
     DealAccess,
     get_deal_access,
     require_owner_assignment,
+    scope_calls,
     scope_counterparties,
     scope_deals,
 )
-from modules.sales.models import CrmClient, Deal, DealDocument
-from modules.sales.schemas import DocumentOut
+from modules.sales.models import CallLog, CrmClient, Deal, DealDocument
+from modules.sales.schemas import CallOut, DocumentOut
 
 router = APIRouter()
 MANAGER_FIELD = 'crm_responsible_employee_id'
@@ -284,3 +286,138 @@ async def list_crm_client_documents(client_id: int, session: AsyncSession = Depe
         .order_by(DealDocument.id.desc()))).all()
     return [{**DocumentOut.model_validate(doc).model_dump(), "deal_id": doc.deal_id, "deal_number": number}
             for doc, number in rows]
+
+
+class RelationshipPageBase(BaseModel):
+    counterparty_id: int
+    offset: int
+    limit: int
+    total: int
+
+
+class RelationshipContactOut(BaseModel):
+    id: int
+    counterparty_id: int
+    full_name: str
+    phone: str | None
+    email: str | None
+    is_primary: bool
+
+
+class RelationshipManagerOut(BaseModel):
+    employee_id: int
+    name: str
+    active: bool
+
+
+class RelationshipDealOut(BaseModel):
+    id: int
+    number: str
+    title: str
+    counterparty_id: int | None
+    crm_client_id: int | None
+    stage: str
+    owner_id: int | None
+    responsible_manager: RelationshipManagerOut | None
+
+
+class RelationshipContactsPage(RelationshipPageBase):
+    kind: Literal["contacts"]
+    items: list[RelationshipContactOut]
+
+
+class RelationshipDealsPage(RelationshipPageBase):
+    kind: Literal["deals"]
+    items: list[RelationshipDealOut]
+
+
+class RelationshipCallsPage(RelationshipPageBase):
+    kind: Literal["calls"]
+    items: list[CallOut]
+
+
+CounterpartyRelationshipPage = Annotated[
+    Union[RelationshipContactsPage, RelationshipDealsPage, RelationshipCallsPage],
+    Field(discriminator="kind"),
+]
+
+
+@router.get("/counterparties/{mdm_id}/relationships", response_model=CounterpartyRelationshipPage)
+async def counterparty_relationships(
+    mdm_id: int = Path(gt=0),
+    kind: Literal["contacts", "deals", "calls"] = Query(...),
+    offset: int = Query(default=0, ge=0, le=2_147_483_647),
+    limit: int = Query(default=20, ge=1, le=50),
+    contact_id: int | None = Query(default=None, gt=0),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
+    """Read one bounded relationship list for an explicitly visible MDM client."""
+    client = await responsible_counterparty(session, mdm_id, access)
+    if contact_id is not None and kind != "contacts":
+        raise HTTPException(422, "contact_id допустим только для kind=contacts")
+    page = dict(counterparty_id=client.id, offset=offset, limit=limit)
+
+    if kind == "contacts":
+        stmt = select(Contact).where(Contact.counterparty_id == client.id)
+        if contact_id is not None:
+            stmt = stmt.where(Contact.id == contact_id)
+        total = await session.scalar(select(func.count()).select_from(stmt.order_by(None).subquery())) or 0
+        rows = (await session.scalars(stmt.order_by(Contact.is_primary.desc(), Contact.id)
+                                      .offset(offset).limit(limit))).all()
+        return RelationshipContactsPage(
+            kind="contacts", **page, total=total,
+            items=[RelationshipContactOut(
+                id=row.id, counterparty_id=client.id, full_name=row.full_name,
+                phone=row.phone, email=row.email, is_primary=row.is_primary,
+            ) for row in rows],
+        )
+
+    if kind == "deals":
+        linked_clients = scope_clients(
+            select(CrmClient.id).where(CrmClient.counterparty_id == client.id), access,
+        )
+        exact_client_link = Deal.crm_client_id.in_(linked_clients)
+        consistent_direct_link = and_(
+            Deal.counterparty_id == client.id,
+            or_(Deal.crm_client_id.is_(None), exact_client_link),
+        )
+        consistent_client_link = and_(Deal.counterparty_id.is_(None), exact_client_link)
+        stmt = scope_deals(select(Deal).where(or_(consistent_direct_link, consistent_client_link)), access)
+        total = await session.scalar(select(func.count()).select_from(stmt.order_by(None).subquery())) or 0
+        rows = (await session.scalars(stmt.order_by(Deal.id.desc()).offset(offset).limit(limit))).all()
+        managers = await manager_labels(session, (row.owner_id for row in rows))
+        return RelationshipDealsPage(
+            kind="deals", **page, total=total,
+            items=[RelationshipDealOut(
+                id=row.id, number=row.number, title=row.title,
+                counterparty_id=row.counterparty_id, crm_client_id=row.crm_client_id,
+                stage=row.stage, owner_id=row.owner_id,
+                responsible_manager=managers.get(row.owner_id) if type(row.owner_id) is int else None,
+            ) for row in rows],
+        )
+
+    stmt = scope_calls(select(CallLog).where(CallLog.counterparty_id == client.id), access)
+    total = await session.scalar(select(func.count()).select_from(stmt.order_by(None).subquery())) or 0
+    rows = (await session.scalars(stmt.order_by(CallLog.started_at.desc(), CallLog.id.desc())
+                                  .offset(offset).limit(limit))).all()
+    contact_ids = {row.contact_id for row in rows if row.contact_id is not None}
+    valid_contact_ids = set()
+    if contact_ids:
+        valid_contact_ids = set((await session.scalars(select(Contact.id).where(
+            Contact.id.in_(contact_ids), Contact.counterparty_id == client.id,
+        ))).all())
+    linked_client_rows = (await session.execute(scope_clients(
+        select(CrmClient.id).where(CrmClient.counterparty_id == client.id), access,
+    ))).scalars().all()
+    linked_client_ids = {client_id for client_id in linked_client_rows}
+    crm_client_id = next(iter(linked_client_ids)) if len(linked_client_ids) == 1 else None
+    return RelationshipCallsPage(
+        kind="calls", **page, total=total,
+        items=[CallOut.model_validate(row).model_copy(update={
+            "counterparty_id": client.id,
+            "contact_id": row.contact_id if row.contact_id in valid_contact_ids else None,
+            "crm_client_id": crm_client_id,
+        }) for row in rows],
+    )
