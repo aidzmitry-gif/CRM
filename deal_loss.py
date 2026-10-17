@@ -420,6 +420,7 @@ async def loss_context(deal_id: int, session=Depends(get_session), core=Depends(
                   "organization": organization, "mapping_required": org is None,
                   "funnel": deal.funnel, "stage": deal.stage,
                   "lost_stage": next((code for code, kind in kinds.items() if kind == "lost"), None),
+                  "lost_stages": [code for code, kind in kinds.items() if kind == "lost"],
                   "pending_request_id": active.id if active else None,
                   "latest_request_id": latest.id if latest else None,
                   "latest_request_state": latest.state if latest else None}
