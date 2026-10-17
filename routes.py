@@ -12,6 +12,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -28,12 +29,14 @@ from core.domain.models import (
     CounterpartyAlias,
     OutboxEvent,
     Sku,
+    User,
 )
 from core.runtime.core import Core
 from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
 from core.services.auth import CurrentUser, get_current_user, require_permission
 from core.services.price_cost import ItemPriceCost
+from modules.hr.models import Employee
 from modules.sales import client_contacts as crm_contacts
 from modules.sales import clients as crm_clients
 from modules.sales import documents as originals
@@ -284,6 +287,11 @@ async def _board_stages(session: AsyncSession, funnel: str = DEFAULT_FUNNEL) -> 
 def _utcnow() -> datetime:
     # наивный UTC — единообразно для SQLite и PostgreSQL
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _minsk_today() -> date:
+    """Текущий день отчёта по локальным часам Минска."""
+    return datetime.now(ZoneInfo("Europe/Minsk")).date()
 
 
 def _task_naive_utc(value: datetime | None) -> datetime | None:
@@ -1083,11 +1091,12 @@ async def _owner_plan_overrides(
 async def kpis(
     period: str = "day",
     owner_id: int | None = None,
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
     session: AsyncSession = Depends(get_session),
 ):
     """Показатели «План/Факт» за период (день/неделя/месяц/квартал/год, sales-34).
 
-    Факт — сумма активностей за окно периода (от последней даты назад); план —
+    Факт — сумма активностей за окно периода (от текущей даты в Минске назад); план —
     дневная цель, масштабированная на число рабочих дней периода. Период также
     принимает конкретный месяц вида ``"YYYY-MM"`` (напр. ``"2026-05"``) — тогда
     окно факта фиксировано на этот календарный месяц (а не «от последней даты
@@ -1122,9 +1131,9 @@ async def kpis(
             if date(year, month, day).weekday() < 5
         )
     else:
-        latest = (await session.execute(select(func.max(Activity.date)))).scalar()
-        start = None if latest is None else latest - timedelta(days=PERIOD_DAYS.get(period, 1) - 1)
-        end = latest
+        today = _minsk_today()
+        start = today - timedelta(days=PERIOD_DAYS.get(period, 1) - 1)
+        end = today
         mult = PERIOD_MULT.get(period, 1)
 
     actuals: dict[str, float] = {}
@@ -1206,15 +1215,44 @@ async def kpis(
 
 
 @router.post("/activities", status_code=201)
-async def create_activity(payload: ActivityCreate, session: AsyncSession = Depends(get_session)):
+async def create_activity(
+    payload: ActivityCreate,
+    user: CurrentUser = Depends(require_permission("sales.deal.write")),
+    session: AsyncSession = Depends(get_session),
+):
     """Отметить активность. Без даты — добавляется в текущий отчётный день."""
-    day = payload.date
-    if day is None:
-        day = (await session.execute(select(func.max(Activity.date)))).scalar() or date.today()
+    identity_filter = (
+        User.keycloak_user_id == user.keycloak_user_id
+        if user.keycloak_user_id is not None
+        else User.username == user.username
+    )
+    app_user = (
+        await session.execute(
+            select(User)
+            .where(identity_filter)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if app_user is None or app_user.status != "active" or app_user.employee_id is None:
+        raise HTTPException(status_code=403, detail="Не найден активный профиль сотрудника.")
+    employee = (
+        await session.execute(
+            select(Employee)
+            .where(Employee.id == app_user.employee_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if employee is None or employee.status != "active":
+        raise HTTPException(status_code=403, detail="Не найден активный профиль сотрудника.")
+
+    day = payload.date if payload.date is not None else _minsk_today()
     session.add(
         Activity(
             kpi_key=payload.kpi_key,
-            owner=payload.owner,
+            owner=employee.full_name,
+            owner_id=employee.id,
             value=Decimal(str(payload.value)),
             date=day,
         )
