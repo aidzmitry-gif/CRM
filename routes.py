@@ -4691,6 +4691,7 @@ async def calls_stream(
     owner: str | None = None,
     user: CurrentUser = Depends(require_permission("sales.deal.read")),
     access: DealAccess = Depends(get_deal_access),
+    session: AsyncSession = Depends(get_session),
 ):
     """SSE-поток карточек звонков продавца (всплывающее окно входящего звонка).
 
@@ -4709,6 +4710,8 @@ async def calls_stream(
         raise HTTPException(status_code=403, detail="Для потока звонков нужна связанная учётная запись сотрудника")
 
     employee_id = access.employee_id
+    # Access checks are complete; the queue-only stream must not retain a SQL connection.
+    await session.close()
     queue = calls_mod.subscribe(employee_id)
 
     async def _gen():
