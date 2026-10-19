@@ -162,7 +162,10 @@ async def require_replacement_source(session, doc, organization_id):
             or old.status != "cancelled" or old.reserve_status != "released"
             or old.superseded_by_id is not None):
         raise HTTPException(409, "Cancel and reconcile the original invoice before replacement")
-    from modules.sales.invoice_cancellation import InvoiceCancellationReceipt, orm_cancellation_receipt
+    from modules.sales.invoice_cancellation import (
+        InvoiceCancellationReceipt,
+        orm_cancellation_receipt,
+    )
 
     cancellation = await session.scalar(select(InvoiceCancellationReceipt).where(
         InvoiceCancellationReceipt.document_id == old.id,
