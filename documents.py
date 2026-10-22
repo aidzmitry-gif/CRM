@@ -273,26 +273,60 @@ def render_erp_invoice(number, prepared):
     """Static local original from confirmed exact facts, with no runtime defaults."""
     def esc(value):
         return html.escape(str(value if value is not None else ''), quote=True)
+
+    def present(value):
+        return value is not None and str(value).strip() != ''
+
+    def group(label, values):
+        text = ', '.join(esc(value) for value in values if present(value))
+        return f'<dt>{esc(label)}</dt><dd>{text}</dd>' if text else ''
+
+    labels = {
+        'address': 'Адрес', 'legal_address': 'Юридический адрес',
+        'postal_address': 'Почтовый адрес', 'bank': 'Банк', 'bank_name': 'Банк',
+        'bik': 'БИК', 'account': 'Расчётный счёт', 'iban': 'IBAN',
+        'phone': 'Телефон', 'email': 'Email', 'director': 'Руководитель',
+    }
+
+    def requisites(value, path=()):
+        if isinstance(value, dict):
+            return ''.join(requisites(item, (*path, labels.get(str(key), str(key))))
+                           for key, item in sorted(value.items(), key=lambda pair: str(pair[0])))
+        if isinstance(value, list):
+            return ''.join(requisites(item, (*path, str(index)))
+                           for index, item in enumerate(value, 1))
+        return group(' / '.join(path), [value]) if present(value) else ''
+
     seller, buyer = prepared['seller'], prepared['buyer']
+    party_fields = ''.join((
+        group('Продавец', [seller['name'], f"УНП {seller['unp']}", seller['address']]),
+        group('Банк / счёт', [seller['bank'], seller['bik'], seller['account']]),
+        group('Контакты / руководитель', [seller.get('phone'), seller.get('email'), seller['director']]),
+        group('Покупатель', [buyer['name'], f"УНП {buyer['unp']}"]),
+        requisites(buyer['requisites']),
+    ))
+    terms = ''.join(f'<p>{esc(label)}: {esc(prepared[key])}</p>' for label, key in (
+        ('Условия оплаты', 'payment_terms'), ('Условия поставки', 'delivery_terms'))
+        if present(prepared[key]))
     rows = ''.join('<tr>' + ''.join(f'<td>{esc(line[key])}</td>' for key in (
         'line_no', 'sku_code', 'name', 'qty', 'unit', 'price', 'vat_rate', 'net', 'tax', 'total'))
         + '</tr>' for line in prepared['lines'])
     return f'''<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">
 <title>Счёт {esc(number)}</title><style>
-body{{font-family:Arial,sans-serif;color:#172033;margin:32px}}table{{width:100%;border-collapse:collapse}}
-th,td{{border:1px solid #9ca3af;padding:6px;text-align:left}}dl{{line-height:1.6}}
-</style></head><body><h1>Счёт {esc(number)} от {esc(prepared['document_date'])}</h1>
-<dl><dt>Продавец</dt><dd>{esc(seller['name'])}, УНП {esc(seller['unp'])}, {esc(seller['address'])}</dd>
-<dt>Банк / счёт</dt><dd>{esc(seller['bank'])}, {esc(seller['bik'])}, {esc(seller['account'])}</dd>
-<dt>Контакты / руководитель</dt><dd>{esc(seller.get('phone'))}, {esc(seller.get('email'))}, {esc(seller['director'])}</dd>
-<dt>Покупатель</dt><dd>{esc(buyer['name'])}, УНП {esc(buyer['unp'])}, {esc(buyer['requisites'].get('address'))}</dd>
-<dt>Реквизиты покупателя</dt><dd>{esc(json.dumps(buyer['requisites'], ensure_ascii=False, sort_keys=True))}</dd></dl>
-<table><thead><tr><th>№</th><th>Код</th><th>Товар</th><th>Количество</th><th>Ед.</th><th>Цена нетто</th>
+@page{{size:A4 landscape;margin:14mm}}
+body{{font-family:Arial,sans-serif;font-size:9pt;color:#172033;margin:0 auto;max-width:269mm}}
+h1{{font-size:16pt}}table{{width:100%;table-layout:fixed;border-collapse:collapse}}
+th,td{{border:1px solid #9ca3af;padding:5px;text-align:left;overflow-wrap:anywhere}}
+thead{{display:table-header-group}}tr{{break-inside:avoid}}dl{{line-height:1.4}}
+dd{{margin:0 0 6px 16px;overflow-wrap:anywhere}}dt{{font-weight:bold}}
+</style></head><body><h1>Счёт {esc(number)} от {esc(prepared['document_date'])}</h1><dl>{party_fields}</dl>
+<table><colgroup>{''.join(f'<col style="width:{width}%">' for width in (3, 11, 25, 7, 4, 10, 6, 11, 11, 12))}</colgroup>
+<thead><tr><th>№</th><th>Код</th><th>Товар</th><th>Количество</th><th>Ед.</th><th>Цена нетто</th>
 <th>НДС %</th><th>Нетто</th><th>НДС</th><th>Всего</th></tr></thead><tbody>{rows}</tbody></table>
 <p>Всего: {esc(prepared['amount'])} {esc(prepared['currency'])}</p>
 <p>{'Под заказ — товар не зарезервирован.' if prepared.get('reserve_mode') == 'on_order' else 'Поставка со склада.'}</p>
 <p>Действителен до {esc(prepared['valid_until'])}.</p>
-<p>Условия оплаты: {esc(prepared['payment_terms'])}. Условия поставки: {esc(prepared['delivery_terms'])}.</p>
+{terms}
 <p>Основание цен и ставок: {esc(prepared['pricing_evidence'])}.</p></body></html>'''
 
 
