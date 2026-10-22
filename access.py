@@ -162,6 +162,7 @@ async def resolve_owner_assignment(
 _OWN_ROUTE_NAMES = frozenset(
     {
         "board",
+        "list_buyer_options",
         "shipping_association_preview", "shipping_association_confirm", "shipping_envelope_prepare",
         "pipeline_analytics",
         "pipeline_stage_metrics",

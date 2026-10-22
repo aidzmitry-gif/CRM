@@ -179,6 +179,36 @@ async def client_out(session, client):
             "source": "crm", "responsible_manager": labels.get(client.owner_id)}
 
 
+class BuyerOption(BaseModel):
+    id: int
+    name: str
+    unp: str | None
+
+
+class BuyerOptionsPage(BaseModel):
+    rows: list[BuyerOption]
+    total: int
+
+
+@router.get("/buyer-options", response_model=BuyerOptionsPage)
+async def list_buyer_options(
+    q: str = Query("", max_length=120),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_session),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
+):
+    """Basic buyer selection only; no shared contacts or CRM history."""
+    conditions = [Counterparty.is_active.is_(True), Counterparty.merged_into_id.is_(None)]
+    if query := q.strip():
+        conditions.append(or_(Counterparty.name.ilike(f"%{query}%"), Counterparty.unp.ilike(f"%{query}%")))
+    total = await session.scalar(select(func.count()).select_from(Counterparty).where(*conditions))
+    rows = (await session.execute(select(Counterparty.id, Counterparty.name, Counterparty.unp)
+        .where(*conditions).order_by(Counterparty.name, Counterparty.id).offset(offset).limit(limit))).mappings().all()
+    return {"rows": [dict(row) for row in rows], "total": total}
+
+
 @router.get("/clients/owners")
 async def crm_client_owners(
     session: AsyncSession = Depends(get_session),
@@ -224,11 +254,11 @@ async def create_crm_client(
     if old := await replay():
         return await client_out(session, old)
     if payload.counterparty_id is not None:
-        counterparty = await session.scalar(scope_counterparties(select(Counterparty).where(
+        counterparty = await session.scalar(select(Counterparty).where(
             Counterparty.id == payload.counterparty_id,
             Counterparty.is_active.is_(True),
             Counterparty.merged_into_id.is_(None),
-        ), access).with_for_update(read=True))
+        ).with_for_update(read=True))
         if counterparty is None:
             raise HTTPException(422, "Активный контрагент не найден")
         existing = await session.scalar(select(CrmClient).where(

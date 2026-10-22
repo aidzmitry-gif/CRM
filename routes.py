@@ -2828,20 +2828,30 @@ async def create_deal(
                 raise HTTPException(422, "Нужна активная стадия целевой воронки")
             if kinds[data.stage] in {"won", "lost"} or data.closed_date is not None:
                 raise HTTPException(422, "Создайте открытую сделку; закрытие выполняется через /win или /lose")
+        client = None
         if data.crm_client_id is not None:
             client = await crm_clients.visible_client(session, data.crm_client_id, access, lock=True)
             if data.owner_id != client.owner_id:
                 raise HTTPException(422, "Владелец сделки должен совпадать с владельцем CRM-клиента")
             data.counterparty = client.name
-            if data.counterparty_id is not None and data.counterparty_id != client.counterparty_id:
-                raise HTTPException(422, "Контрагент должен совпадать с подтверждённой связью CRM-клиента")
-            data.counterparty_id = client.counterparty_id
-            if data.counterparty_id is None and data.branch_id is not None:
-                raise HTTPException(422, "Для выбора филиала требуется подтверждённый контрагент")
+            if client.counterparty_id is not None:
+                if data.counterparty_id not in (None, client.counterparty_id):
+                    raise HTTPException(422, "Контрагент должен совпадать с подтверждённой связью CRM-клиента")
+                data.counterparty_id = client.counterparty_id
+            else:
+                if data.counterparty_id is None:
+                    raise HTTPException(422, "Выберите контрагента по названию или УНП перед созданием сделки")
+                if await session.scalar(select(Deal.id).where(Deal.crm_client_id == client.id).limit(1)):
+                    raise HTTPException(409, "У CRM-клиента уже есть сделки без подтверждённой связи; требуется сверка")
         if data.crm_client_id is None or data.counterparty_id is not None:
             party_data = data.model_dump()
             await prepare_party_change(session, party_data)
             data = DealCreate.model_validate(party_data)
+        if client is not None and client.counterparty_id is None:
+            buyer = await session.get(Counterparty, data.counterparty_id)
+            if client.unp and (buyer is None or client.unp != buyer.unp):
+                raise HTTPException(409, "УНП CRM-клиента не совпадает с выбранным контрагентом")
+            client.counterparty_id = data.counterparty_id
         deal = await DealRepository(session).create(data)
         core.event_bus.emit(session, "sales.deal.created", {"number": deal.number, "title": deal.title})
         if deal.ship_deadline:
@@ -2850,6 +2860,9 @@ async def create_deal(
     except IntegrityError:
         await session.rollback()
         raise HTTPException(status_code=409, detail="Сделка с таким номером уже существует")
+    except Exception:
+        await session.rollback()
+        raise
     return deal
 
 

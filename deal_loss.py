@@ -106,6 +106,14 @@ async def kind_map(session, funnel):
     return dict(rows) if rows else {s["code"]: s["kind"] for s in canonical_stages() if s["funnel"] == funnel}
 
 
+async def available_kinds(session, funnel):
+    rows = (await session.execute(select(Stage.code, Stage.kind, Stage.is_active).where(
+        Stage.funnel == funnel))).all()
+    if rows:
+        return {code: kind for code, kind, active in rows if active}
+    return {s["code"]: s["kind"] for s in canonical_stages() if s["funnel"] == funnel}
+
+
 async def current_writer(session, core, user):
     try:
         user = await resolve_effective_oidc_user(user, session)
@@ -305,7 +313,7 @@ async def resolve(session, core, user, row, deal, docs, actor, data, action):
         raise HTTPException(409, detail=status)
     if (deal.funnel, deal.stage) != (row.snapshot["funnel"], row.snapshot["stage"]):
         raise HTTPException(409, "Deal stage changed during pending request")
-    if action == "finalized" and (await kind_map(session, deal.funnel)).get(row.snapshot["lost_stage"]) != "lost":
+    if action == "finalized" and (await available_kinds(session, deal.funnel)).get(row.snapshot["lost_stage"]) != "lost":
         raise HTTPException(409, "Requested lost stage semantics changed")
     receipt = DealLossResolution(id=str(data.request_key), request_id=row.id, action=action,
         command=command, command_hash=snapshot_hash(command), snapshot={"request_digest": row.digest,
@@ -356,12 +364,12 @@ async def request_loss(session, core, user, access, deal_id, data, expected_prin
                 "command": prior.command, "snapshot": prior.snapshot, "replayed": True,
                 "resolution": resolution_output(receipt) if receipt else None}
     await assert_not_pending(session, deal_id)
-    kinds = await kind_map(session, deal.funnel)
+    kinds = await available_kinds(session, deal.funnel)
     lost = next((code for code, kind in kinds.items() if kind == "lost"), None)
     if lost is None or kinds.get(deal.stage) == "lost":
         raise HTTPException(409, "An open deal and configured lost stage are required")
     codes = set((await session.scalars(select(LossReason.code).where(LossReason.active))).all())
-    if codes and data.reason_code not in codes:
+    if data.reason_code not in codes:
         raise HTTPException(422, "Unknown loss reason")
     snapshot = {"funnel": deal.funnel, "stage": deal.stage, "lost_stage": lost, "invoices": composition(docs)}
     if snapshot_hash(snapshot) != data.expected_composition_digest:
@@ -411,7 +419,7 @@ async def loss_context(deal_id: int, session=Depends(get_session), core=Depends(
             organization = next((item for item in organizations if item["id"] == org), None)
             if organization is None:
                 raise HTTPException(403, "Current organization access is required")
-        kinds = await kind_map(session, deal.funnel)
+        kinds = await available_kinds(session, deal.funnel)
         active = await pending(session, deal_id) if org is not None else None
         latest = await session.scalar(select(DealLossRequest).where(
             DealLossRequest.deal_id == deal_id, DealLossRequest.organization_id == org)
@@ -435,7 +443,7 @@ async def preview(org_id: int, deal_id: int, session=Depends(get_session), core=
                   user=Depends(require_permission("sales.deal.write")), access=Depends(get_deal_access)):
     try:
         deal, docs, _, user = await context(session, core, user, access, deal_id, org_id)
-        kinds = await kind_map(session, deal.funnel)
+        kinds = await available_kinds(session, deal.funnel)
         snapshot = {"funnel": deal.funnel, "stage": deal.stage,
             "lost_stage": next((c for c, k in kinds.items() if k == "lost"), None), "invoices": composition(docs)}
         active = await pending(session, deal_id)
