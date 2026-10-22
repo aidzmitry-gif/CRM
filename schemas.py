@@ -204,6 +204,18 @@ class DealItemUpdate(BaseModel):
         return self
 
 
+class PickerStockOut(BaseModel):
+    """Operational catalogue snapshot; the route masks cost for managed CRM users."""
+
+    sku_code: str
+    warehouse: str
+    qty_available: float
+    qty_reserved: float
+    qty_forecast: float
+    price: float
+    cost: float | None
+
+
 class SkuOut(BaseModel):
     """Позиция справочника номенклатуры (для подбора в сделку)."""
 

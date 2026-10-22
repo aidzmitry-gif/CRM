@@ -34,6 +34,7 @@ from core.runtime.deps import get_core, get_session
 from core.services.approvals import ApprovalOut, ApprovalRequest
 from core.services.auth import CurrentUser, get_current_user, require_permission
 from core.services.price_cost import ItemPriceCost
+from modules.integrations.models import StockItem
 from modules.sales import client_contacts as crm_contacts
 from modules.sales import clients as crm_clients
 from modules.sales import documents as originals
@@ -156,6 +157,7 @@ from modules.sales.schemas import (
     ObjectionReplyOut,
     PackagePrepare,
     PackageSentOut,
+    PickerStockOut,
     PipelineAnalyticsOut,
     PlanDecisionIn,
     PlanItemIn,
@@ -2885,6 +2887,23 @@ async def request_approval(
     )
     await session.commit()
     return approval
+
+
+@router.get("/picker-stock", response_model=list[PickerStockOut])
+async def picker_stock(
+    session: AsyncSession = Depends(get_session),
+    user: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Shared company catalogue facts, without deal history or restricted cost."""
+    rows = (await session.execute(
+        select(StockItem).order_by(StockItem.sku_code, StockItem.warehouse, StockItem.id)
+    )).scalars().all()
+    return [{
+        "sku_code": row.sku_code, "warehouse": row.warehouse,
+        "qty_available": row.qty_available, "qty_reserved": row.qty_reserved,
+        "qty_forecast": row.qty_forecast, "price": row.price,
+        "cost": None if user.crm_restricted else row.cost,
+    } for row in rows]
 
 
 @router.get("/skus", response_model=list[SkuOut])
