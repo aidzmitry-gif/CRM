@@ -19,7 +19,7 @@ from core.runtime.deps import get_core, get_session
 from core.services.auth import CurrentUser, has_permission, require_permission
 from modules.sales.access import DealAccess, get_deal_access, visible_deal_or_404
 from modules.sales.mail_attachments import UploadSpec, uploads_from_payload
-from modules.sales.mail_documents import attachments_for
+from modules.sales.mail_documents import attachments_for, eligible_original
 from modules.sales.mail_models import EmailAttempt, OutgoingEmail
 from modules.sales.mail_profiles import actor_identity, append_signature, resolve_profile
 from modules.sales.mail_queue import audit, digest, now, prepare, request_fingerprint
@@ -261,28 +261,31 @@ async def email_options(
         signature_preview, signature_error = profile.preview, None
     except HTTPException as exc:
         signature_preview, signature_error = None, str(exc.detail)
+    choices = []
+    for document in documents:
+        try:
+            await eligible_original(session, document)
+            available = True
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+            available = False
+        choices.append({
+            "id": document.id,
+            "number": document.number,
+            "kind": document.kind,
+            "status": document.status,
+            "version": getattr(document, "version", None),
+            "superseded_by_id": getattr(document, "superseded_by_id", None),
+            "available": available,
+        })
     return {
         "sender": sender,
         "configuration_error": error,
         "signature_preview": signature_preview,
         "signature_configuration_error": signature_error,
         "enabled": os.getenv("AIOS_SALES_EMAIL_ENABLED") == "1",
-        "documents": [
-            {
-                "id": d.id,
-                "number": d.number,
-                "kind": d.kind,
-                "status": d.status,
-                "version": getattr(d, "version", None),
-                "superseded_by_id": getattr(d, "superseded_by_id", None),
-                "available": bool(
-                    getattr(d, "issued_at", None)
-                    and getattr(d, "original_html", None)
-                    and d.status in {"posted", "paid"}
-                ),
-            }
-            for d in documents
-        ],
+        "documents": choices,
     }
 
 
