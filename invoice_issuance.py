@@ -95,6 +95,13 @@ async def verified_receipt(session, doc, organization_id):
     if doc is None:
         raise ValueError("Issued document is missing")
     receipt = await session.get(InvoiceIssuanceReceipt, doc.id)
+    return verified_receipt_values(doc, organization_id, receipt)
+
+
+def verified_receipt_values(doc, organization_id, receipt):
+    """Shared immutable-original check for async services and ORM guards."""
+    if doc is None:
+        raise ValueError("Issued document is missing")
     marker = isinstance(doc.snapshot_json, dict) and doc.snapshot_json.get("issuance_mode") == MODE
     if receipt is None:
         if marker or doc.status == "issued":
@@ -121,6 +128,30 @@ async def verified_receipt(session, doc, organization_id):
     ):
         raise ValueError("Invoice issuance receipt does not match the immutable original")
     return receipt
+
+
+def unreserved_issuance_anchor(doc, organization_id, receipt):
+    verified_receipt_values(doc, organization_id, receipt)
+    if (receipt is None or doc.reserve_mode != "on_order" or doc.reserve_status != "unreserved"
+            or doc.snapshot_json.get("reserve_mode") != "on_order"
+            or receipt.reservation_digest is not None):
+        raise ValueError("Cancellation requires a genuine unreserved ERP on-order original")
+    response = receipt.response
+    original = response.get("document") if isinstance(response, dict) else None
+    if (not isinstance(original, dict) or response.get("status") != "issued"
+            or type(response.get("organization_id")) is not int
+            or type(response.get("document_version")) is not int
+            or type(original.get("id")) is not int or type(original.get("version")) is not int
+            or response.get("organization_id") != organization_id
+            or response.get("document_version") != doc.version
+            or response.get("content_sha256") != doc.content_sha256
+            or "reservation_digest" not in response or response["reservation_digest"] is not None
+            or original.get("id") != doc.id or original.get("version") != doc.version
+            or original.get("content_sha256") != doc.content_sha256
+            or original.get("status") != "issued" or original.get("kind") != "invoice"
+            or original.get("reserve_status") != "unreserved" or original.get("reserve_mode") != "on_order"):
+        raise ValueError("Initial unreserved issuance response requires reconciliation")
+    return receipt_anchor(receipt)
 
 
 async def is_erp_invoice(session, doc):
@@ -159,7 +190,7 @@ async def require_replacement_source(session, doc, organization_id):
         DealDocument.id == doc.supersedes_id,
     ).with_for_update().execution_options(populate_existing=True))
     if (old is None or old.deal_id != doc.deal_id or old.kind != "invoice"
-            or old.status != "cancelled" or old.reserve_status != "released"
+            or old.status != "cancelled"
             or old.superseded_by_id is not None):
         raise HTTPException(409, "Cancel and reconcile the original invoice before replacement")
     from modules.sales.invoice_cancellation import (

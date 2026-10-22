@@ -151,6 +151,7 @@ BEGIN
   SELECT * INTO r FROM sales.invoice_fulfillment_review WHERE id=c.fulfillment_review_id;
   SELECT * INTO m FROM sales.invoice_money_reconciliation WHERE id=r.money_reconciliation_id;
   SELECT * INTO w FROM wms.invoice_reservation_release WHERE id=c.release_id;
+  IF c.release_id IS NULL THEN PERFORM sales.check_no_stock_cancellation(c.id); END IF;
   IF jsonb_typeof(c.snapshot::jsonb) IS DISTINCT FROM 'object'
     OR jsonb_typeof(r.request::jsonb->'external_sources') IS DISTINCT FROM 'array'
     OR jsonb_typeof(c.snapshot::jsonb->'money'->'facts') IS DISTINCT FROM 'object'
@@ -186,19 +187,20 @@ BEGIN
           AND (b->>'bank_entry_id')::integer=s.bank_entry_id AND b->>'direction'=s.direction
           AND (b->>'amount')::numeric=s.amount AND (b->>'refund_of')::integer IS NOT DISTINCT FROM s.refund_of
           AND b->'snapshot'=s.snapshot::jsonb))
-    OR d.status IS DISTINCT FROM 'cancelled' OR d.reserve_status IS DISTINCT FROM 'released'
+    OR d.status IS DISTINCT FROM 'cancelled' OR d.reserve_status IS DISTINCT FROM (CASE WHEN c.release_id IS NULL THEN 'unreserved' ELSE 'released' END)
     OR c.document_version IS DISTINCT FROM d.version OR c.content_sha256 IS DISTINCT FROM d.content_sha256
     OR r.document_id IS DISTINCT FROM d.id OR r.organization_id IS DISTINCT FROM c.organization_id
     OR m.document_id IS DISTINCT FROM d.id OR m.organization_id IS DISTINCT FROM c.organization_id
-    OR w.document_id IS DISTINCT FROM d.id OR w.organization_id IS DISTINCT FROM c.organization_id
-    OR w.source_key IS DISTINCT FROM c.id
+    OR (c.release_id IS NOT NULL AND (
+      w.document_id IS DISTINCT FROM d.id OR w.organization_id IS DISTINCT FROM c.organization_id
+      OR w.source_key IS DISTINCT FROM c.id
+      OR c.snapshot->'release'->>'digest' IS DISTINCT FROM w.digest
+      OR (w.snapshot->'fulfillment'->>'review_id') IS DISTINCT FROM r.id))
     OR c.snapshot->>'basis_digest' IS DISTINCT FROM r.snapshot->>'basis_digest'
     OR c.snapshot->>'review_digest' IS DISTINCT FROM r.digest
     OR c.snapshot->'money'->>'digest' IS DISTINCT FROM m.basis_digest
     OR (c.snapshot->'money'->'facts')::jsonb IS DISTINCT FROM (r.snapshot->'money'->'facts')::jsonb
     OR (c.snapshot->'money'->'facts')::jsonb IS DISTINCT FROM m.facts::jsonb
-    OR c.snapshot->'release'->>'digest' IS DISTINCT FROM w.digest
-    OR (w.snapshot->'fulfillment'->>'review_id') IS DISTINCT FROM r.id
     OR (r.request->>'all_fulfillment_sources_identified') IS DISTINCT FROM 'true'
     OR (m.request->>'all_money_sources_checked') IS DISTINCT FROM 'true'
     OR m.history_through < c.created_at::date
@@ -239,14 +241,14 @@ BEGIN
       AND (e.payload->>'document_id')::integer=d.id)
   THEN RAISE EXCEPTION 'Incomplete or inconsistent invoice cancellation package';
   END IF;
-  IF EXISTS (SELECT 1 FROM wms.invoice_reservation_release_line l
+  IF c.release_id IS NOT NULL AND (EXISTS (SELECT 1 FROM wms.invoice_reservation_release_line l
     LEFT JOIN wms.reservation_version v ON v.id=l.after_id
     WHERE l.release_id=w.id AND (v.id IS NULL OR v.qty<>0 OR EXISTS(
       SELECT 1 FROM wms.reservation_version newer WHERE newer.organization_id=w.organization_id
       AND newer.source=l.source AND newer.version>v.version)))
     OR NOT EXISTS(SELECT 1 FROM wms.reservation_event_state WHERE document_id=d.id AND state='released')
     OR EXISTS(SELECT 1 FROM wms.task t JOIN wms.reservation_pick p ON p.task_id=t.id
-      WHERE p.document_id=d.id AND (t.status<>'canceled' OR t.done_at IS NOT NULL))
+      WHERE p.document_id=d.id AND (t.status<>'canceled' OR t.done_at IS NOT NULL)))
   THEN RAISE EXCEPTION 'Loss requires current released reserve and canceled picks'; END IF;
   RETURN;
 END;

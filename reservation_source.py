@@ -20,7 +20,7 @@ class SalesReservationSource:
         self, session, document_id, *, organization_id,
         expected_version, expected_content_sha256, operation="fulfill",
     ):
-        if not isinstance(operation, str) or operation not in {"fulfill", "historical_claim"}:
+        if not isinstance(operation, str) or operation not in {"fulfill", "historical_claim", "cancellation"}:
             raise ValueError("Unknown invoice shipping operation")
         if (type(organization_id) is not int or organization_id <= 0
                 or type(expected_version) is not int or expected_version <= 0
@@ -32,6 +32,17 @@ class SalesReservationSource:
         # source locks when the caller holds the wrong organization lock.
         if await self.invoice_organization(session, document_id) != organization_id:
             raise ValueError("Invoice source identity does not match")
+        if operation == "cancellation":
+            doc = await session.get(DealDocument, document_id, populate_existing=True)
+            if doc is not None and doc.reserve_status == "unreserved":
+                # A failure here is unresolved evidence, never a stock fallback.
+                return await self._unreserved_cancellation_source(
+                    session, document_id, organization_id=organization_id,
+                    expected_version=expected_version, expected_content_sha256=expected_content_sha256,
+                )
+            # Preserve both legacy stock and genuinely later-reserved on-order
+            # history, including the exact old source shape and validations.
+            operation = "historical_claim"
         facts = await self.invoice_reservation(session, document_id)
         if (facts["organization_id"] != organization_id
                 or facts["version"] != expected_version
@@ -50,6 +61,36 @@ class SalesReservationSource:
             raise ValueError("Invoice is terminal or its reservation is released")
         return {**facts, "document_status": doc.status, "operation": operation,
                 "fulfillment_allowed": operation == "fulfill" and can_fulfill}
+
+    async def _unreserved_cancellation_source(
+        self, session, document_id, *, organization_id, expected_version, expected_content_sha256,
+    ):
+        from modules.sales.invoice_issuance import (
+            InvoiceLateReservationReceipt,
+            unreserved_issuance_anchor,
+            verified_receipt,
+        )
+
+        facts = await self.invoice_financial_source(
+            session, document_id, organization_id=organization_id,
+            expected_version=expected_version, expected_content_sha256=expected_content_sha256,
+        )
+        doc = await session.get(DealDocument, document_id)
+        receipt = await verified_receipt(session, doc, organization_id)
+        unreserved_issuance_anchor(doc, organization_id, receipt)
+        if await session.get(InvoiceLateReservationReceipt, document_id, populate_existing=True) is not None:
+            raise ValueError("Cancellation requires a genuine unreserved ERP on-order original")
+        if doc.superseded_by_id is not None:
+            from modules.sales.invoice_cancellation import orm_cancellation_receipt
+
+            if doc.status != "cancelled" or not await session.run_sync(
+                    lambda sync: orm_cancellation_receipt(sync.connection(), doc)):
+                raise ValueError("Superseded invoice cancellation requires reconciliation")
+        # [] is the consequence of the verified initial on-order mode, not a
+        # fabricated persisted reservation. WMS must still inspect its history.
+        return {**facts, "reserve_mode": "on_order", "reserve_status": "unreserved",
+                "reservation_digest": None, "allocations": [], "operation": "cancellation",
+                "fulfillment_allowed": False}
 
     async def invoice_organization(self, session, document_id):
         if type(document_id) is not int or document_id <= 0:
