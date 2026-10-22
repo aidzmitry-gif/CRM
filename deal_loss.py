@@ -434,10 +434,14 @@ async def loss_context(deal_id: int, session=Depends(get_session), core=Depends(
         latest = await session.scalar(select(DealLossRequest).where(
             DealLossRequest.deal_id == deal_id, DealLossRequest.organization_id == org)
             .order_by(DealLossRequest.created_at.desc(), DealLossRequest.id.desc()).limit(1)) if org else None
+        reasons = (await session.scalars(select(LossReason).where(LossReason.active)
+                   .order_by(LossReason.sort_order, LossReason.code))).all() if org is not None else []
         result = {"deal_id": deal_id, "principal": actor, "organization_id": org,
                   "organization": organization, "mapping_required": org is None,
                   "funnel": deal.funnel, "stage": deal.stage,
                   "lost_stage": next((code for code, kind in kinds.items() if kind == "lost"), None),
+                  "lost_stages": [code for code, kind in kinds.items() if kind == "lost"],
+                  "loss_reasons": [{"code": row.code, "title": row.title} for row in reasons],
                   "pending_request_id": active.id if active else None,
                   "latest_request_id": latest.id if latest else None,
                   "latest_request_state": latest.state if latest else None}
