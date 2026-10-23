@@ -204,6 +204,40 @@ class DealItemUpdate(BaseModel):
         return self
 
 
+class PickerReferencePriceOut(BaseModel):
+    sku_id: int
+    sku_code: str
+    unit: str
+    price: str  # Preserve source precision; never serialize through float.
+    currency: str
+    kind: str
+    price_includes_vat: bool
+    effective_at: str
+    characteristic_guid: str
+    package_guid: str
+    application_status: Literal["reference_only"]
+
+
+class PickerPriceSnapshotOut(BaseModel):
+    id: str
+    kind: str
+    source_as_of: str
+    observed_at: str
+    row_count: int
+    response_complete: Literal[True]
+    full_coverage: Literal[False]
+    activity_verified: Literal[False]
+    mapped: int
+    held: int
+    unmapped: int
+
+
+class PickerPricesOut(BaseModel):
+    status: Literal["reference", "unavailable"]
+    snapshot: PickerPriceSnapshotOut | None
+    rows: list[PickerReferencePriceOut]
+
+
 class PickerStockOut(BaseModel):
     """Operational catalogue snapshot; the route masks cost for managed CRM users."""
 

@@ -173,6 +173,7 @@ _OWN_ROUTE_NAMES = frozenset(
         "create_deal",
         "list_skus",
         "picker_stock",  # Shared catalogue facts, no deal/contact/history data.
+        "picker_prices",  # Selected reference selling prices, no cost/history.
         "price_info",
         "deal_margin",
         "deal_margin_reconcile",

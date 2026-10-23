@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import ValidationError
 from sqlalchemy import case, delete, func, literal, or_, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.domain.models import (
@@ -157,6 +157,7 @@ from modules.sales.schemas import (
     ObjectionReplyOut,
     PackagePrepare,
     PackageSentOut,
+    PickerPricesOut,
     PickerStockOut,
     PipelineAnalyticsOut,
     PlanDecisionIn,
@@ -2887,6 +2888,21 @@ async def request_approval(
     )
     await session.commit()
     return approval
+
+
+@router.get("/picker-prices", response_model=PickerPricesOut)
+async def picker_prices(
+    session: AsyncSession = Depends(get_session),
+    core: Core = Depends(get_core),
+    _: CurrentUser = Depends(require_permission("sales.deal.read")),
+):
+    """Shared selected selling-price references, without cost or customer history."""
+    if core.services.stock is None:
+        return {"status": "unavailable", "snapshot": None, "rows": []}
+    try:
+        return PickerPricesOut.model_validate(await core.services.stock.reference_prices(session))
+    except (ValueError, SQLAlchemyError):
+        raise HTTPException(status_code=503, detail="Прайс временно недоступен") from None
 
 
 @router.get("/picker-stock", response_model=list[PickerStockOut])
