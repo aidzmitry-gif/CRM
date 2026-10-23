@@ -428,7 +428,7 @@ async def issue(session, core, user, access, deal_id, data, doc_id=None):
                 or (doc_id is not None and prior.document_id != doc_id)
             ):
                 raise HTTPException(409, "Issuance key already has a different request/scope")
-            existing = await session.get(DealDocument, prior.document_id)
+            existing = await session.get(DealDocument, prior.document_id, populate_existing=True)
             try:
                 await verified_receipt(session, existing, data.organization_id)
             except (ValueError, KeyError, TypeError) as exc:
