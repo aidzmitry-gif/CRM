@@ -298,6 +298,11 @@ def render_erp_invoice(number, prepared):
         return group(' / '.join(path), [value]) if present(value) else ''
 
     seller, buyer = prepared['seller'], prepared['buyer']
+    logo = seller.get('logo_data_url') or ''
+    if logo and (not isinstance(logo, str) or not logo.startswith(('data:image/png;base64,', 'data:image/jpeg;base64,'))):
+        raise ValueError('Invoice logo must be a confirmed local PNG/JPEG')
+    logo_html = (f'<div class="logo"><img src="{esc(logo)}" alt="{esc(seller["name"])}" '
+                 'style="max-width:300px;max-height:100px;object-fit:contain"></div>') if logo else ''
     party_fields = ''.join((
         group('Продавец', [seller['name'], f"УНП {seller['unp']}", seller['address']]),
         group('Банк / счёт', [seller['bank'], seller['bik'], seller['account']]),
@@ -319,7 +324,7 @@ h1{{font-size:16pt}}table{{width:100%;table-layout:fixed;border-collapse:collaps
 th,td{{border:1px solid #9ca3af;padding:5px;text-align:left;overflow-wrap:anywhere}}
 thead{{display:table-header-group}}tr{{break-inside:avoid}}dl{{line-height:1.4}}
 dd{{margin:0 0 6px 16px;overflow-wrap:anywhere}}dt{{font-weight:bold}}
-</style></head><body><h1>Счёт {esc(number)} от {esc(prepared['document_date'])}</h1><dl>{party_fields}</dl>
+</style></head><body>{logo_html}<h1>Счёт {esc(number)} от {esc(prepared['document_date'])}</h1><dl>{party_fields}</dl>
 <table><colgroup>{''.join(f'<col style="width:{width}%">' for width in (3, 11, 25, 7, 4, 10, 6, 11, 11, 12))}</colgroup>
 <thead><tr><th>№</th><th>Код</th><th>Товар</th><th>Количество</th><th>Ед.</th><th>Цена нетто</th>
 <th>НДС %</th><th>Нетто</th><th>НДС</th><th>Всего</th></tr></thead><tbody>{rows}</tbody></table>
