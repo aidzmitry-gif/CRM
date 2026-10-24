@@ -4308,7 +4308,9 @@ async def document_snapshot(
 
 async def _package_docs(session, deal_id, selection=None):
     docs = (await session.execute(select(DealDocument).where(
-        DealDocument.deal_id == deal_id, DealDocument.status.in_(("posted", "paid")),
+        DealDocument.deal_id == deal_id,
+        or_(DealDocument.status.in_(("posted", "paid")),
+            (DealDocument.kind == "invoice") & (DealDocument.status == "issued")),
         DealDocument.superseded_by_id.is_(None),
     ).order_by(DealDocument.id.desc()))).scalars().all()
     invoice = next((d for d in docs if d.kind == "invoice" and
@@ -4317,6 +4319,15 @@ async def _package_docs(session, deal_id, selection=None):
                      (not selection or selection.contract_id is None or d.id == selection.contract_id)), None)
     if invoice is None or contract is None:
         raise HTTPException(409, "Нужны действующие выпущенные версии счёта и договора")
+    if await erp_issuance.is_erp_invoice(session, invoice):
+        ownership = await session.get(DealOwnership, deal_id)
+        try:
+            if ownership is None or await erp_issuance.verified_receipt(
+                session, invoice, ownership.organization_id,
+            ) is None:
+                raise ValueError("ERP invoice has no confirmed organization or issuance receipt")
+        except (ValueError, KeyError, TypeError, InvalidOperation):
+            raise HTTPException(409, "Подтверждение выпуска счёта требует сверки") from None
     originals.original(invoice, issued_only=True)
     originals.original(contract, issued_only=True)
     return invoice, contract
