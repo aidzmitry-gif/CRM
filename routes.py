@@ -4691,6 +4691,7 @@ async def calls_stream(
     owner: str | None = None,
     user: CurrentUser = Depends(require_permission("sales.deal.read")),
     access: DealAccess = Depends(get_deal_access),
+    session: AsyncSession = Depends(get_session),
 ):
     """SSE-поток карточек звонков продавца (всплывающее окно входящего звонка).
 
@@ -4709,6 +4710,9 @@ async def calls_stream(
         raise HTTPException(status_code=403, detail="Для потока звонков нужна связанная учётная запись сотрудника")
 
     employee_id = access.employee_id
+    # The router guard shares this request-scoped session.  The streaming
+    # generator needs only the resolved employee ID; release its connection.
+    await session.close()
     queue = calls_mod.subscribe(employee_id)
 
     async def _gen():
@@ -4763,6 +4767,17 @@ async def list_calls(
         stmt = stmt.where(CallLog.started_at >= start, CallLog.started_at < start + timedelta(days=1))
     calls = (await session.execute(stmt)).scalars().all()
     counterparty_ids = {call.counterparty_id for call in calls if call.counterparty_id is not None}
+    contact_ids = {call.contact_id for call in calls if call.contact_id is not None}
+    valid_contact_links = set()
+    if contact_ids and counterparty_ids:
+        from core.domain.models import Contact
+
+        valid_contact_links = {
+            (contact_id, linked_counterparty_id)
+            for contact_id, linked_counterparty_id in (await session.execute(select(Contact.id, Contact.counterparty_id).where(
+            Contact.id.in_(contact_ids), Contact.counterparty_id.in_(counterparty_ids),
+            ))).all()
+        }
     client_ids_by_counterparty: dict[int, set[int]] = defaultdict(set)
     if counterparty_ids:
         visible_clients = await session.execute(crm_clients.scope_clients(
@@ -4777,6 +4792,9 @@ async def list_calls(
             "crm_client_id": next(iter(client_ids_by_counterparty[call.counterparty_id]))
             if call.counterparty_id is not None
             and len(client_ids_by_counterparty[call.counterparty_id]) == 1 else None,
+            "contact_id": call.contact_id
+            if call.counterparty_id is not None and (call.contact_id, call.counterparty_id) in valid_contact_links
+            else None,
         })
         for call in calls
     ]
