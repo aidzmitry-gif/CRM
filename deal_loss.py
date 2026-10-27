@@ -101,9 +101,9 @@ async def assert_not_pending(session, deal_id):
 
 
 async def kind_map(session, funnel):
-    rows = (await session.execute(select(Stage.code, Stage.kind).where(
-        Stage.funnel == funnel, Stage.is_active))).all()
-    return dict(rows) if rows else {s["code"]: s["kind"] for s in canonical_stages() if s["funnel"] == funnel}
+    rows = (await session.execute(select(Stage.code, Stage.kind, Stage.is_active).where(
+        Stage.funnel == funnel))).all()
+    return {row.code: row.kind for row in rows if row.is_active} if rows else {s["code"]: s["kind"] for s in canonical_stages() if s["funnel"] == funnel}
 
 
 async def current_writer(session, core, user):
@@ -363,7 +363,8 @@ async def request_loss(session, core, user, access, deal_id, data, expected_prin
     if lost is None or kinds.get(deal.stage) == "lost":
         raise HTTPException(409, "An open deal and configured lost stage are required")
     codes = set((await session.scalars(select(LossReason.code).where(LossReason.active))).all())
-    if codes and data.reason_code not in codes:
+    catalog_exists = bool(codes) or await session.scalar(select(LossReason.code).limit(1)) is not None
+    if catalog_exists and data.reason_code not in codes:
         raise HTTPException(422, "Unknown loss reason")
     snapshot = {"funnel": deal.funnel, "stage": deal.stage, "lost_stage": lost, "invoices": composition(docs)}
     if snapshot_hash(snapshot) != data.expected_composition_digest:
@@ -521,9 +522,9 @@ event.listen(DealDocument, "before_update", composition_guard)
 
 
 def connection_kinds(connection, funnel):
-    rows = connection.execute(select(Stage.code, Stage.kind).where(
-        Stage.funnel == funnel, Stage.is_active)).all()
-    return dict(rows) if rows else {s["code"]: s["kind"] for s in canonical_stages() if s["funnel"] == funnel}
+    rows = connection.execute(select(Stage.code, Stage.kind, Stage.is_active).where(
+        Stage.funnel == funnel)).all()
+    return {row.code: row.kind for row in rows if row.is_active} if rows else {s["code"]: s["kind"] for s in canonical_stages() if s["funnel"] == funnel}
 
 
 @event.listens_for(Deal, "before_update")
