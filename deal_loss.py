@@ -155,6 +155,8 @@ def composition(docs):
 
 
 async def context(session, core, user, access, deal_id, org):
+    # Hide foreign deals before book membership can disclose their existence.
+    await visible_deal_or_404(session, deal_id, access)
     actor = await core.services.accounting.source_member(session, org, user)
     await visible_deal_or_404(session, deal_id, access)
     await lock_deal(session, deal_id)
