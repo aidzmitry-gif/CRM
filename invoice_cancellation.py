@@ -403,6 +403,11 @@ async def cancel(org_id: int, document_id: int, data: CancellationInput, ctx=Dep
         if len(rows) != 1 or rows[0].organization_id != org_id or rows[0].document_id != document_id or rows[0].request != request:
             raise HTTPException(409, "Cancellation key or invoice already used")
         return cancellation_output(rows[0])
+    from modules.sales.mail_invoice_guard import require_no_inflight_invoice_mail
+    invoice = await session.get(DealDocument, document_id)
+    if invoice is None:
+        raise HTTPException(404, "Invoice not found")
+    await require_no_inflight_invoice_mail(session, invoice.deal_id, document_id)
     basis, current = await collect_cancellation_basis(session, core.services, org_id, document_id, data, user)
     verifier = await prepare_fulfillment_verifier(session, core.services, org_id, basis, current,
         str(data.fulfillment_review_id), data.expected_review_digest)

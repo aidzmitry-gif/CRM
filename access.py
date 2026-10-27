@@ -167,6 +167,8 @@ _OWN_ROUTE_NAMES = frozenset(
         "pipeline_stage_metrics",
         "list_deals",
         "list_funnels",
+        "list_stages",
+        "loss_reasons",
         "get_deal",
         "update_deal",
         "create_deal",
