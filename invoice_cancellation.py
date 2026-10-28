@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (
     JSON,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Integer,
@@ -23,7 +24,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from core.db.base import Base
 from core.runtime.deps import get_core
 from core.services.auth import get_current_user
-from core.services.logistics import snapshot_hash
+from core.services.logistics import snapshot_hash, snapshot_value
 from core.services.wms import EvidenceReference, VerifiedNoShipment, no_shipment_review_digest
 from modules.sales.access import get_deal_access_for_user, scope_deals
 from modules.sales.accounting_ownership import DealOwnership, context, immutable
@@ -108,7 +109,7 @@ async def collect_cancellation_basis(session, services, org_id, document_id, ide
         raise HTTPException(404, "Invoice not found")
     if doc.status == "cancelled" or doc.superseded_by_id is not None:
         raise HTTPException(409, "Invoice is already terminal")
-    facts = await source.invoice_shipping_source(session, **exact, operation="historical_claim")
+    facts = await source.invoice_shipping_source(session, **exact, operation="cancellation")
     money = await evaluate_invoice_money_basis(session, org_id, user, doc, accounting)
     start, through = coverage(doc, money)
     stock = await wms.invoice_fulfillment_snapshot(session, org_id, facts)
@@ -271,7 +272,7 @@ class PreparedFulfillmentVerification:
                 or session.get_transaction() is not self.transaction or not self.transaction.is_active
                 or organization_id != self.proof.organization_id or review_id != self.proof.review_id
                 or expected_review_digest != self.proof.review_digest
-                or json.loads(self.source_json) != source):
+                or json.loads(self.source_json) != snapshot_value(source)):
             raise HTTPException(409, "Fulfillment verification requires its original transaction and source")
         object.__setattr__(self, "_consumed", True)
         row = await session.scalar(select(SalesFulfillmentReview).where(
@@ -311,6 +312,16 @@ async def prepare_fulfillment_verifier(session, services, org_id, basis, current
     validate_accounting_classification(basis)
     service(services, "logistics", "assert_unexecuted_invoice").assert_unexecuted_invoice(
         basis["sections"]["logistics_shipment"]["facts"])
+    proof = fulfillment_proof(org_id, current["source"], row)
+    if date.today() != review_date:
+        raise HTTPException(409, "Fulfillment history requires review for the new day")
+    return PreparedFulfillmentVerification(session, transaction,
+        json.dumps(snapshot_value(current["source"]), ensure_ascii=False, sort_keys=True, allow_nan=False),
+        row.digest, review_date, proof)
+
+
+def fulfillment_proof(org_id, source, row):
+    """Same persisted manifest for stock release and cancellation without stock."""
     refs = []
     for name, section in sorted(row.snapshot["sections"].items()):
         # External coverage is an explicit saved attestation, not empty local facts.
@@ -319,14 +330,17 @@ async def prepare_fulfillment_verifier(session, services, org_id, basis, current
             "all_sources_identified": row.request["all_fulfillment_sources_identified"],
             "evidence": row.request["evidence"]})
         refs.append(EvidenceReference(name, row.id + ":" + name, row.digest, digest))
-    source = current["source"]
     proof = VerifiedNoShipment(org_id, source["document_id"], source["version"], source["content_sha256"],
-        basis["reservation_digest"], row.id, "", row.actor, tuple(refs))
-    proof = replace(proof, review_digest=no_shipment_review_digest(proof))
-    if date.today() != review_date:
-        raise HTTPException(409, "Fulfillment history requires review for the new day")
-    return PreparedFulfillmentVerification(session, transaction,
-        json.dumps(source, ensure_ascii=False, sort_keys=True, allow_nan=False), row.digest, review_date, proof)
+        row.snapshot["reservation_digest"], row.id, "", row.actor, tuple(refs))
+    return replace(proof, review_digest=no_shipment_review_digest(proof))
+
+
+def fulfillment_manifest(proof):
+    refs = [{"scope": r.scope, "record_id": r.record_id, "revision": r.revision, "sha256": r.sha256}
+            for r in proof.references]
+    return {"review_id": proof.review_id, "digest": proof.review_digest, "reviewed_by": proof.reviewed_by,
+            "references": sorted(refs, key=lambda value: json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False))}
 
 
 class CancellationInput(CancellationIdentity):
@@ -337,9 +351,21 @@ class CancellationInput(CancellationIdentity):
     acknowledge_invoice_invalidation: bool = Field(strict=True)
 
 
+STOCK_OUTCOME_CHECK = """((release_id > 0
+ AND jsonb_typeof(snapshot::jsonb->'release') = 'object'
+ AND NOT (snapshot::jsonb ? 'stock_outcome') AND NOT (snapshot::jsonb ? 'no_stock_release'))
+ OR (release_id IS NULL AND snapshot->>'stock_outcome' = 'no_stock_release'
+ AND jsonb_typeof(snapshot::jsonb->'no_stock_release') = 'object'
+ AND NOT (snapshot::jsonb ? 'release'))) IS TRUE"""
+
+
 class InvoiceCancellationReceipt(Base):
     __tablename__ = "invoice_cancellation_receipt"
-    __table_args__ = (UniqueConstraint("organization_id", "request_key"), {"schema": "sales"})
+    __table_args__ = (
+        UniqueConstraint("organization_id", "request_key"),
+        CheckConstraint(STOCK_OUTCOME_CHECK, name="invoice_cancellation_stock_outcome").ddl_if(dialect="postgresql"),
+        {"schema": "sales"},
+    )
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     organization_id: Mapped[int] = mapped_column(Integer, index=True)
     document_id: Mapped[int] = mapped_column(ForeignKey("sales.deal_document.id"), unique=True)
@@ -349,7 +375,7 @@ class InvoiceCancellationReceipt(Base):
     request_hash: Mapped[str] = mapped_column(String(64))
     request: Mapped[dict] = mapped_column(JSON)
     fulfillment_review_id: Mapped[str] = mapped_column(ForeignKey("sales.invoice_fulfillment_review.id"))
-    release_id: Mapped[int] = mapped_column(ForeignKey("wms.invoice_reservation_release.id"), unique=True)
+    release_id: Mapped[int | None] = mapped_column(ForeignKey("wms.invoice_reservation_release.id"), unique=True)
     snapshot: Mapped[dict] = mapped_column(JSON)
     digest: Mapped[str] = mapped_column(String(64))
     actor: Mapped[str] = mapped_column(String(200))
@@ -369,14 +395,34 @@ def cancellation_digest(row):
         "snapshot": row.snapshot, "actor": row.actor})
 
 
+def cancellation_stock_outcome(row):
+    snapshot = row.snapshot
+    if isinstance(snapshot, dict):
+        if (type(row.release_id) is int and row.release_id > 0
+                and isinstance(snapshot.get("release"), dict)
+                and "stock_outcome" not in snapshot and "no_stock_release" not in snapshot):
+            return "released"
+        if (row.release_id is None and snapshot.get("stock_outcome") == "no_stock_release"
+                and isinstance(snapshot.get("no_stock_release"), dict) and "release" not in snapshot):
+            detail = snapshot["no_stock_release"]
+            if (set(detail) == {"schema_version", "exact_invoice", "issuance_receipt", "observation", "fulfillment"}
+                    and type(detail["schema_version"]) is int and detail["schema_version"] == 1
+                    and all(isinstance(detail[k], dict) for k in (
+                        "exact_invoice", "issuance_receipt", "observation", "fulfillment"))):
+                return "no_stock_release"
+    raise HTTPException(409, "Stored cancellation stock outcome requires reconciliation")
+
+
 def cancellation_output(row):
     if row.digest != cancellation_digest(row) or row.request_hash != snapshot_hash(row.request):
         raise HTTPException(409, "Stored cancellation receipt is corrupt")
-    return {"cancellation_id": row.id, "digest": row.digest,
+    outcome = cancellation_stock_outcome(row)
+    extra = {"stock_outcome": outcome} if outcome == "no_stock_release" else {}
+    return {"cancellation_id": row.id, "digest": row.digest, **extra,
         "request_key": row.request_key, "request_hash": row.request_hash,
         "document_version": row.document_version, "content_sha256": row.content_sha256,
         "organization_id": row.organization_id, "document_id": row.document_id,
-        "status": "cancelled", "reserve_status": "released", "release_id": row.release_id,
+        "status": "cancelled", "reserve_status": "unreserved" if extra else "released", "release_id": row.release_id,
         "fulfillment_review_id": row.fulfillment_review_id, "actor": row.actor,
         "created_at": row.created_at, "customer_notification": "not_sent"}
 
@@ -417,24 +463,36 @@ async def cancel(org_id: int, document_id: int, data: CancellationInput, ctx=Dep
         prepared=current["prepared"], current_snapshot=shipping, expected_digest=shipping["sha256"],
         cancel_receipt_identity={"exact_invoice": basis["exact_invoice"],
             "cancellation_receipt_id": cancellation_id, "cancellation_request_sha256": snapshot_hash(request)})
-    release = await core.services.wms_reservations.release_invoice(session, org_id, current["source"], {
-        "source_key": cancellation_id, "expected_reservation_digest": basis["reservation_digest"],
-        "expected_remaining_digest": basis["remaining_digest"],
-        "fulfillment_review_id": verifier.proof.review_id,
-        "fulfillment_review_digest": verifier.proof.review_digest, "evidence": data.evidence,
-    }, actor, verifier)
+    if current["source"].get("reserve_status") == "unreserved":
+        proof = await verifier.verify_no_shipment(session, org_id, current["source"],
+            verifier.proof.review_id, verifier.proof.review_digest)
+        stock = {"stock_outcome": "no_stock_release", "no_stock_release": {
+            "schema_version": 1, "exact_invoice": basis["exact_invoice"],
+            "issuance_receipt": current["source"]["issuance_receipt"],
+            "observation": {name: basis["sections"][name] for name in ("wms_issue", "wms_pick")},
+            "fulfillment": fulfillment_manifest(proof)}}
+        release_id, reserve_status = None, "unreserved"
+    else:
+        release = await core.services.wms_reservations.release_invoice(session, org_id, current["source"], {
+            "source_key": cancellation_id, "expected_reservation_digest": basis["reservation_digest"],
+            "expected_remaining_digest": basis["remaining_digest"],
+            "fulfillment_review_id": verifier.proof.review_id,
+            "fulfillment_review_digest": verifier.proof.review_digest, "evidence": data.evidence,
+        }, actor, verifier)
+        stock = {"release": release}
+        release_id, reserve_status = release["release_id"], "released"
     doc = current["doc"]
     row = InvoiceCancellationReceipt(id=cancellation_id, organization_id=org_id, document_id=document_id,
         document_version=doc.version, content_sha256=doc.content_sha256, request_key=str(data.request_key),
         request_hash=snapshot_hash(request), request=request,
-        fulfillment_review_id=str(data.fulfillment_review_id), release_id=release["release_id"],
+        fulfillment_review_id=str(data.fulfillment_review_id), release_id=release_id,
         snapshot={"before_status": doc.status, "before_reserve_status": doc.reserve_status,
             "basis_digest": basis["basis_digest"], "review_digest": data.expected_review_digest,
-            "money": basis["money"], "withdrawal": withdrawal, "release": release}, actor=actor)
+            "money": basis["money"], "withdrawal": withdrawal, **stock}, actor=actor)
     row.digest = cancellation_digest(row)
     session.add(row)
     await session.flush()  # receipt exists before narrow database status exception
-    doc.status, doc.reserve_status = "cancelled", "released"
+    doc.status, doc.reserve_status = "cancelled", reserve_status
     core.event_bus.emit(session, "sales.invoice.cancelled", {"organization_id": org_id,
         "document_id": document_id, "document_version": doc.version, "content_sha256": doc.content_sha256,
         "cancellation_id": row.id, "cancellation_digest": row.digest, "release_id": row.release_id,
@@ -455,10 +513,14 @@ def orm_cancellation_receipt(connection, doc):
         InvoiceCancellationReceipt.document_version == doc.version,
         InvoiceCancellationReceipt.content_sha256 == doc.content_sha256,
     )).mappings().one_or_none()
-    if saved is None or doc.reserve_status != "released":
+    if saved is None:
         return False
     row = SimpleNamespace(**saved)
-    cancellation_output(row)
+    output = cancellation_output(row)
+    if doc.reserve_status != output["reserve_status"]:
+        return False
+    if output.get("stock_outcome") == "no_stock_release":
+        return orm_no_stock_cancellation(connection, doc, row)
     release = connection.execute(select(InvoiceReservationRelease.__table__).where(
         InvoiceReservationRelease.id == row.release_id,
         InvoiceReservationRelease.organization_id == row.organization_id,
@@ -466,3 +528,60 @@ def orm_cancellation_receipt(connection, doc):
         InvoiceReservationRelease.source_key == row.id,
     )).mappings().one_or_none()
     return release is not None and release["digest"] == row.snapshot["release"]["digest"]
+
+
+def orm_no_stock_cancellation(connection, doc, row):
+    from types import SimpleNamespace
+
+    from modules.sales.invoice_issuance import (
+        InvoiceIssuanceReceipt,
+        InvoiceLateReservationReceipt,
+        unreserved_issuance_anchor,
+    )
+    from modules.wms.invoice_fulfillment import unreserved_snapshot
+
+    issuance = connection.execute(select(InvoiceIssuanceReceipt.__table__).where(
+        InvoiceIssuanceReceipt.document_id == doc.id)).mappings().one_or_none()
+    if issuance is None or connection.execute(select(InvoiceLateReservationReceipt.document_id).where(
+            InvoiceLateReservationReceipt.document_id == doc.id)).scalar() is not None:
+        return False
+    anchor = unreserved_issuance_anchor(doc, row.organization_id, SimpleNamespace(**issuance))
+    saved = connection.execute(select(SalesFulfillmentReview.__table__).where(
+        SalesFulfillmentReview.id == row.fulfillment_review_id,
+        SalesFulfillmentReview.organization_id == row.organization_id,
+        SalesFulfillmentReview.document_id == doc.id)).mappings().one_or_none()
+    if saved is None:
+        return False
+    review = SimpleNamespace(**saved)
+    review_output(review)
+    basis = review.snapshot
+    exact = {"organization_id": row.organization_id, "document_id": doc.id,
+             "expected_version": doc.version, "expected_content_sha256": doc.content_sha256}
+    if (basis["basis_digest"] != snapshot_hash({k: v for k, v in basis.items() if k != "basis_digest"})
+            or basis["exact_invoice"] != exact or basis["observed_blockers"]
+            or basis["reservation_digest"] is not None
+            or row.snapshot["review_digest"] != review.digest
+            or row.snapshot["basis_digest"] != basis["basis_digest"]
+            or row.snapshot["money"] != basis["money"]):
+        return False
+    validate_review_coverage(basis, FulfillmentReviewInput.model_validate(review.request))
+    validate_accounting_classification(basis)
+    source = {"organization_id": row.organization_id, "document_id": doc.id,
+              "version": doc.version, "content_sha256": doc.content_sha256, "issuance_receipt": anchor,
+              "reserve_mode": "on_order", "reserve_status": "unreserved", "reservation_digest": None,
+              "allocations": [], "operation": "cancellation", "fulfillment_allowed": False}
+    observed = unreserved_snapshot(connection, row.organization_id, source)
+    snapshot = observed["snapshot"]
+    sections = {
+        "wms_issue": {"identity": observed["identity"], "observed_state": observed["observed_state"],
+                      **{k: snapshot[k] for k in ("acts", "movements", "physical_basis")}},
+        "wms_pick": {"identity": observed["identity"], **{k: snapshot[k] for k in (
+            "reservation", "versions", "event_state", "picks", "remaining")}},
+    }
+    observation = {k: {"facts": v, "sha256": snapshot_hash(v)} for k, v in sections.items()}
+    expected = {"schema_version": 1, "exact_invoice": exact, "issuance_receipt": anchor,
+                "observation": observation, "fulfillment": fulfillment_manifest(
+                    fulfillment_proof(row.organization_id, source, review))}
+    return (row.snapshot["no_stock_release"] == expected
+            and all(basis["sections"][k] == v for k, v in observation.items())
+            and basis["remaining_digest"] == snapshot_hash(snapshot["remaining"]))

@@ -1,4 +1,5 @@
 """Original invoice evidence for warehouse event processing."""
+from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import select
@@ -19,7 +20,7 @@ class SalesReservationSource:
         self, session, document_id, *, organization_id,
         expected_version, expected_content_sha256, operation="fulfill",
     ):
-        if not isinstance(operation, str) or operation not in {"fulfill", "historical_claim"}:
+        if not isinstance(operation, str) or operation not in {"fulfill", "historical_claim", "cancellation"}:
             raise ValueError("Unknown invoice shipping operation")
         if (type(organization_id) is not int or organization_id <= 0
                 or type(expected_version) is not int or expected_version <= 0
@@ -31,6 +32,17 @@ class SalesReservationSource:
         # source locks when the caller holds the wrong organization lock.
         if await self.invoice_organization(session, document_id) != organization_id:
             raise ValueError("Invoice source identity does not match")
+        if operation == "cancellation":
+            doc = await session.get(DealDocument, document_id, populate_existing=True)
+            if doc is not None and doc.reserve_status == "unreserved":
+                # A failure here is unresolved evidence, never a stock fallback.
+                return await self._unreserved_cancellation_source(
+                    session, document_id, organization_id=organization_id,
+                    expected_version=expected_version, expected_content_sha256=expected_content_sha256,
+                )
+            # Preserve both legacy stock and genuinely later-reserved on-order
+            # history, including the exact old source shape and validations.
+            operation = "historical_claim"
         facts = await self.invoice_reservation(session, document_id)
         if (facts["organization_id"] != organization_id
                 or facts["version"] != expected_version
@@ -49,6 +61,36 @@ class SalesReservationSource:
             raise ValueError("Invoice is terminal or its reservation is released")
         return {**facts, "document_status": doc.status, "operation": operation,
                 "fulfillment_allowed": operation == "fulfill" and can_fulfill}
+
+    async def _unreserved_cancellation_source(
+        self, session, document_id, *, organization_id, expected_version, expected_content_sha256,
+    ):
+        from modules.sales.invoice_issuance import (
+            InvoiceLateReservationReceipt,
+            unreserved_issuance_anchor,
+            verified_receipt,
+        )
+
+        facts = await self.invoice_financial_source(
+            session, document_id, organization_id=organization_id,
+            expected_version=expected_version, expected_content_sha256=expected_content_sha256,
+        )
+        doc = await session.get(DealDocument, document_id)
+        receipt = await verified_receipt(session, doc, organization_id)
+        unreserved_issuance_anchor(doc, organization_id, receipt)
+        if await session.get(InvoiceLateReservationReceipt, document_id, populate_existing=True) is not None:
+            raise ValueError("Cancellation requires a genuine unreserved ERP on-order original")
+        if doc.superseded_by_id is not None:
+            from modules.sales.invoice_cancellation import orm_cancellation_receipt
+
+            if doc.status != "cancelled" or not await session.run_sync(
+                    lambda sync: orm_cancellation_receipt(sync.connection(), doc)):
+                raise ValueError("Superseded invoice cancellation requires reconciliation")
+        # [] is the consequence of the verified initial on-order mode, not a
+        # fabricated persisted reservation. WMS must still inspect its history.
+        return {**facts, "reserve_mode": "on_order", "reserve_status": "unreserved",
+                "reservation_digest": None, "allocations": [], "operation": "cancellation",
+                "fulfillment_allowed": False}
 
     async def invoice_organization(self, session, document_id):
         if type(document_id) is not int or document_id <= 0:
@@ -125,3 +167,73 @@ class SalesReservationSource:
                 "reserve_status": doc.reserve_status,
                 "lines": stock_lines,
                 "quantities": {sku: format(qty, ".2f") for sku, qty in sorted(quantities.items())}}
+
+    async def invoice_financial_source(
+        self, session, document_id, *, organization_id,
+        expected_version, expected_content_sha256,
+    ):
+        """Verify receivable evidence; no reservation, shipment or cash assertion.
+
+        Internal outbox caller holds the explicit organization lock and owns the
+        transaction. Refresh source under existing deal/document lock order.
+        A delayed issuance event receives current terminal state, never demand
+        resurrected from its old payload. Unknown legacy ownership stays held.
+        """
+        if (type(document_id) is not int or document_id <= 0
+                or type(organization_id) is not int or organization_id <= 0
+                or type(expected_version) is not int or expected_version <= 0
+                or not isinstance(expected_content_sha256, str)
+                or len(expected_content_sha256) != 64
+                or any(c not in "0123456789abcdef" for c in expected_content_sha256)):
+            raise ValueError("Exact financial invoice identity is required")
+        if await self.invoice_organization(session, document_id) != organization_id:
+            raise ValueError("Financial invoice organization does not match")
+        deal_id = await session.scalar(select(DealDocument.deal_id).where(DealDocument.id == document_id))
+        if deal_id is None:
+            raise ValueError("Financial invoice does not exist")
+        await lock_deal(session, deal_id)
+        doc = await session.scalar(select(DealDocument).where(DealDocument.id == document_id)
+                                   .with_for_update().execution_options(populate_existing=True))
+        owner = await session.get(DealOwnership, deal_id, populate_existing=True)
+        if (doc is None or doc.deal_id != deal_id or owner is None
+                or owner.organization_id != organization_id or doc.kind != "invoice"
+                or doc.version != expected_version or doc.content_sha256 != expected_content_sha256
+                or doc.status not in {"issued", "posted", "paid", "cancelled", "rejected"}):
+            raise ValueError("Financial invoice source identity does not match")
+        from modules.sales.invoice_issuance import receipt_anchor, verified_receipt
+
+        receipt = await verified_receipt(session, doc, organization_id)
+        if receipt is None:
+            raise ValueError("Financial invoice requires its confirmed issuance receipt")
+        snapshot = doc.snapshot_json
+        raw_amount = snapshot.get("amount")
+        if not isinstance(raw_amount, str):
+            raise ValueError("Financial invoice amount must be exact")
+        try:
+            amount = Decimal(raw_amount)
+        except InvalidOperation:
+            raise ValueError("Financial invoice amount is invalid") from None
+        if (not amount.is_finite() or amount < 0 or amount >= Decimal("1000000000000")
+                or amount != amount.quantize(Decimal("0.01")) or amount != doc.amount):
+            raise ValueError("Financial invoice amount does not match")
+        currency = snapshot.get("currency")
+        if (not isinstance(currency, str) or len(currency) != 3
+                or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" for c in currency)):
+            raise ValueError("Financial invoice currency is not confirmed")
+        raw_date = snapshot.get("document_date")
+        if not isinstance(raw_date, str):
+            raise ValueError("Financial invoice operation date is required")
+        try:
+            operation_date = date.fromisoformat(raw_date)
+        except ValueError:
+            raise ValueError("Financial invoice operation date is invalid") from None
+        if operation_date.isoformat() != raw_date:
+            raise ValueError("Financial invoice operation date must be canonical ISO")
+        return {"document_id": doc.id, "deal_id": deal_id, "organization_id": organization_id,
+                "version": doc.version, "content_sha256": doc.content_sha256,
+                "issuance_receipt": receipt_anchor(receipt), "number": doc.number,
+                "amount": format(amount, ".2f"), "currency": currency,
+                "document_date": raw_date, "issued_at": doc.issued_at,
+                "document_status": doc.status, "supersedes_id": doc.supersedes_id,
+                "superseded_by_id": doc.superseded_by_id,
+                "collectible": doc.status in {"issued", "posted", "paid"} and doc.superseded_by_id is None}

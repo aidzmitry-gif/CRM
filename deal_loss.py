@@ -193,7 +193,7 @@ async def invoice_progress(session, core, user, org, doc):
                            "received": str(money.received), "refunded": str(money.refunded)}
         if not money.money_conditions_met:
             result["blockers"].append("funds_not_fully_refunded_or_history_unknown")
-        if doc.status != "cancelled" or doc.reserve_status != "released":
+        if doc.status != "cancelled":
             result["blockers"].append("chief_invoice_cancellation_required")
             return result
         receipt = await session.scalar(select(InvoiceCancellationReceipt).where(
@@ -237,16 +237,26 @@ async def invoice_progress(session, core, user, org, doc):
         # Source-owned historical replay verifies release lines/latest zero reserve
         # and canceled pick tasks. The persisted link above is mandatory BEFORE
         # this call, so there is no new release or cancellation authorization.
-        source = await core.services.sales_source.invoice_reservation(session, doc.id)
-        release = await core.services.wms_reservations.release_invoice(session, org, source, {
-            "source_key": receipt.id, "expected_reservation_digest": review.snapshot["reservation_digest"],
-            "expected_remaining_digest": review.snapshot["remaining_digest"],
-            "fulfillment_review_id": review.id,
-            "fulfillment_review_digest": receipt.snapshot["release"]["snapshot"]["fulfillment"]["digest"],
-            "evidence": receipt.request["evidence"],
-        }, receipt.actor, None)
-        if release != receipt.snapshot["release"]:
-            raise ValueError("Release receipt mismatch")
+        if saved.get("stock_outcome") == "no_stock_release":
+            source = await core.services.sales_source.invoice_shipping_source(session, doc.id,
+                organization_id=org, expected_version=doc.version,
+                expected_content_sha256=doc.content_sha256, operation="cancellation")
+            observed = await core.services.wms_reservations.invoice_fulfillment_snapshot(session, org, source)
+            if (observed["identity"] != review.snapshot["sections"]["wms_issue"]["facts"]["identity"]
+                    or observed["observed_state"] != "no_shipment"
+                    or snapshot_hash(observed["snapshot"]["remaining"]) != review.snapshot["remaining_digest"]):
+                raise ValueError("Unreserved cancellation history changed")
+        else:
+            source = await core.services.sales_source.invoice_reservation(session, doc.id)
+            release = await core.services.wms_reservations.release_invoice(session, org, source, {
+                "source_key": receipt.id, "expected_reservation_digest": review.snapshot["reservation_digest"],
+                "expected_remaining_digest": review.snapshot["remaining_digest"],
+                "fulfillment_review_id": review.id,
+                "fulfillment_review_digest": receipt.snapshot["release"]["snapshot"]["fulfillment"]["digest"],
+                "evidence": receipt.request["evidence"],
+            }, receipt.actor, None)
+            if release != receipt.snapshot["release"]:
+                raise ValueError("Release receipt mismatch")
         result["cancellation_receipt"] = {k: saved[k] for k in (
             "cancellation_id", "digest", "document_version", "content_sha256", "release_id", "fulfillment_review_id")}
         result["ready"] = not result["blockers"]

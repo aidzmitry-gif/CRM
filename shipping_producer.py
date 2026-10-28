@@ -140,7 +140,7 @@ class SalesShippingProducer:
         if len(documents) != len(current["source_document_ids"]) or any(row.deal_id != doc.deal_id for row in documents):
             conflict("Order snapshot source document set changed")
         try:
-            await self.services.sales_source.invoice_shipping_source(session, **exact, operation="historical_claim")
+            await self.services.sales_source.invoice_shipping_source(session, **exact, operation="cancellation")
         except ValueError as exc:
             conflict(str(exc))
         # The caller's org lock prevents a new association while these rows are read.

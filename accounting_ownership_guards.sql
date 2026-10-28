@@ -78,6 +78,129 @@ FOR EACH ROW EXECUTE FUNCTION sales.reject_ownership_change();
 CREATE TRIGGER sales_cancellation_receipt_no_truncate BEFORE TRUNCATE ON sales.invoice_cancellation_receipt
 FOR EACH STATEMENT EXECUTE FUNCTION sales.reject_ownership_change();
 
+-- Match the immutable original's Python JSON separators (including Unicode).
+CREATE OR REPLACE FUNCTION sales.invoice_original_json(value json) RETURNS text
+LANGUAGE plpgsql IMMUTABLE STRICT AS $$
+DECLARE result text;
+BEGIN
+ CASE json_typeof(value)
+ WHEN 'object' THEN
+  SELECT '{'||coalesce(string_agg(to_jsonb(key)::text||': '||sales.invoice_original_json(val),
+   ', ' ORDER BY key COLLATE "C"),'')||'}' INTO result FROM json_each(value) AS pairs(key,val);
+ WHEN 'array' THEN
+  SELECT '['||coalesce(string_agg(sales.invoice_original_json(val),', ' ORDER BY ordinal),'')||']'
+   INTO result FROM json_array_elements(value) WITH ORDINALITY AS items(val,ordinal);
+ WHEN 'string' THEN result := to_jsonb(value #>> '{}')::text;
+ ELSE result := value::text;
+ END CASE;
+ RETURN result;
+END $$;
+
+CREATE OR REPLACE FUNCTION sales.check_no_stock_cancellation(cancellation_key text) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+ c sales.invoice_cancellation_receipt%ROWTYPE;
+ d sales.deal_document%ROWTYPE;
+ i sales.invoice_issuance_receipt%ROWTYPE;
+ r sales.invoice_fulfillment_review%ROWTYPE;
+ n jsonb; anchor jsonb; exact jsonb; identity jsonb; issue jsonb; pick jsonb;
+ remaining jsonb; observation jsonb; refs jsonb; manifest jsonb; proof jsonb;
+BEGIN
+ SELECT * INTO c FROM sales.invoice_cancellation_receipt WHERE id=cancellation_key;
+ SELECT * INTO d FROM sales.deal_document WHERE id=c.document_id;
+ SELECT * INTO i FROM sales.invoice_issuance_receipt WHERE document_id=d.id;
+ SELECT * INTO r FROM sales.invoice_fulfillment_review WHERE id=c.fulfillment_review_id;
+ n := c.snapshot::jsonb->'no_stock_release';
+ anchor := jsonb_build_object('document_id',i.document_id,'request_key',i.request_key,
+  'request_hash',i.request_hash,'snapshot_digest',i.snapshot_digest);
+ exact := jsonb_build_object('organization_id',c.organization_id,'document_id',d.id,
+  'expected_version',d.version,'expected_content_sha256',d.content_sha256);
+ IF NOT (c.release_id IS NULL AND c.snapshot->>'stock_outcome'='no_stock_release'
+  AND NOT(c.snapshot::jsonb ? 'release') AND jsonb_typeof(n)='object'
+  AND json_typeof(c.snapshot->'no_stock_release'->'schema_version')='number'
+  AND c.snapshot->'no_stock_release'->>'schema_version'='1'
+  AND n->'schema_version'='1'::jsonb AND n->'exact_invoice'=exact AND n->'issuance_receipt'=anchor
+  AND (SELECT count(*)=5 FROM jsonb_object_keys(n))
+  AND d.kind='invoice' AND d.reserve_status='unreserved' AND d.issued_at IS NOT NULL
+  AND d.snapshot_json->>'issuance_mode'='erp_issuance_v1' AND d.snapshot_json->>'reserve_mode'='on_order'
+  AND d.snapshot_json->>'document_id'=d.id::text AND d.snapshot_json->>'version'=d.version::text
+  AND d.snapshot_json->>'organization_id'=c.organization_id::text
+  AND (d.snapshot_json->>'amount')::numeric=d.amount
+  AND i.document_id=d.id AND i.deal_id=d.deal_id AND i.organization_id=c.organization_id
+  AND i.document_version=d.version AND i.content_sha256=d.content_sha256
+  AND d.issued_by=i.actor AND i.reservation_digest IS NULL
+  AND encode(sha256(convert_to(d.original_html,'UTF8')),'hex')=i.content_sha256
+  AND encode(sha256(convert_to(sales.invoice_original_json(d.snapshot_json),'UTF8')),'hex')=i.snapshot_digest
+  AND i.response->>'status'='issued' AND i.response->>'organization_id'=c.organization_id::text
+  AND i.response->>'document_version'=d.version::text AND i.response->>'content_sha256'=d.content_sha256
+  AND i.response::jsonb->'reservation_digest'='null'::jsonb
+  AND i.response->'document'->>'id'=d.id::text AND i.response->'document'->>'version'=d.version::text
+  AND jsonb_typeof(i.response::jsonb->'organization_id')='number'
+  AND jsonb_typeof(i.response::jsonb->'document_version')='number'
+  AND jsonb_typeof(i.response::jsonb->'document'->'id')='number'
+  AND jsonb_typeof(i.response::jsonb->'document'->'version')='number'
+  AND i.response->'document'->>'content_sha256'=d.content_sha256
+  AND i.response->'document'->>'status'='issued' AND i.response->'document'->>'kind'='invoice'
+  AND i.response->'document'->>'reserve_mode'='on_order'
+  AND i.response->'document'->>'reserve_status'='unreserved'
+  AND r.document_id=d.id AND r.organization_id=c.organization_id
+  AND r.request->>'expected_version'=d.version::text
+  AND r.request->>'expected_content_sha256'=d.content_sha256
+  AND r.snapshot::jsonb->'exact_invoice'=exact AND r.snapshot::jsonb->'observed_blockers'='[]'::jsonb
+  AND r.snapshot::jsonb->'reservation_digest'='null'::jsonb
+  AND encode(sha256(convert_to(procurement.order_command_json(r.snapshot::jsonb-'basis_digest'),'UTF8')),'hex')
+      =r.snapshot->>'basis_digest'
+  AND NOT EXISTS(SELECT 1 FROM sales.invoice_late_reservation_receipt WHERE document_id=d.id)
+ ) IS TRUE THEN RAISE EXCEPTION 'No-stock cancellation requires its exact original and saved review'; END IF;
+ -- Global addressed history: a foreign/orphaned row is a blocker too.
+ IF EXISTS(SELECT 1 FROM wms.invoice_reservation WHERE document_id=d.id)
+  OR EXISTS(SELECT 1 FROM wms.reservation_version WHERE source LIKE 'invoice:'||d.id||':%')
+  OR EXISTS(SELECT 1 FROM wms.reservation_event_state WHERE document_id=d.id)
+  OR EXISTS(SELECT 1 FROM wms.reservation_pick WHERE document_id=d.id)
+  OR EXISTS(SELECT 1 FROM wms.task WHERE doc_ref='sales:document:'||d.id)
+  OR EXISTS(SELECT 1 FROM wms.physical_shipment_act WHERE document_id=d.id)
+  OR EXISTS(SELECT 1 FROM wms.invoice_reservation_release WHERE document_id=d.id)
+  OR EXISTS(SELECT 1 FROM wms.stock_movement WHERE doc_ref='sales:document:'||d.id
+    OR doc_ref LIKE 'invoice:'||d.id||':%')
+ THEN RAISE EXCEPTION 'Unreserved invoice has addressed WMS history'; END IF;
+ identity := jsonb_build_object('organization_id',c.organization_id,'document_id',d.id,
+  'document_version',d.version,'content_sha256',d.content_sha256,'reservation_digest',NULL,'issuance_receipt',anchor);
+ remaining := '{"reservation_absent":true,"checked_scopes":["reservation","versions","event_state","pick_links","picks","acts","releases","movements"]}'::jsonb;
+ issue := jsonb_build_object('identity',identity,'observed_state','no_shipment','acts','[]'::jsonb,
+  'movements','[]'::jsonb,'physical_basis',NULL);
+ pick := jsonb_build_object('identity',identity,'reservation',NULL,'versions','[]'::jsonb,
+  'event_state',NULL,'picks','[]'::jsonb,'remaining',remaining);
+ observation := jsonb_build_object(
+  'wms_issue',jsonb_build_object('facts',issue,'sha256',encode(sha256(convert_to(procurement.order_command_json(issue),'UTF8')),'hex')),
+  'wms_pick',jsonb_build_object('facts',pick,'sha256',encode(sha256(convert_to(procurement.order_command_json(pick),'UTF8')),'hex')));
+ SELECT jsonb_agg(jsonb_build_object('scope',key,'record_id',r.id||':'||key,'revision',r.digest,
+  'sha256',CASE WHEN key='legacy_fulfillment' THEN encode(sha256(convert_to(procurement.order_command_json(
+    jsonb_build_object('observed',val,'sources',r.request::jsonb->'external_sources',
+     'all_sources_identified',r.request::jsonb->'all_fulfillment_sources_identified',
+     'evidence',r.request::jsonb->'evidence')),'UTF8')),'hex') ELSE val->>'sha256' END) ORDER BY key COLLATE "C")
+  INTO refs FROM jsonb_each(r.snapshot::jsonb->'sections') AS sections(key,val);
+ proof := jsonb_build_object('organization_id',c.organization_id,'document_id',d.id,'document_version',d.version,
+  'content_sha256',d.content_sha256,'reservation_digest',NULL,'review_id',r.id,'reviewed_by',r.actor,'references',refs);
+ manifest := jsonb_build_object('review_id',r.id,'reviewed_by',r.actor,'references',refs,
+  'digest',encode(sha256(convert_to(procurement.order_command_json(proof),'UTF8')),'hex'));
+ IF NOT(n->'observation'=observation AND n->'fulfillment'=manifest
+  AND r.snapshot::jsonb->'sections'->'wms_issue'=observation->'wms_issue'
+  AND r.snapshot::jsonb->'sections'->'wms_pick'=observation->'wms_pick'
+  AND r.snapshot->>'remaining_digest'=encode(sha256(convert_to(procurement.order_command_json(remaining),'UTF8')),'hex')
+  AND encode(sha256(convert_to(procurement.order_command_json(jsonb_build_object('id',r.id,
+    'organization_id',r.organization_id,'document_id',r.document_id,'money_reconciliation_id',r.money_reconciliation_id,
+    'request_key',r.request_key,'request_hash',r.request_hash,'request',r.request,'snapshot',r.snapshot,'actor',r.actor)),
+    'UTF8')),'hex')=r.digest
+  AND encode(sha256(convert_to(procurement.order_command_json(r.request::jsonb),'UTF8')),'hex')=r.request_hash
+  AND encode(sha256(convert_to(procurement.order_command_json(c.request::jsonb),'UTF8')),'hex')=c.request_hash
+  AND encode(sha256(convert_to(procurement.order_command_json(jsonb_build_object('id',c.id,
+    'organization_id',c.organization_id,'document_id',c.document_id,'document_version',c.document_version,
+    'content_sha256',c.content_sha256,'request_key',c.request_key,'request_hash',c.request_hash,'request',c.request,
+    'fulfillment_review_id',c.fulfillment_review_id,'release_id',c.release_id,'snapshot',c.snapshot,'actor',c.actor)),
+    'UTF8')),'hex')=c.digest
+ ) IS TRUE THEN RAISE EXCEPTION 'No-stock cancellation evidence does not resolve to its saved review'; END IF;
+END $$;
+
 CREATE OR REPLACE FUNCTION sales.check_cancellation_package() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -92,6 +215,7 @@ BEGIN
   SELECT * INTO r FROM sales.invoice_fulfillment_review WHERE id=c.fulfillment_review_id;
   SELECT * INTO m FROM sales.invoice_money_reconciliation WHERE id=r.money_reconciliation_id;
   SELECT * INTO w FROM wms.invoice_reservation_release WHERE id=c.release_id;
+  IF c.release_id IS NULL THEN PERFORM sales.check_no_stock_cancellation(c.id); END IF;
   IF jsonb_typeof(c.snapshot::jsonb) IS DISTINCT FROM 'object'
     OR jsonb_typeof(r.request::jsonb->'external_sources') IS DISTINCT FROM 'array'
     OR jsonb_typeof(c.snapshot::jsonb->'money'->'facts') IS DISTINCT FROM 'object'
@@ -127,19 +251,20 @@ BEGIN
           AND (b->>'bank_entry_id')::integer=s.bank_entry_id AND b->>'direction'=s.direction
           AND (b->>'amount')::numeric=s.amount AND (b->>'refund_of')::integer IS NOT DISTINCT FROM s.refund_of
           AND b->'snapshot'=s.snapshot::jsonb))
-    OR d.status IS DISTINCT FROM 'cancelled' OR d.reserve_status IS DISTINCT FROM 'released'
+    OR d.status IS DISTINCT FROM 'cancelled' OR d.reserve_status IS DISTINCT FROM (CASE WHEN c.release_id IS NULL THEN 'unreserved' ELSE 'released' END)
     OR c.document_version IS DISTINCT FROM d.version OR c.content_sha256 IS DISTINCT FROM d.content_sha256
     OR r.document_id IS DISTINCT FROM d.id OR r.organization_id IS DISTINCT FROM c.organization_id
     OR m.document_id IS DISTINCT FROM d.id OR m.organization_id IS DISTINCT FROM c.organization_id
-    OR w.document_id IS DISTINCT FROM d.id OR w.organization_id IS DISTINCT FROM c.organization_id
-    OR w.source_key IS DISTINCT FROM c.id
+    OR (c.release_id IS NOT NULL AND (
+      w.document_id IS DISTINCT FROM d.id OR w.organization_id IS DISTINCT FROM c.organization_id
+      OR w.source_key IS DISTINCT FROM c.id
+      OR c.snapshot->'release'->>'digest' IS DISTINCT FROM w.digest
+      OR (w.snapshot->'fulfillment'->>'review_id') IS DISTINCT FROM r.id))
     OR c.snapshot->>'basis_digest' IS DISTINCT FROM r.snapshot->>'basis_digest'
     OR c.snapshot->>'review_digest' IS DISTINCT FROM r.digest
     OR c.snapshot->'money'->>'digest' IS DISTINCT FROM m.basis_digest
     OR (c.snapshot->'money'->'facts')::jsonb IS DISTINCT FROM (r.snapshot->'money'->'facts')::jsonb
     OR (c.snapshot->'money'->'facts')::jsonb IS DISTINCT FROM m.facts::jsonb
-    OR c.snapshot->'release'->>'digest' IS DISTINCT FROM w.digest
-    OR (w.snapshot->'fulfillment'->>'review_id') IS DISTINCT FROM r.id
     OR (r.request->>'all_fulfillment_sources_identified') IS DISTINCT FROM 'true'
     OR (m.request->>'all_money_sources_checked') IS DISTINCT FROM 'true'
     OR m.history_through < c.created_at::date
