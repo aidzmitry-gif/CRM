@@ -1916,6 +1916,7 @@ async def sales_journal(
     core: Core = Depends(get_core),
     session: AsyncSession = Depends(get_session),
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """«Журнал продаж» — реестр ЗАКРЫТЫХ WON-сделок по всем воронкам (факт закрытия, маржа,
     оплата, отгрузка) для экрана ``/crm/sales`` (лента как журнал документов 1С).
@@ -1933,7 +1934,7 @@ async def sales_journal(
     won_codes = {code for _, code in won_pairs}
 
     deals = (
-        await session.execute(select(Deal).where(Deal.stage.in_(won_codes)))
+        await session.execute(scope_deals(select(Deal).where(Deal.stage.in_(won_codes)), access))
     ).scalars().all()
     deals = [d for d in deals if (d.funnel, d.stage) in won_pairs]
     if owner:
@@ -1943,24 +1944,6 @@ async def sales_journal(
     deals.sort(key=lambda d: (closed_by_deal[d.id] or date.min, d.id), reverse=True)
     deals = deals[: max(limit, 0)]
     deal_ids = [d.id for d in deals]
-
-    # Оплата: один запрос по всем сделкам разом — счета (kind=invoice), paid побеждает
-    # posted означает выпуск в ERP и НЕ оплату, это уже ловили на ревью.
-    paid_number: dict[int, str] = {}
-    posted_number: dict[int, str] = {}
-    if deal_ids:
-        docs = (
-            await session.execute(
-                select(DealDocument)
-                .where(DealDocument.deal_id.in_(deal_ids), DealDocument.kind == "invoice")
-                .order_by(DealDocument.id)
-            )
-        ).scalars().all()
-        for doc in docs:  # id по возрастанию
-            if doc.status == "paid":
-                paid_number.setdefault(doc.deal_id, doc.number)
-            elif doc.status == "posted":
-                posted_number[doc.deal_id] = doc.number  # перезаписываем — последний побеждает
 
     # Отгрузка: full-scan outbox по event_type (образец — ``_audit_landed_unit_by_sku``,
     # тот же ponytail: без БД-фильтра по deal_id и без индекса на event_type — приемлемо
@@ -1978,7 +1961,7 @@ async def sales_journal(
             if did in idset:
                 delivered_ids.add(did)
 
-    rows: list[JournalRowOut] = []
+    rows: list[dict] = []
     for d in deals:
         # ponytail: O(сделок) вызовов _deal_margin (по сделке) — как в margin-forecast;
         # приемлемо для среза last-N, батч-расчёт — если вырастет.
@@ -2002,16 +1985,9 @@ async def sales_journal(
             gross_profit = revenue - cogs
             margin_pct = round(gross_profit / revenue * 100) if revenue > 0 else None
 
-        if d.id in paid_number:
-            payment, invoice_number = "paid", paid_number[d.id]
-        elif d.id in posted_number:
-            payment, invoice_number = "invoiced", posted_number[d.id]
-        else:
-            payment, invoice_number = "none", None
-
         closed_on = closed_by_deal[d.id]
         rows.append(
-            JournalRowOut(
+            dict(
                 deal_id=d.id,
                 number=d.number,
                 title=d.title,
@@ -2024,12 +2000,17 @@ async def sales_journal(
                 gross_profit=gross_profit,
                 margin_pct=margin_pct,
                 margin_reason=margin_reason,
-                payment=payment,
-                invoice_number=invoice_number,
                 shipment="delivered" if d.id in delivered_ids else "none",
             )
         )
-    return rows
+    # Finish unrelated margin reads before acquiring the book/deal/invoice locks.
+    from modules.sales.journal_payments import project_journal_payments
+
+    payments = await project_journal_payments(session, core.services, _, deals)
+    return [JournalRowOut(**row, payment=payments[row["deal_id"]].payment,
+                         invoice_number=payments[row["deal_id"]].invoice_number,
+                         payment_source=payments[row["deal_id"]].source,
+                         payment_reason=payments[row["deal_id"]].reason) for row in rows]
 
 
 @router.get("/deals/{deal_id}/handoff", response_model=DealHandoffOut | None)
