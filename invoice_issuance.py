@@ -162,7 +162,10 @@ async def require_replacement_source(session, doc, organization_id):
             or old.status != "cancelled" or old.reserve_status != "released"
             or old.superseded_by_id is not None):
         raise HTTPException(409, "Cancel and reconcile the original invoice before replacement")
-    from modules.sales.invoice_cancellation import InvoiceCancellationReceipt, orm_cancellation_receipt
+    from modules.sales.invoice_cancellation import (
+        InvoiceCancellationReceipt,
+        orm_cancellation_receipt,
+    )
 
     cancellation = await session.scalar(select(InvoiceCancellationReceipt).where(
         InvoiceCancellationReceipt.document_id == old.id,
@@ -394,7 +397,11 @@ async def issue(session, core, user, access, deal_id, data, doc_id=None):
                 or (doc_id is not None and prior.document_id != doc_id)
             ):
                 raise HTTPException(409, "Issuance key already has a different request/scope")
-            existing = await session.get(DealDocument, prior.document_id)
+            # /issue discovers the draft before waiting for the org/deal locks.
+            # A competing issuer may have committed its original in that time.
+            existing = await session.get(
+                DealDocument, prior.document_id, populate_existing=True, with_for_update=True
+            )
             try:
                 await verified_receipt(session, existing, data.organization_id)
             except (ValueError, KeyError, TypeError) as exc:

@@ -774,7 +774,9 @@ class JournalRowOut(BaseModel):
 
     ``revenue``/``gross_profit``/``margin_pct`` — как в ``DealMarginOut`` (по ``priced``-позициям,
     ``None`` = честная деградация, НЕ 0); ``margin_reason`` — те же формулировки, что там же.
-    ``payment`` — "paid" ТОЛЬКО по статусу счёта ``paid`` (``posted`` = выпущен в ERP, не оплачен).
+    Текущие ERP-счета проверяются по подтверждённым данным бухгалтерии и правам
+    организации. Исторический статус документа помечен ``payment_source=legacy``.
+    Недоступная или непроверенная оплата — ``unknown``, не отсутствие счёта.
     """
 
     deal_id: int
@@ -789,7 +791,9 @@ class JournalRowOut(BaseModel):
     gross_profit: float | None = None
     margin_pct: int | None = None
     margin_reason: str | None = None
-    payment: Literal["paid", "invoiced", "none"] = "none"
+    payment: Literal["paid", "invoiced", "partial", "refunded", "cancelled", "none", "unknown"] = "none"
+    payment_source: Literal["ledger", "legacy", "none", "unknown"] = "none"
+    payment_reason: str | None = None
     invoice_number: str | None = None
     shipment: Literal["delivered", "none"] = "none"
 
