@@ -110,9 +110,35 @@ async def project_journal_payments(session, services, user, deals):
     if not deals:
         return {}
     ids = [d.id for d in deals]
+    discovered_owners = dict((await session.execute(select(
+        DealOwnership.deal_id, DealOwnership.organization_id,
+    ).where(DealOwnership.deal_id.in_(ids)))).all())
+    gateway = getattr(services, "accounting", None)
+    available = all(callable(getattr(gateway, method, None))
+                    for method in ("source_member", "invoice_bank_basis", "bank_settlement"))
+    authorized = set()
+    denied = {}
+    if available:
+        for org_id in sorted(set(discovered_owners.values())):
+            try:
+                await gateway.source_member(session, org_id, user)
+            except HTTPException as exc:
+                if exc.status_code == 401:
+                    raise
+                denied[org_id] = "organization_access_unavailable" if exc.status_code in {403, 404} else "ledger_unavailable"
+            else:
+                authorized.add(org_id)
+    # Include empty/draft-only deals: a first issuer can already hold the book
+    # lock while its new receipt is still invisible. Classifying before these
+    # locks would turn that pending issuance into a confident "none" result.
+    await session.execute(select(Deal).where(Deal.id.in_(ids)).order_by(Deal.id)
+                          .with_for_update().execution_options(populate_existing=True))
+    owners = dict((await session.execute(select(
+        DealOwnership.deal_id, DealOwnership.organization_id,
+    ).where(DealOwnership.deal_id.in_(ids)))).all())
     documents = (await session.scalars(select(DealDocument).where(
         DealDocument.deal_id.in_(ids), DealDocument.kind == "invoice",
-    ).order_by(DealDocument.id))).all()
+    ).order_by(DealDocument.id).with_for_update().execution_options(populate_existing=True))).all()
     issued_ids = set((await session.scalars(select(InvoiceIssuanceReceipt.document_id).where(
         InvoiceIssuanceReceipt.document_id.in_([d.id for d in documents]),
     ))).all()) if documents else set()
@@ -122,31 +148,13 @@ async def project_journal_payments(session, services, user, deals):
     current = {key for key, docs in grouped.items()
                if any(d.id in issued_ids or d.status == "issued" for d in docs)}
     result = {key: legacy_payment(docs) for key, docs in grouped.items() if key not in current}
-    owners = dict((await session.execute(select(DealOwnership.deal_id, DealOwnership.organization_id).where(
-        DealOwnership.deal_id.in_(sorted(current)),
-    ))).all()) if current else {}
-    gateway = getattr(services, "accounting", None)
-    available = all(callable(getattr(gateway, method, None))
-                    for method in ("source_member", "invoice_bank_basis", "bank_settlement"))
-    authorized = set()
-    denied = {}
-    if available:
-        for org_id in sorted(set(owners.values())):
-            try:
-                await gateway.source_member(session, org_id, user)
-            except HTTPException as exc:
-                if exc.status_code == 401:
-                    raise
-                denied[org_id] = "organization_access_unavailable" if exc.status_code in {403, 404} else "ledger_unavailable"
-            else:
-                authorized.add(org_id)
-    lock_ids = sorted(key for key in current if owners.get(key) in authorized)
-    if lock_ids:
-        await session.execute(select(Deal).where(Deal.id.in_(lock_ids)).order_by(Deal.id)
-                              .with_for_update().execution_options(populate_existing=True))
     for deal_id in sorted(current, key=lambda key: (owners.get(key, 0), key)):
         number = grouped[deal_id][-1].number
         org_id = owners.get(deal_id)
+        if org_id != discovered_owners.get(deal_id):
+            # Never acquire a newly discovered book after a deal lock.
+            result[deal_id] = unknown(number, "organization_binding_changed")
+            continue
         if not available or org_id not in authorized:
             result[deal_id] = unknown(number, denied.get(org_id, "ledger_unavailable" if not available else "unverified_evidence"))
             continue
