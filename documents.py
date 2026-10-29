@@ -269,11 +269,13 @@ async def flush_document(session):
         raise HTTPException(409, "Ключ или версия документа уже используются; повторите исходный запрос") from None
 
 
-def render_erp_invoice(number, prepared):
+def render_erp_invoice(number, prepared, *, logo_data_url=None):
     """Static local original from confirmed exact facts, with no runtime defaults."""
     def esc(value):
         return html.escape(str(value if value is not None else ''), quote=True)
     seller, buyer = prepared['seller'], prepared['buyer']
+    logo = (f'<div class="logo"><img src="{esc(logo_data_url)}" alt="Логотип продавца" '
+            'style="max-height:70px"></div>') if logo_data_url else ''
     rows = ''.join('<tr>' + ''.join(f'<td>{esc(line[key])}</td>' for key in (
         'line_no', 'sku_code', 'name', 'qty', 'unit', 'price', 'vat_rate', 'net', 'tax', 'total'))
         + '</tr>' for line in prepared['lines'])
@@ -281,7 +283,7 @@ def render_erp_invoice(number, prepared):
 <title>Счёт {esc(number)}</title><style>
 body{{font-family:Arial,sans-serif;color:#172033;margin:32px}}table{{width:100%;border-collapse:collapse}}
 th,td{{border:1px solid #9ca3af;padding:6px;text-align:left}}dl{{line-height:1.6}}
-</style></head><body><h1>Счёт {esc(number)} от {esc(prepared['document_date'])}</h1>
+</style></head><body>{logo}<h1>Счёт-протокол на оплату № {esc(number)} от {esc(prepared['document_date'])}</h1>
 <dl><dt>Продавец</dt><dd>{esc(seller['name'])}, УНП {esc(seller['unp'])}, {esc(seller['address'])}</dd>
 <dt>Банк / счёт</dt><dd>{esc(seller['bank'])}, {esc(seller['bik'])}, {esc(seller['account'])}</dd>
 <dt>Контакты / руководитель</dt><dd>{esc(seller.get('phone'))}, {esc(seller.get('email'))}, {esc(seller['director'])}</dd>
@@ -296,10 +298,10 @@ th,td{{border:1px solid #9ca3af;padding:6px;text-align:left}}dl{{line-height:1.6
 <p>Основание цен и ставок: {esc(prepared['pricing_evidence'])}.</p></body></html>'''
 
 
-def capture_erp_invoice(doc, prepared, actor):
+def capture_erp_invoice(doc, prepared, actor, *, logo_data_url=None):
     if doc.original_html or doc.snapshot_json or doc.issued_at:
         raise HTTPException(409, 'An existing original cannot be captured again')
-    original_html = render_erp_invoice(doc.number, prepared)
+    original_html = render_erp_invoice(doc.number, prepared, logo_data_url=logo_data_url)
     validate_static(original_html)
     doc.amount = Decimal(prepared['amount'])
     doc.valid_until = datetime.fromisoformat(prepared['valid_until']).date()

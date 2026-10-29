@@ -18,7 +18,7 @@ from modules.sales import documents
 from modules.sales.access import visible_deal_or_404
 from modules.sales.accounting_ownership import DealOwnership
 from modules.sales.client_document_register import DealClientBinding
-from modules.sales.models import DealDocument, DealItem
+from modules.sales.models import CompanyBranding, DealDocument, DealItem
 from modules.sales.schemas import DocumentOut
 
 MODE = "erp_issuance_v1"
@@ -465,7 +465,16 @@ async def issue(session, core, user, access, deal_id, data, doc_id=None):
             doc.number = f"ERP-INV-{doc.id}"
         else:
             doc = await session.get(DealDocument, doc_id)
-        documents.capture_erp_invoice(doc, prepared, actor)
+        # The singleton branding belongs only to the configured legal seller.
+        # Freeze its image in the content-hashed original, not in the historical
+        # financial preview/request basis. Exact retries return the saved original.
+        logo_data_url = None
+        if (prepared["seller"]["unp"] and prepared["seller"]["unp"] == core.config.seller_unp
+                and prepared["seller"]["name"] == core.config.seller_name):
+            branding = await session.get(CompanyBranding, 1, populate_existing=True)
+            if branding is not None:
+                logo_data_url = branding.logo_data_url
+        documents.capture_erp_invoice(doc, prepared, actor, logo_data_url=logo_data_url)
         doc.status = "issued"
         doc.reserve_status = "reserved" if gateway else "unreserved"
         doc.reserved_at = datetime.now(timezone.utc).replace(tzinfo=None) if gateway else None
