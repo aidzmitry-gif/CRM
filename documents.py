@@ -274,6 +274,7 @@ def render_erp_invoice(number, prepared, *, logo_data_url=None):
     def esc(value):
         return html.escape(str(value if value is not None else ''), quote=True)
     seller, buyer = prepared['seller'], prepared['buyer']
+    valid_until = datetime.fromisoformat(prepared['valid_until']).strftime('%d.%m.%Y')
     logo = (f'<div class="logo"><img src="{esc(logo_data_url)}" alt="Логотип продавца" '
             'style="max-height:70px"></div>') if logo_data_url else ''
     rows = ''.join('<tr>' + ''.join(f'<td>{esc(line[key])}</td>' for key in (
@@ -293,7 +294,7 @@ th,td{{border:1px solid #9ca3af;padding:6px;text-align:left}}dl{{line-height:1.6
 <th>НДС %</th><th>Нетто</th><th>НДС</th><th>Всего</th></tr></thead><tbody>{rows}</tbody></table>
 <p>Всего: {esc(prepared['amount'])} {esc(prepared['currency'])}</p>
 <p>{'Под заказ — товар не зарезервирован.' if prepared.get('reserve_mode') == 'on_order' else 'Поставка со склада.'}</p>
-<p>Действителен до {esc(prepared['valid_until'])}.</p>
+<p>Счёт действителен до {esc(valid_until)} включительно.</p>
 <p>Условия оплаты: {esc(prepared['payment_terms'])}. Условия поставки: {esc(prepared['delivery_terms'])}.</p>
 <p>Основание цен и ставок: {esc(prepared['pricing_evidence'])}.</p></body></html>'''
 
