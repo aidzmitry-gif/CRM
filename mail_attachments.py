@@ -66,13 +66,13 @@ def safe_filename(filename: str, content_type: str) -> str:
 
 
 def _zip_member_safe(info: zipfile.ZipInfo) -> bool:
-    name = info.filename
+    name = info.orig_filename
     normalized = posixpath.normpath(name.replace("\\", "/"))
     components = name.split("/")
     if name.endswith("/"):
         components = components[:-1]
     if (
-        not name
+        not name or name != info.filename
         or "\x00" in name
         or "\\" in name
         or name.startswith(("/", "\\"))
