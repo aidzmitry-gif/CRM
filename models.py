@@ -393,6 +393,7 @@ class Stage(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     code: Mapped[str] = mapped_column(String(32), unique=True)
     title: Mapped[str] = mapped_column(String(128))
+    description: Mapped[str] = mapped_column(Text, default="", server_default="")
     sort_order: Mapped[int] = mapped_column(default=0, server_default="0")
     probability: Mapped[int] = mapped_column(default=0, server_default="0")
     kind: Mapped[str] = mapped_column(String(16), default="normal", server_default="normal")

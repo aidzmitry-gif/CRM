@@ -265,7 +265,8 @@ async def _board_stages(session: AsyncSession, funnel: str = DEFAULT_FUNNEL) -> 
     ).scalars().all()
     if rows:
         return [
-            {"id": r.code, "title": r.title, "color": r.color, "probability": r.probability}
+            {"id": r.code, "title": r.title, "description": r.description,
+             "color": r.color, "probability": r.probability}
             for r in rows
         ]
     # Таблица пуста ВООБЩЕ (до материализации канона) → fallback для дефолтной воронки.
@@ -639,6 +640,7 @@ async def board(
         StageBoard(
             id=s["id"],
             title=s["title"],
+            description=s.get("description", ""),
             color=s["color"],
             count=len(by_stage.get(s["id"], [])),
             sum=float(sum(d.amount for d in by_stage.get(s["id"], []))),

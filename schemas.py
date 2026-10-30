@@ -126,6 +126,7 @@ class StageBoard(BaseModel):
 
     id: str
     title: str
+    description: str = ""
     color: str
     count: int
     sum: float
@@ -517,6 +518,7 @@ class StageOut(BaseModel):
 
     code: str
     title: str
+    description: str = ""
     sort_order: int
     probability: int
     kind: StageKind
@@ -530,6 +532,7 @@ class StageCreate(BaseModel):
 
     code: str = Field(min_length=1, max_length=32)
     title: str = Field(min_length=1, max_length=128)
+    description: str = Field(default="", max_length=2000)
     sort_order: int = 0
     probability: int = Field(default=0, ge=0, le=100)
     kind: StageKind = "normal"
@@ -542,6 +545,7 @@ class StageUpdate(BaseModel):
     """Частичное обновление стадии (порядок/вероятность/тип/имя/цвет/активность/воронки)."""
 
     title: str | None = Field(default=None, min_length=1, max_length=128)
+    description: str = Field(default="", max_length=2000)
     sort_order: int | None = None
     probability: int | None = Field(default=None, ge=0, le=100)
     kind: StageKind | None = None
