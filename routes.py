@@ -3218,9 +3218,8 @@ async def list_chats(
 ):
     """Диалоги для панели «Чаты и дела»: сделки с последним сообщением переписки.
 
-    Graceful fallback: при ``OperationalError`` (колонка/таблица отсутствует — старый
-    dev.db до миграции 0062) возвращаем ``[]`` — фронт честно покажет «нет диалогов»
-    вместо 500.
+    При ошибке чтения БД возвращаем 503. Недоступность данных не означает,
+    что у пользователя нет диалогов.
     """
     from sqlalchemy.exc import OperationalError, ProgrammingError
 
@@ -3234,7 +3233,9 @@ async def list_chats(
         }
     except (OperationalError, ProgrammingError):
         await session.rollback()
-        return []
+        raise HTTPException(
+            status_code=503, detail="Не удалось загрузить диалоги. Повторите позже.",
+        ) from None
     # SALES-49: непрочитанные входящие по сделкам (для бейджа в панели чатов).
     # Цикл 17: тем же агрегатом — created_at самого старого непрочитанного (waiting_since).
     unread_map: dict[int, int] = {}
