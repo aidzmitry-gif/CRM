@@ -2212,9 +2212,9 @@ async def plan_sources(
 
     regulars: list[RegularRowOut] = []
     for cp, cp_deals in sorted(by_counterparty.items()):
-        closed_dates = sorted(
+        closed_dates = sorted({
             dt for dt in (_journal_closed_on(dl) for dl in cp_deals) if dt is not None
-        )
+        })
         orders_count = len(cp_deals)
         cycle_days: int | None = None
         expected: date | None = None
