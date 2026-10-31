@@ -164,6 +164,7 @@ _OWN_ROUTE_NAMES = frozenset(
         "board",
         "shipping_association_preview", "shipping_association_confirm", "shipping_envelope_prepare",
         "pipeline_analytics",
+        "rop_plan_fact",
         "pipeline_stage_metrics",
         "list_deals",
         "list_funnels",

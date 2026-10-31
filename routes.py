@@ -4921,6 +4921,7 @@ async def rop_plan_fact(
     period: str = "",
     session: AsyncSession = Depends(get_session),
     _: CurrentUser = Depends(require_permission("sales.deal.read")),
+    access: DealAccess = Depends(get_deal_access),
 ):
     """Plan/Fact по менеджерам за месяц (YYYY-MM). Demo-план, если KpiTarget пуст."""
     import calendar
@@ -4940,7 +4941,7 @@ async def rop_plan_fact(
     last_day = date(year, month, calendar.monthrange(year, month)[1])
 
     rows = (await session.execute(
-        select(Deal.owner, func.count(Deal.id), func.sum(Deal.amount))
+        scope_deals(select(Deal.owner, func.count(Deal.id), func.sum(Deal.amount)), access)
         .where(Deal.stage == "won")
         .where(func.date(Deal.stage_changed_at) >= first_day)
         .where(func.date(Deal.stage_changed_at) <= last_day)
