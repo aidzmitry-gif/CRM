@@ -6,7 +6,7 @@ from sqlalchemy import select
 
 from modules.sales.accounting_ownership import DealOwnership
 from modules.sales.documents import digest, lock_deal
-from modules.sales.models import DealDocument
+from modules.sales.models import Deal, DealDocument
 
 
 class SalesReservationSource:
@@ -16,10 +16,19 @@ class SalesReservationSource:
         access = await get_deal_access_for_user(session, user)
         await visible_deal_or_404(session, deal_id, access)
 
+    async def invoice_shipping_read_source(self, session, document_id, *, organization_id,
+                                           expected_version, expected_content_sha256):
+        with session.no_autoflush:
+            return await self.invoice_shipping_source(session, document_id, organization_id=organization_id,
+                expected_version=expected_version, expected_content_sha256=expected_content_sha256,
+                operation="historical_claim", _read_only=True)
+
     async def invoice_shipping_source(
         self, session, document_id, *, organization_id,
-        expected_version, expected_content_sha256, operation="fulfill",
+        expected_version, expected_content_sha256, operation="fulfill", _read_only=False,
     ):
+        if type(_read_only) is not bool or (_read_only and operation != "historical_claim"):
+            raise ValueError("Read-only source permits historical attribution only")
         if not isinstance(operation, str) or operation not in {"fulfill", "historical_claim", "cancellation"}:
             raise ValueError("Unknown invoice shipping operation")
         if (type(organization_id) is not int or organization_id <= 0
@@ -43,7 +52,10 @@ class SalesReservationSource:
             # Preserve both legacy stock and genuinely later-reserved on-order
             # history, including the exact old source shape and validations.
             operation = "historical_claim"
-        facts = await self.invoice_reservation(session, document_id)
+        if _read_only:
+            facts = await self.invoice_reservation(session, document_id, _read_only=True)
+        else:
+            facts = await self.invoice_reservation(session, document_id)
         if (facts["organization_id"] != organization_id
                 or facts["version"] != expected_version
                 or facts["content_sha256"] != expected_content_sha256):
@@ -102,14 +114,19 @@ class SalesReservationSource:
             raise ValueError("Invoice organization must be explicitly confirmed")
         return organization_id
 
-    async def invoice_reservation(self, session, document_id):
+    async def invoice_reservation(self, session, document_id, *, _read_only=False):
         if type(document_id) is not int or document_id <= 0:
             raise ValueError("An exact positive invoice ID is required")
         deal_id = await session.scalar(select(DealDocument.deal_id).where(DealDocument.id == document_id))
         if deal_id is None:
             raise ValueError("Reservation invoice does not exist")
         # Same lock order as invoice lifecycle changes; the caller retains locks.
-        await lock_deal(session, deal_id)
+        if _read_only:
+            found = await session.scalar(select(Deal.id).where(Deal.id == deal_id).with_for_update())
+            if found is None:
+                raise ValueError("Reservation invoice deal does not exist")
+        else:
+            await lock_deal(session, deal_id)
         doc = await session.scalar(select(DealDocument).where(DealDocument.id == document_id)
                                    .with_for_update().execution_options(populate_existing=True))
         owner = await session.get(DealOwnership, deal_id)
